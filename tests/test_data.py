@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class DataPipelineTests(unittest.TestCase):
     def test_dry_plan_is_bounded_and_does_not_claim_network_work(self) -> None:
-        config = CollectorConfig.from_yaml(PROJECT_ROOT / "configs" / "default.yaml")
+        config = CollectorConfig.from_yaml(PROJECT_ROOT / "configs" / "collector.yaml")
 
         with CollectorPipeline(config) as pipeline:
             plan = pipeline.plan("SPY", date(2025, 1, 3))
@@ -28,7 +28,7 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(len(plan["evaluation_points"]), 3)
 
     def test_one_contract_vertical_slice_writes_a_complete_manifest(self) -> None:
-        base = CollectorConfig.from_yaml(PROJECT_ROOT / "configs" / "default.yaml")
+        base = CollectorConfig.from_yaml(PROJECT_ROOT / "configs" / "collector.yaml")
         with tempfile.TemporaryDirectory() as directory:
             output_root = Path(directory)
             config = replace(
