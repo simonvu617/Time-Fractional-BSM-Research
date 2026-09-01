@@ -1,0 +1,129 @@
+project:
+  name: tfbsm_empirical
+  output_schema_version: "0.1.0"
+
+collector:
+  vendor: ThetaData
+  base_url: http://127.0.0.1:25503/v3
+  request_timeout_seconds: 120
+  output_dir: data/raw/thetadata
+  start_date: 2018-01-01
+  end_date: 2025-12-31
+  calendar: XNYS
+  exchange_timezone: America/New_York
+  quote_interval: 1s
+  trade_interval: 1s
+  evaluation_times:
+    - "10:30:00"
+    - "13:00:00"
+    - "15:00:00"
+  horizon_minutes: 30
+  max_stock_quote_age_seconds: 70
+  min_dte: 7
+  max_dte: 180
+  target_dtes:
+    - 7
+    - 14
+    - 30
+    - 60
+    - 120
+  max_expirations_per_day: 5
+  moneyness_targets:
+    - 0.80
+    - 0.85
+    - 0.90
+    - 0.95
+    - 1.00
+    - 1.05
+    - 1.10
+    - 1.20
+  strikes_per_moneyness_target: 1
+  option_rights:
+    - call
+    - put
+
+universe:
+  - symbol: SPY
+    asset_type: ETF
+    universe_bucket: broad_market_etf
+    sector_proxy: broad_market
+  - symbol: QQQ
+    asset_type: ETF
+    universe_bucket: growth_etf
+    sector_proxy: technology
+  - symbol: IWM
+    asset_type: ETF
+    universe_bucket: small_cap_etf
+    sector_proxy: small_cap
+  - symbol: DIA
+    asset_type: ETF
+    universe_bucket: value_etf
+    sector_proxy: industrial_mix
+  - symbol: XLF
+    asset_type: ETF
+    universe_bucket: sector_etf
+    sector_proxy: financials
+  - symbol: XLK
+    asset_type: ETF
+    universe_bucket: sector_etf
+    sector_proxy: technology
+  - symbol: XLE
+    asset_type: ETF
+    universe_bucket: sector_etf
+    sector_proxy: energy
+  - symbol: XLV
+    asset_type: ETF
+    universe_bucket: sector_etf
+    sector_proxy: health_care
+  - symbol: XLI
+    asset_type: ETF
+    universe_bucket: sector_etf
+    sector_proxy: industrials
+  - symbol: XLP
+    asset_type: ETF
+    universe_bucket: sector_etf
+    sector_proxy: consumer_staples
+  - symbol: AAPL
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: technology
+  - symbol: MSFT
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: technology
+  - symbol: NVDA
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: technology
+  - symbol: JPM
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: financials
+  - symbol: XOM
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: energy
+  - symbol: UNH
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: health_care
+  - symbol: WMT
+    asset_type: EQUITY
+    universe_bucket: mega_cap_equity
+    sector_proxy: consumer_staples
+  - symbol: CAT
+    asset_type: EQUITY
+    universe_bucket: large_cap_equity
+    sector_proxy: industrials
+  - symbol: AMD
+    asset_type: EQUITY
+    universe_bucket: large_cap_equity
+    sector_proxy: technology
+  - symbol: PLTR
+    asset_type: EQUITY
+    universe_bucket: mid_cap_equity
+    sector_proxy: technology
+  - symbol: RIOT
+    asset_type: EQUITY
+    universe_bucket: small_cap_equity
+    sector_proxy: crypto_exposed

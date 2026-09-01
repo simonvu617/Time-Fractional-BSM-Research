@@ -1,0 +1,19 @@
+model:
+  key: subdiffusive_tfbsm
+  label: Subdiffusive time-fractional Black-Scholes
+  role: candidate_pricing_model
+  implementation_status: not_implemented
+  clock: inverse_stable_market_time
+  fractional_order: alpha
+  alpha_domain: "0 < alpha <= 1"
+  alpha_one_nests_bsm: true
+  explicitly_not:
+    - fractional_brownian_motion
+    - hurst_exponent_model
+    - rough_volatility_model
+
+validation_contract:
+  literature_based_solver_required: true
+  alpha_one_limit_required: true
+  independent_numerical_check_required: true
+  test_set_alpha_selection_allowed: false

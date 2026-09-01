@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software in research, please cite it using this metadata."
+title: "Time-Fractional Black-Scholes Empirical Research"
+type: software
+authors:
+  - family-names: Vu
+    given-names: Simon
+repository-code: "https://github.com/simonvu617/Time-Fractional-BSM-Research"
+license: MIT
+version: 0.1.0

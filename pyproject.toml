@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tfbsm-empirical"
+version = "0.1.0"
+description = "Empirical research infrastructure for subdiffusive time-fractional Black-Scholes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Simon Vu"},
+]
+dependencies = [
+  "exchange-calendars",
+  "pandas",
+  "pyarrow",
+  "PyYAML",
+  "requests",
+]
+
+[project.scripts]
+tfbsm-collect = "tfbsm_empirical.data.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,49 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Vendor and derived datasets stay local; the directory contract is tracked.
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Generated empirical outputs stay local; the directory contract is tracked.
+results/tables/*
+!results/tables/.gitkeep
+results/figures/*
+!results/figures/.gitkeep
+results/summaries/*
+!results/summaries/.gitkeep
+
+# LaTeX build products.
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+
+# Credentials and personal/source documents are never repository inputs.
+.env
+.env.*
+configs/secrets.*
+*credentials*
+*creds*
+*.pem
+*.key
+*.pdf
+*.docx
+*.xlsx

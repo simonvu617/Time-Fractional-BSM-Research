@@ -1,0 +1,23 @@
+experiment:
+  id: experiment_001
+  name: collection_smoke_test
+  status: specified_not_run
+  objective: Validate the data-collection contract before any multi-year pull or model comparison.
+
+inherits:
+  collector: ../../configs/default.yaml
+
+scope:
+  symbol: SPY
+  trade_date: 2025-01-03
+  model_execution: false
+  alpha_selection: false
+  hypothesis_test: false
+
+acceptance_checks:
+  - completed symbol-day manifest
+  - exact request and payload hashes
+  - required vendor schemas present
+  - timestamp parse diagnostics reviewed
+  - contract count reconciliation
+  - historical chain-list semantics established
