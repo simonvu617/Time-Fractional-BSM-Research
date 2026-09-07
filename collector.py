@@ -1,3 +1,20 @@
+"""Historical option-data collector, retained as one file for review.
+
+Python 3.11+; dependencies: exchange-calendars, numpy, pandas>=2, pyarrow,
+requests, yfinance. Running this file collects the configured multi-year panel.
+
+ThetaData v3 reference: https://docs.thetadata.us/openapiv3.yaml
+Contract discovery: /operations/option_list_contracts.html
+Condition codes: /Articles/Errors-Exchanges-Conditions/{Quote,Trade}-Conditions.html
+Open interest: /operations/option_history_open_interest.html
+(All documentation paths above are relative to https://docs.thetadata.us.)
+
+Universe: contracts quoted on each historical date, sampled by the configured
+DTE and S/K grid. A trade is not required for collection. Quotes are sampled;
+trades are events. Missing symbol-days remain in the availability report.
+Pricing, calibration, and backtesting are outside this collector.
+"""
+
 import json
 import hashlib
 import os
@@ -42,7 +59,7 @@ class SymbolConfig:
 
 
 @dataclass(frozen=True)
-class BacktestConfig:
+class CollectorConfig:
     base_url: str
     start_date: str
     end_date: str
@@ -56,7 +73,7 @@ class BacktestConfig:
     max_dte: int
     exchange_tz: str
     quote_interval: str
-    trade_interval: str
+    stock_venue: str
     evaluation_times: tuple[str, ...]
     horizon_minutes: int
     max_stock_quote_age_seconds: int
@@ -96,12 +113,11 @@ MARKET_DATA_DIR = OUTPUT_DIR / "market_inputs"
 REFERENCE_DATA_DIR = OUTPUT_DIR / "reference_data"
 CANONICAL_DATA_DIR = OUTPUT_DIR / "canonical"
 DIAGNOSTIC_DATA_DIR = OUTPUT_DIR / "diagnostics"
-CHAIN_METADATA_DIR = REFERENCE_DATA_DIR / "chain_metadata"
 CANONICAL_PARTS_DIR = CANONICAL_DATA_DIR / "parts"
 DIAGNOSTIC_PARTS_DIR = DIAGNOSTIC_DATA_DIR / "parts"
 # Bump this whenever canonical/session schemas change in a way that makes old
 # parquet chunks unsafe to treat as completed work.
-OUTPUT_SCHEMA_VERSION = "2026-05-26-paper_comparison_surface_v6"
+OUTPUT_SCHEMA_VERSION = "2026-09-07-quoted_surface_v7"
 
 UNIVERSE = [
     SymbolConfig("SPY", "ETF", "broad_market_etf", "broad_market"),
@@ -127,7 +143,7 @@ UNIVERSE = [
     SymbolConfig("RIOT", "EQUITY", "small_cap_equity", "crypto_exposed"),
 ]
 
-CFG = BacktestConfig(
+CFG = CollectorConfig(
     base_url=BASE_URL,
     start_date="2018-01-01",
     end_date="2025-12-31",
@@ -141,7 +157,7 @@ CFG = BacktestConfig(
     max_dte=180,
     exchange_tz="America/New_York",
     quote_interval="1s",
-    trade_interval="1s",
+    stock_venue="utp_cta",
     evaluation_times=("10:30:00", "13:00:00", "15:00:00"),
     horizon_minutes=30,
     max_stock_quote_age_seconds=70,
@@ -198,7 +214,7 @@ def config_payload() -> dict:
 _CONFIG_PAYLOAD = config_payload()
 _CONFIG_DIGEST = sha256_bytes(json.dumps(_CONFIG_PAYLOAD, sort_keys=True).encode("utf-8"))
 _CODE_DIGEST = sha256_bytes(Path(__file__).read_bytes())
-_RUN_STARTED_UTC = pd.Timestamp.utcnow().isoformat()
+_RUN_STARTED_UTC = pd.Timestamp.now("UTC").isoformat()
 _THREAD_LOCAL = threading.local()
 _PATH_LOCK_STRIPES = tuple(threading.Lock() for _ in range(256))
 _REQUEST_PACE_LOCK = threading.Lock()
@@ -261,12 +277,27 @@ def record_request_result(endpoint: str, success: bool) -> None:
             _REQUEST_FAILURE_COUNTS[endpoint] = _REQUEST_FAILURE_COUNTS.get(endpoint, 0) + 1
 
 
-def atomic_write_bytes(path: Path, payload: bytes) -> None:
+@contextmanager
+def atomic_output(path: Path):
+    """Replace a generated file only after its temporary output is complete."""
     ensure_dir(path.parent)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
-        tmp.write(payload)
-        tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False, suffix=path.suffix) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        yield temp_path
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    with atomic_output(path) as temp_path:
+        temp_path.write_bytes(payload)
+
+
+def write_parquet(path: Path, frame: pd.DataFrame) -> None:
+    with atomic_output(path) as temp_path:
+        frame.to_parquet(temp_path, index=False, compression="zstd")
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -277,7 +308,7 @@ def build_request_session() -> requests.Session:
     retry = Retry(
         total=5,
         backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
+        status_forcelist=(429, 474, 500, 502, 503, 504, 571),
         allowed_methods=("GET",),
     )
     pool_size = max(20, CFG.max_contract_workers * 4)
@@ -308,7 +339,7 @@ def safe_pkg_version(name: str) -> str:
 
 def run_context() -> dict:
     return {
-        "collector_name": "multi_year_bsm_backtest",
+        "collector_name": "collector",
         "collector_mode": "neutral_surface_scrape",
         "output_schema_version": OUTPUT_SCHEMA_VERSION,
         "config_digest": _CONFIG_DIGEST,
@@ -324,8 +355,14 @@ def run_context() -> dict:
             "is_tick_level": False,
             "uses_requested_intervals": {
                 "quotes": CFG.quote_interval,
-                "trades": CFG.trade_interval,
+                "trades": "events",
             },
+            "contract_universe": "quoted_on_trade_date",
+            "contract_universe_is_intraday_listing_snapshot": False,
+            "stock_venue": CFG.stock_venue,
+            "condition_policy": "regular_auto_quotes_and_trades",
+            "open_interest_request_date": "trade_day; report reflects prior session close",
+            "missing_history_policy": "record_unavailable_symbol_days; no imputation",
             "full_market_archive": False,
             "instrument_identity_is_observed_not_authoritative": True,
             "corporate_actions_source": "yfinance_reference_layer",
@@ -369,8 +406,8 @@ def attach_timestamp_metadata(df: pd.DataFrame, include_raw: bool = False) -> pd
     if include_raw:
         result["timestamp_raw"] = result["timestamp"]
     result["timestamp"] = parsed
-    result["timestamp_parse_failed"] = parse_failed
-    result["timestamp_naive_assumed"] = naive_assumed
+    result["timestamp_parse_failed"] = result.get("timestamp_parse_failed", parse_failed)
+    result["timestamp_naive_assumed"] = result.get("timestamp_naive_assumed", naive_assumed)
     return result
 
 
@@ -491,7 +528,6 @@ def build_sample_flags(contract_row: dict) -> dict:
     # The label-specific flags are authoritative. The first-evaluation aliases
     # are explicitly named so downstream code cannot mistake them for all-day
     # inclusion flags.
-    lagged_oi = to_float(contract_row.get("lagged_open_interest", np.nan))
     broad_max_quote_age = CFG.max_option_quote_age_seconds * 3
     broad_max_rel_spread = max(0.75, CFG.max_rel_spread * 2.0)
     output: dict[str, object] = {}
@@ -501,6 +537,7 @@ def build_sample_flags(contract_row: dict) -> dict:
 
     for time_str in CFG.evaluation_times:
         label = time_label(time_str)
+        lagged_oi = to_float(contract_row.get(f"eval_{label}_open_interest", contract_row.get("lagged_open_interest")))
         entry_age = to_float(contract_row.get(f"eval_{label}_entry_quote_age_seconds", np.nan))
         entry_rel_spread = to_float(contract_row.get(f"eval_{label}_entry_quote_rel_spread", np.nan))
         entry_bid = to_float(contract_row.get(f"eval_{label}_entry_quote_bid", np.nan))
@@ -595,34 +632,28 @@ def boolean_flag_series(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.
     return pd.Series(False, index=frame.index, dtype=bool)
 
 
-def normalize_condition_value(value: object) -> str:
-    if pd.isna(value):
-        return ""
-    return str(value).strip().lower()
-
-
 def filter_condition_rows(df: pd.DataFrame, dataset: str) -> tuple[pd.DataFrame, int]:
-    condition_columns = [
-        col for col in df.columns
-        if any(token in col.lower() for token in ("condition", "qualifier", "indicator"))
-    ]
-    if not condition_columns:
-        return df, 0
-    allowed_tokens = {"", "regular", "normal", "auto", "continuous", "nbbo"}
-    blocked_pattern = r"(?:^|[^a-z0-9])(?:late|cancel|correct|correction|odd|out_of_seq|deriv|derivative)(?:[^a-z0-9]|$)"
-    mask = pd.Series(True, index=df.index, dtype=bool)
-    # Blank condition fields usually mean no special sale/quote condition; keep
-    # them, but count them so the assumption is visible in diagnostics.
-    missing_condition_mask = pd.Series(False, index=df.index, dtype=bool)
-    for column in condition_columns:
-        normalized = df[column].map(normalize_condition_value)
-        missing_condition_mask |= normalized.eq("")
-        blocked = normalized.str.contains(blocked_pattern, regex=True, na=False)
-        column_ok = normalized.isin(allowed_tokens) & ~blocked
-        mask &= column_ok
-    filtered = df.loc[mask].copy()
-    filtered.attrs["missing_condition_row_count"] = int(missing_condition_mask.sum())
-    return filtered, int((~mask).sum())
+    # Explicit research policy; raw cached rows retain every vendor condition.
+    # Quotes: REGULAR=0, BID_ASK_AUTO_EXEC=1, NATIONAL_BBO=50.
+    # Trades: REGULAR=0, AUTO_EXECUTION=18. OPRA extended conditions are unused.
+    quotes = "quotes" in dataset
+    columns = ["bid_condition", "ask_condition"] if quotes else ["condition"]
+    if dataset.startswith("stock_trades"):
+        columns += [f"ext_condition{i}" for i in range(1, 5)]
+    allowed_codes = {0, 1, 50} if quotes else {0, 18}
+    allowed_labels = {"", "regular", "normal", "auto", "continuous", "nbbo"}
+    allowed_labels |= {"bid_ask_auto_exec", "national_bbo"} if quotes else {"auto_execution"}
+    keep = pd.Series(True, index=df.index)
+    missing = pd.Series(False, index=df.index)
+    for column in columns:
+        if column not in df:
+            continue
+        text = df[column].fillna("").astype(str).str.strip().str.lower()
+        missing |= text.eq("")
+        keep &= pd.to_numeric(text, errors="coerce").isin(allowed_codes) | text.isin(allowed_labels)
+    result = df.loc[keep].copy()
+    result.attrs["missing_condition_row_count"] = int(missing.sum())
+    return result, int((~keep).sum())
 
 
 def market_snapshot(
@@ -640,6 +671,9 @@ def market_snapshot(
         # NaN means freshness was not evaluated for this snapshot type.
         f"{prefix}_is_stale": True if max_age_seconds is not None else np.nan,
     }
+    if trade_lookback_minutes is not None:
+        snapshot.update({f"{prefix}_recent_trade_count": 0, f"{prefix}_recent_trade_size": 0.0,
+                         f"{prefix}_recent_trade_vwap": np.nan})
     if df.empty or "timestamp" not in df.columns:
         return snapshot
     clean = df.loc[df["timestamp"].notna()]
@@ -647,7 +681,7 @@ def market_snapshot(
         return snapshot
     if not clean["timestamp"].is_monotonic_increasing:
         clean = clean.sort_values("timestamp")
-    timestamps_ns = pd.DatetimeIndex(clean["timestamp"]).asi8
+    timestamps_ns = pd.DatetimeIndex(clean["timestamp"]).as_unit("ns").asi8
     target_ns = pd.Timestamp(target_ts).value
     row_pos = int(np.searchsorted(timestamps_ns, target_ns, side="right") - 1)
     if row_pos < 0:
@@ -658,7 +692,7 @@ def market_snapshot(
     snapshot[f"{prefix}_age_seconds"] = float((target_ts - row["timestamp"]).total_seconds())
     if max_age_seconds is not None:
         snapshot[f"{prefix}_is_stale"] = bool(snapshot[f"{prefix}_age_seconds"] > max_age_seconds)
-    for column in ("bid", "ask", "bid_size", "ask_size", "price", "size", "stock_mid", "option_mid", "option_spread", "rel_spread"):
+    for column in ("bid", "ask", "bid_size", "ask_size", "price", "size", "open_interest", "stock_mid", "option_mid", "option_spread", "rel_spread"):
         if column in clean.columns:
             snapshot[f"{prefix}_{column}"] = row[column]
     if trade_lookback_minutes is not None:
@@ -694,7 +728,7 @@ def nearest_clock_skew_seconds(reference_ts: pd.Series | np.ndarray, other_ts: p
             clean = pd.to_datetime(clean, errors="coerce")
             if pd.Series(clean).isna().any():
                 raise TypeError(f"{name} must contain datetime-like values")
-        return pd.DatetimeIndex(clean).asi8
+        return pd.DatetimeIndex(clean).as_unit("ns").asi8
 
     ref = timestamp_ns(reference_ts, "reference_ts")
     oth = timestamp_ns(other_ts, "other_ts")
@@ -721,17 +755,15 @@ def nearest_clock_skew_seconds(reference_ts: pd.Series | np.ndarray, other_ts: p
 
 
 def dataset_required_columns(dataset: str) -> tuple[str, ...]:
-    if dataset.startswith("stock_quotes_"):
+    if dataset == "quoted_contracts":
+        return ("symbol", "expiration", "strike", "right")
+    if "quotes" in dataset:
         return ("timestamp", "bid", "ask")
-    if dataset.startswith("stock_trades_"):
-        return ("timestamp", "price", "size")
-    if dataset.startswith("option_quotes_"):
-        return ("timestamp", "bid", "ask")
-    if dataset.startswith("option_trades_"):
+    if "trades" in dataset:
         return ("timestamp", "price", "size")
     if dataset == "option_open_interest":
         return ("timestamp", "open_interest")
-    return tuple()
+    raise ValueError(f"Unknown vendor dataset: {dataset}")
 
 
 def normalize_strike_for_key(strike: float | None) -> str | None:
@@ -762,93 +794,39 @@ def parquet_chunk_path(base_dir: Path, dataset: str, symbol: str, trade_day: pd.
 
 def write_parquet_chunk(base_dir: Path, dataset: str, symbol: str, trade_day: pd.Timestamp, rows: list[dict], suffix: str = "") -> Path:
     path = parquet_chunk_path(base_dir, dataset, symbol, trade_day, suffix=suffix)
-    ensure_dir(path.parent)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False, suffix=".parquet") as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pd.DataFrame(rows).to_parquet(tmp_path, index=False, compression="zstd")
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    write_parquet(path, pd.DataFrame(rows))
     return path
 
 
 class SymbolDayChunkWriter:
+    """Bound memory while writing the same contract and quality artifacts."""
     def __init__(self, symbol: str, trade_day: pd.Timestamp):
-        self.symbol = symbol
-        self.trade_day = trade_day
+        self.symbol, self.trade_day = symbol, trade_day
         self.paths = chunk_paths()
-        self.contract_rows: list[dict] = []
-        self.quality_rows: list[dict] = []
-        self.screening_rows: list[dict] = []
-        self.contract_part = 0
-        self.quality_part = 0
-        self.screening_part = 0
+        self.rows = {dataset: [] for dataset in ("contracts", "quality")}
+        self.parts = dict.fromkeys(self.rows, 0)
 
-    def _flush_contracts(self) -> None:
-        if not self.contract_rows:
-            return
-        self.contract_part += 1
-        write_parquet_chunk(
-            self.paths["contracts"],
-            "contracts",
-            self.symbol,
-            self.trade_day,
-            self.contract_rows,
-            suffix=f"part={self.contract_part:05d}",
-        )
-        self.contract_rows = []
+    def _flush(self, dataset: str) -> None:
+        if self.rows[dataset]:
+            self.parts[dataset] += 1
+            write_parquet_chunk(self.paths[dataset], dataset, self.symbol, self.trade_day,
+                                self.rows[dataset], suffix=f"part={self.parts[dataset]:05d}")
+            self.rows[dataset] = []
 
-    def _flush_quality(self) -> None:
-        if not self.quality_rows:
-            return
-        self.quality_part += 1
-        write_parquet_chunk(
-            self.paths["quality"],
-            "quality",
-            self.symbol,
-            self.trade_day,
-            self.quality_rows,
-            suffix=f"part={self.quality_part:05d}",
-        )
-        self.quality_rows = []
+    def _extend(self, dataset: str, rows: list[dict]) -> None:
+        self.rows[dataset].extend(rows)
+        if len(self.rows[dataset]) >= CFG.stream_flush_row_count:
+            self._flush(dataset)
 
     def append_contract_row(self, row: dict) -> None:
-        self.contract_rows.append(row)
-        if len(self.contract_rows) >= CFG.stream_flush_row_count:
-            self._flush_contracts()
+        self._extend("contracts", [row])
 
     def extend_quality_rows(self, rows: list[dict]) -> None:
-        if not rows:
-            return
-        self.quality_rows.extend(rows)
-        if len(self.quality_rows) >= CFG.stream_flush_row_count:
-            self._flush_quality()
-
-    def _flush_screening(self) -> None:
-        if not self.screening_rows:
-            return
-        self.screening_part += 1
-        write_parquet_chunk(
-            self.paths["screening"],
-            "screening",
-            self.symbol,
-            self.trade_day,
-            self.screening_rows,
-            suffix=f"part={self.screening_part:05d}",
-        )
-        self.screening_rows = []
-
-    def append_screening_row(self, row: dict) -> None:
-        self.screening_rows.append(row)
-        if len(self.screening_rows) >= CFG.stream_flush_row_count:
-            self._flush_screening()
+        self._extend("quality", rows)
 
     def finalize(self) -> None:
-        self._flush_contracts()
-        self._flush_quality()
-        self._flush_screening()
+        for dataset in self.rows:
+            self._flush(dataset)
 
 
 # ============================================================
@@ -873,13 +851,23 @@ def get_csv(path: str, params: dict) -> tuple[pd.DataFrame, dict, bytes]:
         "payload_sha256": sha256_bytes(payload),
         "payload_bytes": len(payload),
     }
+    if response.status_code == 472:  # NO_DATA is an observation, not a transport failure.
+        record_request_result(path, success=True)
+        return pd.DataFrame(), meta, payload
     if response.status_code != 200:
         record_request_result(path, success=False)
         raise RuntimeError(
             f"Request failed: {response.url}\nstatus={response.status_code}\ntext={response.text[:1000]}"
         )
     record_request_result(path, success=True)
-    return pd.read_csv(BytesIO(payload)), meta, payload
+    content_type = response.headers.get("Content-Type", "").lower()
+    if content_type and not any(t in content_type for t in ("csv", "text/plain", "octet-stream")):
+        raise ValueError(f"Unexpected response content type: {content_type}")
+    try:
+        frame = pd.read_csv(BytesIO(payload))
+    except pd.errors.EmptyDataError:
+        frame = pd.DataFrame()
+    return frame, meta, payload
 
 
 def raw_cache_path(dataset: str, symbol: str, day: pd.Timestamp, expiration: str | None = None, strike: float | None = None, right: str | None = None) -> Path:
@@ -911,36 +899,7 @@ def raw_cache_meta(dataset: str, symbol: str, day: pd.Timestamp, expiration: str
         return {}
 
 
-def small_cache_meta_path(path: Path) -> Path:
-    return path.with_suffix(path.suffix + ".meta.json")
 
-
-def small_cache_is_usable(path: Path, meta_path: Path, endpoint: str, params: dict, required_columns: tuple[str, ...] = ()) -> bool:
-    if not path.exists() or not meta_path.exists():
-        return False
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    required = {"endpoint", "params", "cache_data_sha256"}
-    if not required.issubset(meta):
-        return False
-    if meta["endpoint"] != endpoint or meta["params"] != params:
-        return False
-    # Raw vendor cache validity is tied to the request surface and data hash,
-    # not to collector comments or non-request configuration fields.
-    try:
-        stat = path.stat()
-        if meta.get("cache_data_size_bytes") == stat.st_size and meta.get("cache_data_mtime_ns") == stat.st_mtime_ns:
-            pass
-        elif meta["cache_data_sha256"] != sha256_bytes(path.read_bytes()):
-            return False
-        if required_columns:
-            df = pd.read_csv(path)
-            return all(col in df.columns for col in required_columns)
-        return True
-    except Exception:
-        return False
 
 
 def cache_is_usable(data_path: Path, meta_path: Path, dataset: str, path: str, params: dict) -> bool:
@@ -955,7 +914,7 @@ def cache_is_usable(data_path: Path, meta_path: Path, dataset: str, path: str, p
         return False
     if meta["dataset"] != dataset or meta["endpoint"] != path or meta["params"] != params:
         return False
-    if meta.get("cache_status") != "ok":
+    if meta.get("cache_status") not in {"ok", "no_data"}:
         return False
     # Reuse is safe only when the stored parquet still matches its recorded
     # hash/size metadata.
@@ -970,13 +929,14 @@ def cache_is_usable(data_path: Path, meta_path: Path, dataset: str, path: str, p
 
 def finalize_market_frame(
     df: pd.DataFrame,
+    dataset: str,
     *,
     derived_columns: tuple[str, ...] = (),
 ) -> pd.DataFrame:
     if "timestamp" not in df.columns:
         raise KeyError(f"Response missing timestamp column: {list(df.columns)}")
     result = optimize_frame_dtypes(attach_timestamp_metadata(df))
-    result, filtered_condition_row_count = filter_condition_rows(result, "market")
+    result, filtered_condition_row_count = filter_condition_rows(result, dataset)
     missing_condition_row_count = int(result.attrs.get("missing_condition_row_count", 0))
     if {"bid", "ask"}.issubset(result.columns):
         if "stock_mid" in derived_columns:
@@ -1020,7 +980,7 @@ def fetch_market_frame(
         strike=strike,
         right=right,
     )
-    return finalize_market_frame(df, derived_columns=derived_columns)
+    return finalize_market_frame(df, dataset, derived_columns=derived_columns)
 
 
 def cached_request_frame(
@@ -1043,29 +1003,17 @@ def cached_request_frame(
                 return read_csv_cache(cache_path)
 
             df, response_meta, payload = get_csv(path, params)
-            ensure_dir(cache_path.parent)
-            content_type = str(response_meta["response_headers"].get("Content-Type", "")).lower()
-            validation_issues: list[str] = []
-            if not any(token in content_type for token in ("csv", "text/plain", "application/octet-stream", "")):
-                validation_issues.append(f"unexpected_content_type:{content_type}")
-            missing_columns = [col for col in dataset_required_columns(dataset) if col not in df.columns]
-            if missing_columns:
-                validation_issues.append(f"missing_columns:{','.join(missing_columns)}")
-            if "timestamp" in df.columns:
-                if pd.to_datetime(df["timestamp"], errors="coerce").isna().all() and not df.empty:
-                    validation_issues.append("all_timestamps_unparseable")
-            if df.empty:
-                validation_issues.append("empty_pull")
-            cache_status = "ok" if not validation_issues else "suspect"
+            required = dataset_required_columns(dataset)
+            if df.empty and not len(df.columns):
+                df = pd.DataFrame(columns=required)
+            missing = set(required) - set(df.columns)
+            if missing:
+                raise ValueError(f"{dataset} response missing columns: {sorted(missing)}")
+            if "timestamp" in df and not df.empty and pd.to_datetime(df["timestamp"], errors="coerce").isna().all():
+                raise ValueError(f"{dataset} response has no parseable timestamps")
+            cache_status = "no_data" if df.empty else "ok"
             cached_df = optimize_frame_dtypes(attach_timestamp_metadata(df, include_raw=True))
-            with tempfile.NamedTemporaryFile(dir=cache_path.parent, delete=False, suffix=".parquet") as tmp:
-                tmp_path = Path(tmp.name)
-            try:
-                cached_df.to_parquet(tmp_path, index=False, compression="zstd")
-                os.replace(tmp_path, cache_path)
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
+            write_parquet(cache_path, cached_df)
             cache_stat = cache_path.stat()
             if CFG.store_raw_payloads:
                 atomic_write_bytes(payload_path, payload)
@@ -1074,7 +1022,7 @@ def cached_request_frame(
                 "dataset": dataset,
                 "endpoint": path,
                 "params": params,
-                "fetched_at_utc": pd.Timestamp.utcnow().isoformat(),
+                "fetched_at_utc": pd.Timestamp.now("UTC").isoformat(),
                 "columns": list(df.columns),
                 "row_count": int(len(df)),
                 "column_signature": "|".join(df.columns.astype(str)),
@@ -1082,7 +1030,7 @@ def cached_request_frame(
                 "raw_duplicate_row_count": int(df.duplicated().sum()),
                 "raw_null_timestamp_count": int(df["timestamp"].isna().sum()) if "timestamp" in df.columns else 0,
                 "cache_status": cache_status,
-                "validation_issues": validation_issues,
+                "validation_issues": ["no_data"] if df.empty else [],
                 "cache_data_sha256": sha256_bytes(cache_path.read_bytes()),
                 "cache_data_size_bytes": cache_stat.st_size,
                 "cache_data_mtime_ns": cache_stat.st_mtime_ns,
@@ -1093,153 +1041,68 @@ def cached_request_frame(
             write_json(meta_path, meta)
             return read_csv_cache(cache_path)
 
-@lru_cache(maxsize=None)
-def get_expirations(symbol: str) -> tuple[pd.Timestamp, ...]:
-    ensure_dir(CHAIN_METADATA_DIR)
-    cache_path = CHAIN_METADATA_DIR / f"{symbol}_expirations.csv"
-    meta_path = small_cache_meta_path(cache_path)
-    with path_lock(cache_path):
-        with file_lock(cache_path):
-            params = {"symbol": symbol}
-            if small_cache_is_usable(cache_path, meta_path, "/option/list/expirations", params, ("expiration",)):
-                df = pd.read_csv(cache_path)
-            else:
-                df, _, _ = get_csv("/option/list/expirations", params)
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
-                atomic_write_bytes(cache_path, csv_bytes)
-                cache_stat = cache_path.stat()
-                write_json(
-                    meta_path,
-                    {
-                        "endpoint": "/option/list/expirations",
-                        "params": params,
-                        "cache_data_sha256": sha256_bytes(csv_bytes),
-                        "cache_data_size_bytes": cache_stat.st_size,
-                        "cache_data_mtime_ns": cache_stat.st_mtime_ns,
-                        "config_digest": run_context()["config_digest"],
-                        "code_digest": run_context()["code_digest"],
-                    },
-                )
-    if "expiration" not in df.columns:
-        raise KeyError(f"Expirations response missing expiration column: {list(df.columns)}")
-    expirations = pd.to_datetime(df["expiration"], errors="coerce").dropna().dt.normalize().sort_values().drop_duplicates().tolist()
-    return tuple(pd.Timestamp(exp) for exp in expirations)
+def get_quoted_contracts(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
+    """One dated universe; retain the vendor's actual expiration/strike/right tuples."""
+    frame = cached_request_frame("quoted_contracts", symbol, day,
+                                 "/option/list/contracts/quote",
+                                 {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"})
+    frame = frame.copy()
+    frame["expiration"] = pd.to_datetime(frame["expiration"], errors="raise").dt.normalize()
+    frame["strike"] = pd.to_numeric(frame["strike"], errors="raise")
+    frame["right"] = frame["right"].astype(str).str.lower().replace({"c": "call", "p": "put"})
+    if (frame["symbol"].ne(symbol).any() or frame[["expiration", "strike"]].isna().any().any()
+            or frame["strike"].le(0).any() or not frame["right"].isin(["call", "put"]).all()):
+        raise ValueError("Invalid contract identity in dated quote universe")
+    return (frame.loc[frame["right"].isin(CFG.option_rights)]
+            .drop_duplicates(["expiration", "strike", "right"])
+            .sort_values(["expiration", "strike", "right"]).reset_index(drop=True))
 
 
-@lru_cache(maxsize=None)
-def get_strikes(symbol: str, expiration_str: str) -> tuple[float, ...]:
-    ensure_dir(CHAIN_METADATA_DIR / f"symbol={symbol}")
-    cache_path = CHAIN_METADATA_DIR / f"symbol={symbol}" / f"expiration={expiration_str}_strikes.csv"
-    meta_path = small_cache_meta_path(cache_path)
-    with path_lock(cache_path):
-        with file_lock(cache_path):
-            params = {"symbol": symbol, "expiration": expiration_str}
-            if small_cache_is_usable(cache_path, meta_path, "/option/list/strikes", params):
-                df = pd.read_csv(cache_path)
-            else:
-                df, _, _ = get_csv("/option/list/strikes", params)
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
-                atomic_write_bytes(cache_path, csv_bytes)
-                cache_stat = cache_path.stat()
-                write_json(
-                    meta_path,
-                    {
-                        "endpoint": "/option/list/strikes",
-                        "params": params,
-                        "cache_data_sha256": sha256_bytes(csv_bytes),
-                        "cache_data_size_bytes": cache_stat.st_size,
-                        "cache_data_mtime_ns": cache_stat.st_mtime_ns,
-                        "config_digest": run_context()["config_digest"],
-                        "code_digest": run_context()["code_digest"],
-                    },
-                )
-    strike_col = "strike" if "strike" in df.columns else df.columns[-1]
-    strikes = pd.to_numeric(df[strike_col], errors="coerce").dropna().sort_values().drop_duplicates().tolist()
-    return tuple(float(strike) for strike in strikes)
+def history_dataset(asset: str, kind: str) -> str:
+    if kind == "quote":
+        return f"{asset}_quotes_{CFG.quote_interval}"
+    return f"{asset}_trades_tick" if kind == "trade" else f"{asset}_{kind}"
 
 
-def get_stock_quotes(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
-    return fetch_market_frame(
-        dataset=f"stock_quotes_{CFG.quote_interval}",
-        symbol=symbol,
-        day=day,
-        path="/stock/history/quote",
-        params={"symbol": symbol, "date": day.strftime("%Y%m%d"), "interval": CFG.quote_interval},
-        derived_columns=("stock_mid", "stock_spread"),
-    )
+def get_history(asset: str, kind: str, symbol: str, day: pd.Timestamp,
+                expiration: pd.Timestamp | None = None, strike: float | None = None,
+                right: str | None = None) -> pd.DataFrame:
+    params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
+    identity = {}
+    if asset == "option":
+        identity = {"expiration": expiration.strftime("%Y-%m-%d"), "strike": strike, "right": right}
+        params.update(identity, strike=format_strike(strike))
+    else:
+        params["venue"] = CFG.stock_venue
+    derived = ()
+    if kind == "quote":
+        params["interval"] = CFG.quote_interval
+        derived = (f"{asset}_mid", f"{asset}_spread") + (("rel_spread",) if asset == "option" else ())
+    if kind != "open_interest":
+        opened, closed = market_session_bounds(day)
+        params.update(start_time=opened.strftime("%H:%M:%S"), end_time=closed.strftime("%H:%M:%S"))
+    return fetch_market_frame(history_dataset(asset, kind), symbol, day, f"/{asset}/history/{kind}",
+                              params, derived_columns=derived, **identity)
 
 
-def get_stock_trades(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
-    return fetch_market_frame(
-        dataset=f"stock_trades_{CFG.trade_interval}",
-        symbol=symbol,
-        day=day,
-        path="/stock/history/trade",
-        params={"symbol": symbol, "date": day.strftime("%Y%m%d"), "interval": CFG.trade_interval},
-    )
-
-
-def get_option_quotes(symbol: str, expiration: pd.Timestamp, strike: float, right: str, day: pd.Timestamp) -> pd.DataFrame:
-    expiration_str = expiration.strftime("%Y-%m-%d")
-    return fetch_market_frame(
-        dataset=f"option_quotes_{CFG.quote_interval}",
-        symbol=symbol,
-        day=day,
-        path="/option/history/quote",
-        params={
-            "symbol": symbol,
-            "expiration": expiration_str,
-            "strike": format_strike(strike),
-            "right": right.lower(),
-            "date": day.strftime("%Y%m%d"),
-            "interval": CFG.quote_interval,
-        },
-        expiration=expiration_str,
-        strike=strike,
-        right=right,
-        derived_columns=("option_mid", "option_spread", "rel_spread"),
-    )
-
-
-def get_option_trades(symbol: str, expiration: pd.Timestamp, strike: float, right: str, day: pd.Timestamp) -> pd.DataFrame:
-    expiration_str = expiration.strftime("%Y-%m-%d")
-    return fetch_market_frame(
-        dataset=f"option_trades_{CFG.trade_interval}",
-        symbol=symbol,
-        day=day,
-        path="/option/history/trade",
-        params={
-            "symbol": symbol,
-            "expiration": expiration_str,
-            "strike": format_strike(strike),
-            "right": right.lower(),
-            "date": day.strftime("%Y%m%d"),
-            "interval": CFG.trade_interval,
-        },
-        expiration=expiration_str,
-        strike=strike,
-        right=right,
-    )
-
-
-def get_option_open_interest(symbol: str, expiration: pd.Timestamp, strike: float, right: str, day: pd.Timestamp) -> pd.DataFrame:
-    expiration_str = expiration.strftime("%Y-%m-%d")
-    return fetch_market_frame(
-        dataset="option_open_interest",
-        symbol=symbol,
-        day=day,
-        path="/option/history/open_interest",
-        params={
-            "symbol": symbol,
-            "expiration": expiration_str,
-            "strike": format_strike(strike),
-            "right": right.lower(),
-            "date": day.strftime("%Y%m%d"),
-        },
-        expiration=expiration_str,
-        strike=strike,
-        right=right,
-    )
+def collect_history(asset: str, kind: str, symbol: str, day: pd.Timestamp,
+                    expiration: pd.Timestamp | None = None, strike: float | None = None,
+                    right: str | None = None) -> tuple[pd.DataFrame, dict]:
+    """Keep absent data distinct from request errors without losing diagnostic rows."""
+    error = ""
+    try:
+        frame = get_history(asset, kind, symbol, day, expiration, strike, right)
+        status = "available" if not frame.empty else "no_data"
+        if frame.empty and frame.attrs.get("filtered_condition_row_count", 0):
+            status = "filtered_out"
+    except Exception as exc:
+        frame, error, status = pd.DataFrame(), repr(exc), "request_error"
+    dataset = f"{asset}_{kind}s" if kind in {"quote", "trade"} else f"{asset}_{kind}"
+    diagnostic = summarize_market_frame(frame, dataset, day, CFG.quote_interval if kind == "quote" else None)
+    diagnostic.update(symbol=symbol, trade_day=day, expiration=expiration, strike=strike,
+                      right=right.upper() if right else "", request_error=error, data_status=status,
+                      contract_id=occ_contract_id(symbol, expiration, right, strike) if expiration is not None else "")
+    return frame, diagnostic
 
 
 # ============================================================
@@ -1366,7 +1229,7 @@ def occ_contract_id(symbol: str, expiration: pd.Timestamp, right: str, strike: f
 def count_sync_missing(stock_ts_ns: np.ndarray, option_ts: pd.Series, tolerance_seconds: int = 5) -> float:
     if len(stock_ts_ns) == 0 or option_ts.empty:
         return np.nan
-    option_ns = pd.DatetimeIndex(option_ts.dropna()).asi8
+    option_ns = pd.DatetimeIndex(option_ts.dropna()).as_unit("ns").asi8
     if option_ns.size == 0:
         return np.nan
     positions = np.searchsorted(stock_ts_ns, option_ns)
@@ -1404,7 +1267,7 @@ def summarize_market_frame(
         "duplicate_timestamp_count": 0,
         "duplicate_timestamp_conflict_count": 0,
         "out_of_order_timestamp_count": 0,
-        "missing_interval_count": 0,
+        "missing_interval_count": 0 if interval is not None else np.nan,
         "max_gap_seconds": np.nan,
         "p99_gap_seconds": np.nan,
         "interval_alignment_miss_count": 0,
@@ -1573,77 +1436,18 @@ def collect_contract_day(
     chain_context: dict,
 ) -> tuple[dict, list[dict]]:
     contract_key = occ_contract_id(symbol_cfg.symbol, expiration, right, strike)
-    oi_error = ""
-    if prev_trade_day is not None:
-        try:
-            option_oi = get_option_open_interest(symbol_cfg.symbol, expiration, strike, right, prev_trade_day)
-            oi_diag = summarize_market_frame(option_oi, "option_open_interest", prev_trade_day)
-        except Exception as exc:
-            option_oi = pd.DataFrame()
-            oi_diag = summarize_market_frame(option_oi, "option_open_interest", prev_trade_day)
-            oi_error = repr(exc)
-    else:
-        option_oi = pd.DataFrame()
-        oi_diag = summarize_market_frame(option_oi, "option_open_interest", trade_day)
-        oi_error = "no_previous_trade_day"
-    quality_rows = [
-        {
-            "symbol": symbol_cfg.symbol,
-            "trade_day": trade_day,
-            "expiration": expiration,
-            "strike": strike,
-            "right": right.upper(),
-            "contract_id": contract_key,
-            "open_interest_trade_day": prev_trade_day,
-            **oi_diag,
-            "request_error": oi_error,
-        }
-    ]
-
-    quote_error = ""
-    try:
-        option_quotes = get_option_quotes(symbol_cfg.symbol, expiration, strike, right, trade_day)
-        quote_diag = summarize_market_frame(option_quotes, "option_quotes", trade_day, CFG.quote_interval)
-    except Exception as exc:
-        option_quotes = pd.DataFrame()
-        quote_diag = summarize_market_frame(option_quotes, "option_quotes", trade_day, CFG.quote_interval)
-        quote_error = repr(exc)
-
-    trade_error = ""
-    try:
-        option_trades = get_option_trades(symbol_cfg.symbol, expiration, strike, right, trade_day)
-        trade_diag = summarize_market_frame(option_trades, "option_trades", trade_day, CFG.trade_interval)
-    except Exception as exc:
-        option_trades = pd.DataFrame()
-        trade_diag = summarize_market_frame(option_trades, "option_trades", trade_day, CFG.trade_interval)
-        trade_error = repr(exc)
-
-    quality_rows.extend(
-        [
-            {
-                "symbol": symbol_cfg.symbol,
-                "trade_day": trade_day,
-                "expiration": expiration,
-                "strike": strike,
-                "right": right.upper(),
-                "contract_id": contract_key,
-                **quote_diag,
-                "request_error": quote_error,
-            },
-            {
-                "symbol": symbol_cfg.symbol,
-                "trade_day": trade_day,
-                "expiration": expiration,
-                "strike": strike,
-                "right": right.upper(),
-                "contract_id": contract_key,
-                **trade_diag,
-                "request_error": trade_error,
-            },
-        ]
-    )
-
-    open_interest = float(option_oi["open_interest"].dropna().iloc[-1]) if (not option_oi.empty and "open_interest" in option_oi.columns and option_oi["open_interest"].notna().any()) else np.nan
+    frames, diagnostics = {}, {}
+    for kind in ("open_interest", "quote", "trade"):
+        frames[kind], diagnostics[kind] = collect_history(
+            "option", kind, symbol_cfg.symbol, trade_day, expiration, strike, right)
+    option_oi, option_quotes, option_trades = (frames[k] for k in ("open_interest", "quote", "trade"))
+    oi_diag, quote_diag, trade_diag = (diagnostics[k] for k in ("open_interest", "quote", "trade"))
+    quality_rows = list(diagnostics.values())
+    oi_diag.update(open_interest_trade_day=prev_trade_day, open_interest_report_date=trade_day)
+    # The report on D describes D-1 close. Use only reports received by evaluation time.
+    primary_entry = next(iter(stock_context["evaluation_contexts"].values()))["entry_ts"]
+    primary_oi = market_snapshot(option_oi, primary_entry, prefix="oi")
+    open_interest = to_float(primary_oi.get("oi_open_interest"))
     quote_mid = option_quotes["option_mid"] if "option_mid" in option_quotes.columns else pd.Series(dtype=float)
     quote_spread = option_quotes["option_spread"] if "option_spread" in option_quotes.columns else pd.Series(dtype=float)
     trade_price = option_trades["price"] if "price" in option_trades.columns else pd.Series(dtype=float)
@@ -1679,34 +1483,16 @@ def collect_contract_day(
                 total_trade_size >= 10,
                 trade_diag["outside_session_row_count"] == 0,
                 trade_diag["timestamp_naive_assumed_count"] == 0,
-                trade_diag["missing_interval_count"] == 0,
+                trade_diag["data_status"] == "available",
             ]
         )
     )
-    option_quote_meta = raw_cache_meta(
-        f"option_quotes_{CFG.quote_interval}",
-        symbol_cfg.symbol,
-        trade_day,
-        expiration=expiration.strftime("%Y-%m-%d"),
-        strike=strike,
-        right=right,
-    )
-    option_trade_meta = raw_cache_meta(
-        f"option_trades_{CFG.trade_interval}",
-        symbol_cfg.symbol,
-        trade_day,
-        expiration=expiration.strftime("%Y-%m-%d"),
-        strike=strike,
-        right=right,
-    )
-    option_oi_meta = raw_cache_meta(
-        "option_open_interest",
-        symbol_cfg.symbol,
-        prev_trade_day if prev_trade_day is not None else trade_day,
-        expiration=expiration.strftime("%Y-%m-%d"),
-        strike=strike,
-        right=right,
-    )
+    metadata = {
+        kind: raw_cache_meta(history_dataset("option", kind), symbol_cfg.symbol, trade_day,
+                             expiration=expiration.strftime("%Y-%m-%d"), strike=strike, right=right)
+        for kind in ("quote", "trade", "open_interest")
+    }
+    option_quote_meta, option_trade_meta, option_oi_meta = (metadata[k] for k in ("quote", "trade", "open_interest"))
 
     corporate_actions = stock_context.get("corporate_actions", pd.DataFrame())
     # Corporate-action flags are annotations, not hard exclusions. The modeling
@@ -1730,7 +1516,7 @@ def collect_contract_day(
     for label, eval_context in stock_context["evaluation_contexts"].items():
         entry_ts = eval_context["entry_ts"]
         exit_ts = eval_context["exit_ts"]
-        # Per-evaluation moneyness depends on get_stock_quotes deriving
+        # Per-evaluation moneyness depends on stock history deriving
         # stock_mid; if that input is unavailable, the value is intentionally NaN.
         underlying_reference_mid = to_float(eval_context["entry_quote"].get(f"stock_eval_{label}_entry_quote_stock_mid", np.nan))
         entry_date = pd.Timestamp(entry_ts.date())
@@ -1740,26 +1526,16 @@ def collect_contract_day(
         evaluation_fields[f"eval_{label}_underlying_reference_mid"] = underlying_reference_mid
         evaluation_fields[f"eval_{label}_moneyness"] = underlying_reference_mid / strike if strike > 0 and pd.notna(underlying_reference_mid) else np.nan
         evaluation_fields[f"eval_{label}_dividend_in_horizon_flag"] = dividend_in_eval_horizon
-        evaluation_fields.update(market_snapshot(option_quotes, entry_ts, max_age_seconds=CFG.max_option_quote_age_seconds, prefix=f"eval_{label}_entry_quote"))
-        evaluation_fields.update(market_snapshot(option_quotes, exit_ts, max_age_seconds=CFG.max_option_quote_age_seconds, prefix=f"eval_{label}_exit_quote"))
-        evaluation_fields.update(market_snapshot(option_trades, entry_ts, trade_lookback_minutes=CFG.recent_trade_lookback_minutes, prefix=f"eval_{label}_entry_trade"))
-        evaluation_fields.update(market_snapshot(option_trades, exit_ts, trade_lookback_minutes=CFG.recent_trade_lookback_minutes, prefix=f"eval_{label}_exit_trade"))
-        evaluation_fields.update(window_update_features(option_quotes, entry_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"eval_{label}_entry_quote_window", value_column="option_mid"))
-        evaluation_fields.update(window_update_features(option_quotes, exit_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"eval_{label}_exit_quote_window", value_column="option_mid"))
-        evaluation_fields.update(window_update_features(option_trades, entry_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"eval_{label}_entry_trade_window", value_column="price"))
-        evaluation_fields.update(window_update_features(option_trades, exit_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"eval_{label}_exit_trade_window", value_column="price"))
-        for key in (
-            "metadata",
-            "entry_quote",
-            "exit_quote",
-            "entry_trade",
-            "exit_trade",
-            "entry_quote_window",
-            "exit_quote_window",
-            "entry_trade_window",
-            "exit_trade_window",
-        ):
-            evaluation_fields.update(eval_context[key])
+        contexts = evaluation_observations(option_quotes, option_trades, entry_ts, exit_ts,
+                                            f"eval_{label}", "option", CFG.max_option_quote_age_seconds)
+        for values in contexts.values():
+            evaluation_fields.update(values)
+        oi = market_snapshot(option_oi, entry_ts, prefix="oi")
+        evaluation_fields[f"eval_{label}_open_interest"] = to_float(oi.get("oi_open_interest"))
+        evaluation_fields[f"eval_{label}_open_interest_report_timestamp"] = oi["oi_timestamp"]
+        for key, values in eval_context.items():
+            if isinstance(values, dict):
+                evaluation_fields.update(values)
 
     contract_row = {
         "symbol": symbol_cfg.symbol,
@@ -1787,6 +1563,12 @@ def collect_contract_day(
         "trade_vwap": vwap,
         "total_trade_size": total_trade_size,
         "lagged_open_interest": open_interest,
+        "open_interest_report_date": trade_day,
+        "open_interest_report_timestamp": primary_oi["oi_timestamp"],
+        "request_error_count": sum(bool(d["request_error"]) for d in quality_rows),
+        "quote_data_status": quote_diag["data_status"],
+        "trade_data_status": trade_diag["data_status"],
+        "open_interest_data_status": oi_diag["data_status"],
         "option_to_stock_sync_missing_count": sync_missing,
         "quote_missing_interval_count": quote_diag["missing_interval_count"],
         "trade_missing_interval_count": trade_diag["missing_interval_count"],
@@ -1825,7 +1607,7 @@ def collect_contract_day(
         "option_quote_trade_clock_alignment_median_skew_seconds": option_quote_trade_alignment["clock_alignment_median_skew_seconds"],
         "option_quote_trade_clock_alignment_p95_abs_skew_seconds": option_quote_trade_alignment["clock_alignment_p95_abs_skew_seconds"],
         "total_strike_count_for_expiration": chain_context["total_strike_count_for_expiration"],
-        "total_listed_contract_count_for_expiration": chain_context["total_listed_contract_count_for_expiration"],
+        "total_quoted_contract_count_for_expiration": chain_context["total_quoted_contract_count_for_expiration"],
         "sampled_strike_count_for_expiration": chain_context["sampled_strike_count_for_expiration"],
         "sampled_contract_count_for_expiration": chain_context["sampled_contract_count_for_expiration"],
         "sampled_contract_fraction_for_expiration": chain_context["sampled_contract_fraction_for_expiration"],
@@ -1843,286 +1625,193 @@ def collect_contract_day(
     return contract_row, quality_rows
 
 
+def evaluation_observations(quotes: pd.DataFrame, trades: pd.DataFrame,
+                            entry: pd.Timestamp, exit: pd.Timestamp, prefix: str,
+                            asset: str, max_quote_age: int) -> dict[str, dict]:
+    result = {}
+    for moment, timestamp in (("entry", entry), ("exit", exit)):
+        for kind, frame in (("quote", quotes), ("trade", trades)):
+            key = f"{moment}_{kind}"
+            options = ({"max_age_seconds": max_quote_age} if kind == "quote"
+                       else {"trade_lookback_minutes": CFG.recent_trade_lookback_minutes})
+            result[key] = market_snapshot(frame, timestamp, prefix=f"{prefix}_{key}", **options)
+            result[f"{key}_window"] = window_update_features(
+                frame, timestamp, window_minutes=CFG.recent_trade_lookback_minutes,
+                prefix=f"{prefix}_{key}_window", value_column=f"{asset}_mid" if kind == "quote" else "price")
+    return result
+
+
 def collect_symbol_day(
     symbol_cfg: SymbolConfig,
     trade_day: pd.Timestamp,
     chunk_writer: SymbolDayChunkWriter | None = None,
 ) -> tuple[dict, list[dict], list[dict], list[dict], list[dict]]:
-    try:
-        stock_quotes = get_stock_quotes(symbol_cfg.symbol, trade_day)
-        stock_error = ""
-    except Exception as exc:
-        stock_quotes = pd.DataFrame()
-        stock_error = repr(exc)
-    try:
-        stock_trades = get_stock_trades(symbol_cfg.symbol, trade_day)
-        stock_trade_error = ""
-    except Exception as exc:
-        stock_trades = pd.DataFrame()
-        stock_trade_error = repr(exc)
-
+    symbol = symbol_cfg.symbol
+    stock_quotes, quote_diag = collect_history("stock", "quote", symbol, trade_day)
+    stock_trades, trade_diag = collect_history("stock", "trade", symbol, trade_day)
     stock_day = describe_stock_day(stock_quotes, trade_day)
-    carry_context = carry_snapshot(symbol_cfg.symbol, trade_day)
-    stock_available = not pd.isna(stock_day.get("stock_open_mid", np.nan))
-    prev_trade = previous_trade_day(trade_day) if stock_available else None
-    stock_clock_alignment = nearest_clock_skew_seconds(
-        stock_quotes["timestamp"] if "timestamp" in stock_quotes.columns else pd.Series(dtype="datetime64[ns, America/New_York]"),
-        stock_trades["timestamp"] if "timestamp" in stock_trades.columns else pd.Series(dtype="datetime64[ns, America/New_York]"),
-    )
+    stock_available = pd.notna(stock_day.get("stock_open_mid"))
+    prev_trade = previous_trade_day(trade_day)
+    request_errors = sum(bool(d["request_error"]) for d in (quote_diag, trade_diag))
+    clock = nearest_clock_skew_seconds(stock_quotes.get("timestamp", pd.Series(dtype=object)),
+                                      stock_trades.get("timestamp", pd.Series(dtype=object)))
     session_row = {
-        "output_schema_version": OUTPUT_SCHEMA_VERSION,
-        "symbol": symbol_cfg.symbol,
-        "asset_type": symbol_cfg.asset_type,
-        "universe_bucket": symbol_cfg.universe_bucket,
-        "sector_proxy": symbol_cfg.sector_proxy,
-        "requested_day": trade_day,
-        "trade_day": trade_day,
-        "stock_request_error": stock_error,
-        "stock_trade_request_error": stock_trade_error,
-        "stock_data_available": stock_available,
-        "stock_trade_data_available": bool(not stock_trades.empty),
-        "previous_trade_day_for_oi": prev_trade,
-        **session_metadata(trade_day),
-        **carry_context,
-        "stock_quote_trade_clock_alignment_pair_count": stock_clock_alignment["clock_alignment_pair_count"],
-        "stock_quote_trade_clock_alignment_median_skew_seconds": stock_clock_alignment["clock_alignment_median_skew_seconds"],
-        "stock_quote_trade_clock_alignment_p95_abs_skew_seconds": stock_clock_alignment["clock_alignment_p95_abs_skew_seconds"],
-        **stock_day,
+        "output_schema_version": OUTPUT_SCHEMA_VERSION, "config_digest": _CONFIG_DIGEST,
+        **asdict(symbol_cfg), "requested_day": trade_day, "trade_day": trade_day,
+        "stock_request_error": quote_diag["request_error"],
+        "stock_trade_request_error": trade_diag["request_error"],
+        "stock_quote_data_status": quote_diag["data_status"],
+        "stock_trade_data_status": trade_diag["data_status"],
+        "stock_data_available": stock_available, "stock_trade_data_available": not stock_trades.empty,
+        "open_interest_asof_trade_day": prev_trade, "open_interest_report_date": trade_day,
+        "contract_universe": "quoted_on_trade_date", "stock_venue": CFG.stock_venue,
+        "collection_status": "request_error" if request_errors else "unavailable",
+        "unavailable_reason": "" if stock_available else f"stock_quotes:{quote_diag['data_status']}",
+        "request_error_count": request_errors,
+        "expected_contract_count": 0, "collected_contract_count": 0,
+        "screened_out_contract_count": 0, "contract_task_failure_count": 0,
+        **session_metadata(trade_day), **stock_day,
+        **{f"stock_quote_trade_{key}": value for key, value in clock.items()},
     }
-    quality_rows = [
-        {
-            "symbol": symbol_cfg.symbol,
-            "trade_day": trade_day,
-            "expiration": pd.NaT,
-            "strike": np.nan,
-            "right": "",
-            "contract_id": "",
-            **summarize_market_frame(stock_quotes, "stock_quotes", trade_day, CFG.quote_interval),
-            "request_error": stock_error,
-        },
-        {
-            "symbol": symbol_cfg.symbol,
-            "trade_day": trade_day,
-            "expiration": pd.NaT,
-            "strike": np.nan,
-            "right": "",
-            "contract_id": "",
-            **summarize_market_frame(stock_trades, "stock_trades", trade_day, CFG.trade_interval),
-            "request_error": stock_trade_error,
-        },
-    ]
-    screening_rows: list[dict] = []
+    quality_rows = [quote_diag, trade_diag]
+    expiration_rows, contract_rows, screening_rows = [], [], []
+    result = (session_row, expiration_rows, contract_rows, quality_rows, screening_rows)
     if not stock_available:
-        return session_row, [], [], quality_rows, screening_rows
+        return result
 
-    all_expirations = get_expirations(symbol_cfg.symbol)
-    in_window_expirations = [
-        expiration for expiration in all_expirations
-        if CFG.min_dte <= int((pd.Timestamp(expiration).normalize() - pd.Timestamp(trade_day).normalize()).days) <= CFG.max_dte
-    ]
+    try:
+        chain = get_quoted_contracts(symbol, trade_day)
+    except Exception as exc:
+        session_row.update(collection_status="request_error", unavailable_reason="contract_discovery_failed",
+                           request_error_count=request_errors + 1)
+        quality_rows.append({"symbol": symbol, "trade_day": trade_day, "dataset": "quoted_contracts",
+                             "request_error": repr(exc), "data_status": "request_error"})
+        return result
+    session_row["quoted_contract_count_on_date"] = len(chain)
+    if chain.empty:
+        session_row["unavailable_reason"] = "no_quoted_contracts_on_date"
+        return result
+    all_expirations = tuple(sorted(chain["expiration"].unique()))
+    all_expirations = tuple(pd.Timestamp(value) for value in all_expirations)
+    in_window = [exp for exp in all_expirations if CFG.min_dte <= (exp - trade_day).days <= CFG.max_dte]
     expirations = eligible_expirations(trade_day, all_expirations)
-    excluded_expiration_count = len(all_expirations) - len(in_window_expirations)
-    expiration_rows: list[dict] = []
-    contract_rows: list[dict] = []
-    collected_contract_count = 0
-    contract_task_failure_count = 0
-    stock_timestamp_ns = pd.DatetimeIndex(stock_quotes["timestamp"].dropna()).asi8 if "timestamp" in stock_quotes.columns else np.array([], dtype=np.int64)
-    expected_contract_count = 0
-    total_listed_contract_count_eligible = 0
-    total_sampled_contract_targets = 0
-    evaluation_contexts: dict[str, dict] = {}
+    reference_mids = stock_selection_reference_mids(stock_quotes, trade_day)
+    if not reference_mids or not expirations:
+        session_row["unavailable_reason"] = "no_reference_quotes" if not reference_mids else "no_eligible_expirations"
+        return result
+
+    carry_context = carry_snapshot(symbol, trade_day)
+    session_row.update(carry_context)
+    evaluation_contexts = {}
     for label, entry_ts, exit_ts in evaluation_schedule(trade_day):
-        configured_exit_ts = entry_ts + pd.Timedelta(minutes=CFG.horizon_minutes)
-        evaluation_contexts[label] = {
-            "entry_ts": entry_ts,
-            "exit_ts": exit_ts,
+        configured_exit = entry_ts + pd.Timedelta(minutes=CFG.horizon_minutes)
+        context = {
+            "entry_ts": entry_ts, "exit_ts": exit_ts,
             "metadata": {
-                # Late-day evaluations can have a shorter realized horizon when
-                # the configured exit would exceed the exchange close.
                 f"eval_{label}_entry_timestamp": entry_ts,
-                f"eval_{label}_configured_exit_timestamp": configured_exit_ts,
+                f"eval_{label}_configured_exit_timestamp": configured_exit,
                 f"eval_{label}_actual_exit_timestamp": exit_ts,
                 f"eval_{label}_configured_horizon_minutes": CFG.horizon_minutes,
-                f"eval_{label}_actual_horizon_minutes": float((exit_ts - entry_ts).total_seconds() / 60.0),
-                f"eval_{label}_exit_clipped_to_session_close": bool(exit_ts < configured_exit_ts),
+                f"eval_{label}_actual_horizon_minutes": (exit_ts - entry_ts).total_seconds() / 60,
+                f"eval_{label}_exit_clipped_to_session_close": exit_ts < configured_exit,
             },
-            "entry_quote": market_snapshot(stock_quotes, entry_ts, max_age_seconds=CFG.max_stock_quote_age_seconds, prefix=f"stock_eval_{label}_entry_quote"),
-            "exit_quote": market_snapshot(stock_quotes, exit_ts, max_age_seconds=CFG.max_stock_quote_age_seconds, prefix=f"stock_eval_{label}_exit_quote"),
-            "entry_trade": market_snapshot(stock_trades, entry_ts, trade_lookback_minutes=CFG.recent_trade_lookback_minutes, prefix=f"stock_eval_{label}_entry_trade"),
-            "exit_trade": market_snapshot(stock_trades, exit_ts, trade_lookback_minutes=CFG.recent_trade_lookback_minutes, prefix=f"stock_eval_{label}_exit_trade"),
-            "entry_quote_window": window_update_features(stock_quotes, entry_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"stock_eval_{label}_entry_quote_window", value_column="stock_mid"),
-            "exit_quote_window": window_update_features(stock_quotes, exit_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"stock_eval_{label}_exit_quote_window", value_column="stock_mid"),
-            "entry_trade_window": window_update_features(stock_trades, entry_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"stock_eval_{label}_entry_trade_window", value_column="price"),
-            "exit_trade_window": window_update_features(stock_trades, exit_ts, window_minutes=CFG.recent_trade_lookback_minutes, prefix=f"stock_eval_{label}_exit_trade_window", value_column="price"),
+            **evaluation_observations(stock_quotes, stock_trades, entry_ts, exit_ts,
+                                      f"stock_eval_{label}", "stock", CFG.max_stock_quote_age_seconds),
         }
-    for eval_context in evaluation_contexts.values():
-        for key in ("metadata", "entry_quote", "exit_quote", "entry_trade", "exit_trade", "entry_quote_window", "exit_quote_window", "entry_trade_window", "exit_trade_window"):
-            session_row.update(eval_context[key])
-    selection_reference_mids = stock_selection_reference_mids(stock_quotes, trade_day)
-    stock_context = {
-        # Any field needed by contract rows must be placed here before workers
-        # are submitted; contract tasks receive this immutable snapshot.
-        "evaluation_contexts": evaluation_contexts,
-        "stock_quote_timestamps": stock_quotes["timestamp"] if "timestamp" in stock_quotes.columns else pd.Series(dtype="datetime64[ns, America/New_York]"),
-        "stock_quote_timestamps_ns": stock_timestamp_ns,
-        "carry_context": carry_context,
-        "corporate_actions": get_corporate_actions(symbol_cfg.symbol),
-    }
-    skipped_expirations = [exp for exp in in_window_expirations if exp not in expirations]
-    for skipped_expiration in skipped_expirations:
-        skipped_strikes = get_strikes(symbol_cfg.symbol, skipped_expiration.strftime("%Y-%m-%d"))
-        screening_rows.append(
-            {
-                "symbol": symbol_cfg.symbol,
-                "trade_day": trade_day,
-                "expiration": skipped_expiration,
-                "strike": np.nan,
-                "right": "",
-                "contract_id": "",
-                "selection_status": "unsampled_expiration",
-                "unsampled_reason": "not_targeted_expiration_bucket",
-                "dte_days": int((skipped_expiration - trade_day).days),
-                "total_strike_count_for_expiration": len(skipped_strikes),
-                "total_listed_contract_count_for_expiration": len(skipped_strikes) * len(CFG.option_rights),
-                "sampled_strike_count_for_expiration": 0,
-                "sampled_contract_count_for_expiration": 0,
-            }
-        )
-    clean_contract_counts = {label: 0 for label in evaluation_contexts}
-    broad_contract_counts = {label: 0 for label in evaluation_contexts}
+        evaluation_contexts[label] = context
+        for values in context.values():
+            if isinstance(values, dict):
+                session_row.update(values)
+    stock_timestamp_ns = pd.DatetimeIndex(stock_quotes["timestamp"].dropna()).as_unit("ns").asi8
+    stock_context = {"evaluation_contexts": evaluation_contexts,
+                     "stock_quote_timestamps_ns": stock_timestamp_ns,
+                     "carry_context": carry_context, "corporate_actions": get_corporate_actions(symbol)}
+    clean_counts = dict.fromkeys(evaluation_contexts, 0)
+    broad_counts = dict.fromkeys(evaluation_contexts, 0)
+    expected = collected = failures = eligible_count = 0
     with ThreadPoolExecutor(max_workers=CFG.max_contract_workers) as executor:
-        contract_futures = {}
-        for expiration in expirations:
-            strikes = get_strikes(symbol_cfg.symbol, expiration.strftime("%Y-%m-%d"))
-            total_listed_contract_count_eligible += len(strikes) * len(CFG.option_rights)
-            chosen_strikes = selected_strikes(strikes, selection_reference_mids)
-            total_sampled_contract_targets += len(chosen_strikes) * len(CFG.option_rights)
-            unsampled_strikes = [float(value) for value in strikes if float(value) not in set(chosen_strikes)]
-            expiration_rows.append(
-                {
-                    "symbol": symbol_cfg.symbol,
-                    "trade_day": trade_day,
-                    "expiration": expiration,
-                    "dte_days": int((expiration - trade_day).days),
-                    "strike_count": len(strikes),
-                    "selected_strike_count": len(chosen_strikes),
-                    "listed_contract_count": len(strikes) * len(CFG.option_rights),
-                    "observed_contract_target_count": len(chosen_strikes) * len(CFG.option_rights),
-                    "sampled_contract_fraction_of_listed": ((len(chosen_strikes) * len(CFG.option_rights)) / max(len(strikes) * len(CFG.option_rights), 1)),
-                    "rights_collected": ",".join(opt.upper() for opt in CFG.option_rights),
-                    "excluded_expiration_count_outside_window": excluded_expiration_count,
-                }
-            )
-            strike_rank_map = {float(value): idx + 1 for idx, value in enumerate(sorted(float(v) for v in strikes))}
-            strike_count = max(len(strikes), 1)
-            for unsampled_strike in unsampled_strikes:
-                screening_rows.append(
-                    {
-                        "symbol": symbol_cfg.symbol,
-                        "trade_day": trade_day,
-                        "expiration": expiration,
-                        "strike": unsampled_strike,
-                        "right": "",
-                        "contract_id": "",
-                        "selection_status": "unsampled_strike",
-                        "unsampled_reason": "not_targeted_moneyness_grid",
-                        "dte_days": int((expiration - trade_day).days),
-                        "total_strike_count_for_expiration": len(strikes),
-                        "total_listed_contract_count_for_expiration": len(strikes) * len(CFG.option_rights),
-                        "sampled_strike_count_for_expiration": len(chosen_strikes),
-                        "sampled_contract_count_for_expiration": len(chosen_strikes) * len(CFG.option_rights),
-                        "strike_rank_in_expiration": strike_rank_map.get(float(unsampled_strike), np.nan),
-                        "strike_percentile_in_expiration": (strike_rank_map.get(float(unsampled_strike), 0) - 1) / max(strike_count - 1, 1),
-                    }
-                )
-            for strike in chosen_strikes:
-                for right in CFG.option_rights:
-                    expected_contract_count += 1
-                    chain_context = {
-                        "primary_reference_mid": next(iter(selection_reference_mids.values()), np.nan),
-                        "total_strike_count_for_expiration": len(strikes),
-                        "total_listed_contract_count_for_expiration": len(strikes) * len(CFG.option_rights),
-                        "sampled_strike_count_for_expiration": len(chosen_strikes),
-                        "sampled_contract_count_for_expiration": len(chosen_strikes) * len(CFG.option_rights),
-                        "sampled_contract_fraction_for_expiration": (len(chosen_strikes) * len(CFG.option_rights)) / max(len(strikes) * len(CFG.option_rights), 1),
-                        "strike_rank_in_expiration": strike_rank_map.get(float(strike), np.nan),
-                        "strike_percentile_in_expiration": (strike_rank_map.get(float(strike), 0) - 1) / max(strike_count - 1, 1),
-                    }
-                    future = executor.submit(
-                        collect_contract_day,
-                        symbol_cfg,
-                        trade_day,
-                        expiration,
-                        strike,
-                        right,
-                        prev_trade,
-                        stock_timestamp_ns,
-                        stock_day,
-                        stock_context,
-                        chain_context,
-                    )
-                    # Keep contract identity beside each future so failures are
-                    # logged against the correct expiration/strike/right.
-                    contract_futures[future] = (expiration, strike, right)
-        for future in as_completed(contract_futures):
-            expiration, strike, right = contract_futures[future]
-            try:
-                contract_row, contract_quality_rows = future.result()
-            except Exception as exc:
-                contract_task_failure_count += 1
-                failure_row = {
-                    "symbol": symbol_cfg.symbol,
-                    "trade_day": trade_day,
-                    "expiration": expiration,
-                    "strike": strike,
-                    "right": str(right).upper(),
-                    "contract_id": "",
-                    "dataset": "contract_collection",
-                    "row_count": 0,
-                    "empty_pull": True,
-                    "request_error": repr(exc),
-                }
-                if chunk_writer is not None:
-                    chunk_writer.extend_quality_rows([failure_row])
-                else:
-                    quality_rows.append(failure_row)
+        futures = {}
+        for expiration in in_window:
+            family = chain.loc[chain["expiration"].eq(expiration)]
+            strikes = tuple(sorted(family["strike"].unique()))
+            chosen = selected_strikes(strikes, reference_mids) if expiration in expirations else []
+            selected = family.loc[family["strike"].isin(chosen)]
+            common = {
+                "total_strike_count_for_expiration": len(strikes),
+                "total_quoted_contract_count_for_expiration": len(family),
+                "sampled_strike_count_for_expiration": len(chosen),
+                "sampled_contract_count_for_expiration": len(selected),
+            }
+            identity = {"symbol": symbol, "trade_day": trade_day, "expiration": expiration,
+                        "dte_days": (expiration - trade_day).days}
+            rank = {float(value): i + 1 for i, value in enumerate(strikes)}
+            def strike_context(value):
+                return {"strike_rank_in_expiration": rank[float(value)],
+                        "strike_percentile_in_expiration": (rank[float(value)] - 1) / max(len(strikes) - 1, 1)}
+            if expiration not in expirations:
+                screening_rows.append({**identity, **common, "strike": np.nan, "right": "", "contract_id": "",
+                                       "selection_status": "unsampled_expiration",
+                                       "unsampled_reason": "not_targeted_expiration_bucket"})
                 continue
-            for label in evaluation_contexts:
-                clean_contract_counts[label] += int(bool(contract_row.get(f"clean_sample_included_{label}", False)))
-                broad_contract_counts[label] += int(bool(contract_row.get(f"broad_sample_included_{label}", False)))
-            if chunk_writer is not None:
-                collected_contract_count += 1
-                chunk_writer.append_contract_row(contract_row)
-                chunk_writer.extend_quality_rows(contract_quality_rows)
+            eligible_count += len(family)
+            expiration_rows.append({**identity, "strike_count": len(strikes), "selected_strike_count": len(chosen),
+                                    "quoted_contract_count": len(family), "observed_contract_target_count": len(selected),
+                                    "sampled_contract_fraction_of_quoted": len(selected) / max(len(family), 1),
+                                    "rights_collected": ",".join(sorted(selected["right"].str.upper().unique())),
+                                    "excluded_expiration_count_outside_window": len(all_expirations) - len(in_window)})
+            for strike in strikes:
+                if strike not in chosen:
+                    screening_rows.append({**identity, **common, **strike_context(strike), "strike": strike,
+                                           "right": "", "contract_id": "", "selection_status": "unsampled_strike",
+                                           "unsampled_reason": "not_targeted_moneyness_grid"})
+            for contract in selected.itertuples(index=False):
+                context = {**common, **strike_context(contract.strike),
+                           "sampled_contract_fraction_for_expiration": len(selected) / max(len(family), 1),
+                           "primary_reference_mid": next(iter(reference_mids.values()))}
+                future = executor.submit(collect_contract_day, symbol_cfg, trade_day, expiration,
+                                         contract.strike, contract.right, prev_trade, stock_timestamp_ns,
+                                         stock_day, stock_context, context)
+                futures[future] = (expiration, contract.strike, contract.right)
+                expected += 1
+        for future in as_completed(futures):
+            expiration, strike, right = futures[future]
+            try:
+                row, diagnostics = future.result()
+            except Exception as exc:
+                failures += 1
+                diagnostics = [{"symbol": symbol, "trade_day": trade_day, "expiration": expiration,
+                                "strike": strike, "right": right.upper(), "dataset": "contract_collection",
+                                "data_status": "request_error", "request_error": repr(exc)}]
             else:
-                collected_contract_count += 1
-                contract_rows.append(contract_row)
-                quality_rows.extend(contract_quality_rows)
-
-    if contract_rows:
-        contract_rows.sort(key=lambda row: (row["expiration"], row["strike"], row["right"]))
-    if screening_rows:
-        screening_rows.sort(key=lambda row: (row["expiration"], row["strike"], row["right"]))
-
-    session_row["eligible_expiration_count"] = len(expirations)
-    session_row["in_window_expiration_count"] = len(in_window_expirations)
-    session_row["excluded_expiration_count_outside_window"] = excluded_expiration_count
-    session_row["skipped_in_window_expiration_count"] = len(skipped_expirations)
-    session_row["stock_selection_reference_times"] = "|".join(selection_reference_mids.keys())
-    session_row["stock_selection_reference_mid_count"] = len(selection_reference_mids)
-    session_row["expected_contract_count"] = expected_contract_count
-    session_row["collected_contract_count"] = collected_contract_count
-    session_row["screened_out_contract_count"] = 0
-    session_row["unsampled_chain_context_count"] = len(screening_rows)
-    session_row["total_listed_contract_count_eligible"] = total_listed_contract_count_eligible
-    session_row["sampled_contract_target_count"] = total_sampled_contract_targets
-    session_row["sampled_contract_fraction_eligible"] = total_sampled_contract_targets / max(total_listed_contract_count_eligible, 1)
-    session_row["contract_task_failure_count"] = contract_task_failure_count
-    session_row["contract_task_failure_rate"] = contract_task_failure_count / max(expected_contract_count, 1)
+                collected += 1
+                request_errors += row["request_error_count"]
+                for label in evaluation_contexts:
+                    clean_counts[label] += int(row.get(f"clean_sample_included_{label}", False))
+                    broad_counts[label] += int(row.get(f"broad_sample_included_{label}", False))
+                if chunk_writer:
+                    chunk_writer.append_contract_row(row)
+                else:
+                    contract_rows.append(row)
+            if chunk_writer:
+                chunk_writer.extend_quality_rows(diagnostics)
+            else:
+                quality_rows.extend(diagnostics)
+    contract_rows.sort(key=lambda r: (r["expiration"], r["strike"], r["right"]))
+    session_row.update(
+        collection_status="request_error" if request_errors or failures else "complete", unavailable_reason="",
+        request_error_count=request_errors, expected_contract_count=expected, collected_contract_count=collected,
+        contract_task_failure_count=failures, contract_task_failure_rate=failures / max(expected, 1),
+        eligible_expiration_count=len(expirations), in_window_expiration_count=len(in_window),
+        excluded_expiration_count_outside_window=len(all_expirations) - len(in_window),
+        skipped_in_window_expiration_count=len(in_window) - len(expirations),
+        stock_selection_reference_times="|".join(reference_mids), stock_selection_reference_mid_count=len(reference_mids),
+        unsampled_chain_context_count=len(screening_rows), total_quoted_contract_count_eligible=eligible_count,
+        sampled_contract_target_count=expected, sampled_contract_fraction_eligible=expected / max(eligible_count, 1),
+    )
     for label in evaluation_contexts:
-        session_row[f"clean_contract_count_{label}"] = clean_contract_counts[label]
-        session_row[f"broad_contract_count_{label}"] = broad_contract_counts[label]
-    return session_row, expiration_rows, contract_rows, quality_rows, screening_rows
+        session_row[f"clean_contract_count_{label}"] = clean_counts[label]
+        session_row[f"broad_contract_count_{label}"] = broad_counts[label]
+    return result
 
 
 def download_market_history(ticker: str, cache_name: str, value_name: str) -> pd.DataFrame:
@@ -2450,6 +2139,7 @@ def build_validation_targets() -> pd.DataFrame:
 def output_paths() -> dict[str, Path]:
     return {
         "sessions": CANONICAL_DATA_DIR / "requested_sessions.csv",
+        "availability": DIAGNOSTIC_DATA_DIR / "symbol_day_availability.csv",
         "expirations": CANONICAL_DATA_DIR / "chain_expirations.csv",
         "contracts": CANONICAL_DATA_DIR / "contract_universe.csv",
         "carry_inputs": MARKET_DATA_DIR / "carry_inputs.csv",
@@ -2491,7 +2181,9 @@ def completed_session_keys() -> set[tuple[str, str]]:
             row = frame.iloc[0].to_dict() if not frame.empty else {}
             # Do not let old-schema chunks satisfy resume checks after a schema
             # bump; stale chunks should be archived or collected into a new run.
-            if row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION:
+            if (row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION
+                    or row.get("config_digest") != _CONFIG_DIGEST
+                    or row.get("collection_status") not in {"complete", "unavailable"}):
                 continue
             symbol = str(row.get("symbol", ""))
             trade_day = pd.to_datetime(row.get("trade_day"), errors="coerce")
@@ -2524,24 +2216,31 @@ def write_session_chunks(
     screening_rows: list[dict] | None = None,
 ) -> None:
     paths = chunk_paths()
-    if session_rows:
-        write_parquet_chunk(paths["sessions"], "sessions", symbol, trade_day, session_rows)
-    if expiration_rows:
-        write_parquet_chunk(paths["expirations"], "expirations", symbol, trade_day, expiration_rows)
-    if contract_rows:
-        write_parquet_chunk(paths["contracts"], "contracts", symbol, trade_day, contract_rows)
-    if quality_rows:
-        write_parquet_chunk(paths["quality"], "quality", symbol, trade_day, quality_rows)
-    if screening_rows:
-        write_parquet_chunk(paths["screening"], "screening", symbol, trade_day, screening_rows)
+    rows_by_dataset = {"sessions": session_rows, "expirations": expiration_rows, "contracts": contract_rows,
+                       "quality": quality_rows, "screening": screening_rows}
+    for dataset, rows in rows_by_dataset.items():
+        if rows:
+            write_parquet_chunk(paths[dataset], dataset, symbol, trade_day, rows)
 
 
 def iter_parquet_chunk_frames(base_dir: Path, dataset: str):
-    dataset_dir = base_dir / dataset
-    if not dataset_dir.exists():
-        return
-    for path in sorted(dataset_dir.glob("*.parquet")):
-        yield path, pd.read_parquet(path)
+    for session_path in sorted((CANONICAL_PARTS_DIR / "sessions").glob("*.parquet")):
+        session = pd.read_parquet(session_path)
+        if session.empty:
+            continue
+        row = session.iloc[0]
+        if row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION or row.get("config_digest") != _CONFIG_DIGEST:
+            continue
+        if dataset == "sessions":
+            yield session_path, session
+        elif dataset in {"contracts", "quality"}:
+            count = int(row.get("contract_part_count" if dataset == "contracts" else "quality_part_count", 0))
+            for part in range(1, count + 1):
+                path = base_dir / dataset / f"{session_path.stem}__part={part:05d}.parquet"
+                yield path, pd.read_parquet(path)
+        elif int(row.get("expiration_row_count" if dataset == "expirations" else "screening_row_count", 0)):
+            path = base_dir / dataset / session_path.name
+            yield path, pd.read_parquet(path)
 
 
 def append_csv_frame(path: Path, frame: pd.DataFrame, state: dict[str, bool], key: str) -> None:
@@ -2559,7 +2258,7 @@ def update_progress_manifest(completed_keys: set[tuple[str, str]]) -> None:
         paths["progress"],
         {
             "completed_symbol_days": len(completed_keys),
-            "last_write_utc": pd.Timestamp.utcnow().isoformat(),
+            "last_write_utc": pd.Timestamp.now("UTC").isoformat(),
             "config_digest": run_context()["config_digest"],
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
         },
@@ -2572,7 +2271,15 @@ def assemble_outputs() -> dict:
     ensure_dir(CANONICAL_DATA_DIR)
     ensure_dir(DIAGNOSTIC_DATA_DIR)
     csv_state: dict[str, bool] = {}
+    availability_columns = ["symbol", "trade_day", "collection_status", "unavailable_reason",
+                            "stock_quote_data_status", "stock_trade_data_status", "request_error_count",
+                            "expected_contract_count", "collected_contract_count", "stock_venue", "contract_universe"]
+    # Always write this compact report, even when the large CSV exports are disabled.
+    pd.DataFrame(columns=availability_columns).to_csv(paths["availability"], index=False)
+    csv_state["availability"] = True
     stats = {
+        "unavailable_symbol_days": 0,
+        "failed_symbol_days": 0,
         "requested_symbol_days": 0,
         "expiration_rows": 0,
         "contract_rows": 0,
@@ -2597,6 +2304,10 @@ def assemble_outputs() -> dict:
 
     for _, frame in iter_parquet_chunk_frames(CANONICAL_PARTS_DIR, "sessions"):
         stats["requested_symbol_days"] += len(frame)
+        status = frame.get("collection_status", pd.Series(dtype=str))
+        stats["unavailable_symbol_days"] += int(status.eq("unavailable").sum())
+        stats["failed_symbol_days"] += int(status.eq("request_error").sum())
+        append_csv_frame(paths["availability"], frame.reindex(columns=availability_columns), csv_state, "availability")
         if "symbol" in frame.columns:
             symbols_seen.update(frame["symbol"].dropna().astype(str).tolist())
         if "stock_data_available" in frame.columns:
@@ -2683,10 +2394,10 @@ def assemble_outputs() -> dict:
                 },
             )
             family_state["contract_rows"] += 1
-            family_state["quote_rows_with_data"] += int(pd.to_numeric(pd.Series([row.get("quote_row_count")]), errors="coerce").fillna(0).iloc[0] > 0)
-            family_state["trade_rows_with_data"] += int(pd.to_numeric(pd.Series([row.get("trade_row_count")]), errors="coerce").fillna(0).iloc[0] > 0)
-            spread_value = pd.to_numeric(pd.Series([row.get("median_option_spread")]), errors="coerce").iloc[0]
-            trade_size_value = pd.to_numeric(pd.Series([row.get("total_trade_size")]), errors="coerce").iloc[0]
+            family_state["quote_rows_with_data"] += int(to_int(row.get("quote_row_count")) > 0)
+            family_state["trade_rows_with_data"] += int(to_int(row.get("trade_row_count")) > 0)
+            spread_value = to_float(row.get("median_option_spread"))
+            trade_size_value = to_float(row.get("total_trade_size"))
             if pd.notna(spread_value):
                 family_state["median_option_spread_values"].append(float(spread_value))
             if pd.notna(trade_size_value):
@@ -2702,8 +2413,8 @@ def assemble_outputs() -> dict:
                     "option_quote_trade_abs_skew_values": [],
                 },
             )
-            stock_option_skew = pd.to_numeric(pd.Series([row.get("clock_alignment_median_skew_seconds")]), errors="coerce").iloc[0]
-            option_trade_skew = pd.to_numeric(pd.Series([row.get("option_quote_trade_clock_alignment_median_skew_seconds")]), errors="coerce").iloc[0]
+            stock_option_skew = to_float(row.get("clock_alignment_median_skew_seconds"))
+            option_trade_skew = to_float(row.get("option_quote_trade_clock_alignment_median_skew_seconds"))
             if pd.notna(stock_option_skew):
                 validation_state["stock_option_skew_values"].append(float(stock_option_skew))
                 validation_state["stock_option_abs_skew_values"].append(abs(float(stock_option_skew)))
@@ -2746,9 +2457,8 @@ def assemble_outputs() -> dict:
             )
             state["pulls"] += 1
             for key in ("empty_pulls", "filtered_condition_row_count", "missing_condition_row_count", "duplicate_timestamp_count", "duplicate_timestamp_conflict_count", "out_of_order_timestamp_count", "missing_interval_count", "crossed_market_count", "locked_market_count", "partial_bid_ask_rows", "zero_price_count", "zero_size_count"):
-                value = row.get(key, 0)
-                numeric = pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0]
-                state[key] += int(numeric)
+                value = row.get("empty_pull", False) if key == "empty_pulls" else row.get(key, 0)
+                state[key] += to_int(value)
             state["unique_column_signatures"].add(str(row.get("column_signature", "")))
             state["unique_dtype_signatures"].add(str(row.get("dtype_signature", "")))
             schema_key = (dataset_name, str(row.get("column_signature", "")))
@@ -2768,8 +2478,8 @@ def assemble_outputs() -> dict:
             )
             symbol_state["pulls"] += 1
             for key in ("empty_pulls", "missing_interval_count", "crossed_market_count", "partial_bid_ask_rows"):
-                numeric = pd.to_numeric(pd.Series([row.get(key, 0)]), errors="coerce").fillna(0).iloc[0]
-                symbol_state[key] += int(numeric)
+                value = row.get("empty_pull", False) if key == "empty_pulls" else row.get(key, 0)
+                symbol_state[key] += to_int(value)
 
     if not failures_written:
         pd.DataFrame().to_csv(paths["failures"], index=False)
@@ -2810,6 +2520,8 @@ def assemble_outputs() -> dict:
             {
                 "symbols": len(symbols_seen),
                 "requested_symbol_days": stats["requested_symbol_days"],
+                "unavailable_symbol_days": stats["unavailable_symbol_days"],
+                "failed_symbol_days": stats["failed_symbol_days"],
                 "stock_available_days": stats["stock_available_days"],
                 "expiration_rows": stats["expiration_rows"],
                 "contract_rows": stats["contract_rows"],
@@ -2858,17 +2570,14 @@ def assemble_outputs() -> dict:
     reference_actions_df = collect_reference_actions(UNIVERSE)
     carry_inputs_df = collect_carry_inputs(UNIVERSE)
 
-    observed_instrument_index_df.to_csv(paths["observed_instrument_index"], index=False)
-    family_coverage_df.to_csv(paths["family_coverage"], index=False)
-    summary_df.to_csv(paths["summary"], index=False)
-    dataset_quality_df.to_csv(paths["dataset_quality"], index=False)
-    schema_df.to_csv(paths["schema"], index=False)
-    symbol_quality_df.to_csv(paths["symbol_quality"], index=False)
-    timestamp_validation_df.to_csv(paths["timestamp_validation"], index=False)
-    screening_df.to_csv(paths["screening"], index=False)
-    validation_targets_df.to_csv(paths["validation_targets"], index=False)
-    reference_actions_df.to_csv(paths["reference_actions"], index=False)
-    carry_inputs_df.to_csv(paths["carry_inputs"], index=False)
+    exports = {"observed_instrument_index": observed_instrument_index_df, "family_coverage": family_coverage_df,
+               "summary": summary_df, "dataset_quality": dataset_quality_df, "schema": schema_df,
+               "symbol_quality": symbol_quality_df, "timestamp_validation": timestamp_validation_df,
+               "screening": screening_df, "validation_targets": validation_targets_df,
+               "reference_actions": reference_actions_df, "carry_inputs": carry_inputs_df}
+    for dataset, frame in exports.items():
+        with atomic_output(paths[dataset]) as path:
+            frame.to_csv(path, index=False)
     update_progress_manifest(completed_session_keys())
     return {
         "summary_df": summary_df,
@@ -2884,7 +2593,8 @@ def load_existing_rows() -> set[tuple[str, str]]:
         progress = json.loads(paths["progress"].read_text(encoding="utf-8"))
     except Exception:
         return completed_session_keys()
-    if progress.get("config_digest") != run_context()["config_digest"]:
+    if (progress.get("config_digest") != _CONFIG_DIGEST
+            or progress.get("output_schema_version") != OUTPUT_SCHEMA_VERSION):
         # A mismatched manifest means the already-written parquet set may not
         # correspond to the requested run; fail loudly instead of mixing states.
         raise RuntimeError(
@@ -2899,6 +2609,8 @@ def validate_written_symbol_day(symbol: str, trade_day: pd.Timestamp, session_ro
     session_path = parquet_chunk_path(chunk_paths()["sessions"], "sessions", symbol, trade_day)
     if not session_path.exists():
         raise RuntimeError(f"missing_session_chunk:{session_path}")
+    if session_row.get("collection_status") == "request_error":
+        raise RuntimeError("symbol_day_request_errors; see availability and quality reports")
     contract_pattern = f"{parquet_chunk_stem(symbol, trade_day)}*.parquet"
     contract_parts = list((chunk_paths()["contracts"] / "contracts").glob(contract_pattern))
     screening_parts = list((chunk_paths()["screening"] / "screening").glob(contract_pattern))
@@ -2923,26 +2635,28 @@ def validate_written_symbol_day(symbol: str, trade_day: pd.Timestamp, session_ro
 
 def process_symbol_day(symbol_cfg: SymbolConfig, trade_day: pd.Timestamp) -> tuple[tuple[str, str], dict]:
     chunk_writer = SymbolDayChunkWriter(symbol_cfg.symbol, trade_day)
-    session_row, session_expirations, session_contracts, session_quality, session_screening = collect_symbol_day(
-        symbol_cfg,
-        trade_day,
-        chunk_writer=chunk_writer,
-    )
-    write_session_chunks(
-        symbol=symbol_cfg.symbol,
-        trade_day=trade_day,
-        session_rows=[session_row],
-        expiration_rows=session_expirations,
-        contract_rows=session_contracts,
-        quality_rows=[],
-        screening_rows=session_screening,
-    )
-    if session_quality:
-        chunk_writer.extend_quality_rows(session_quality)
+    try:
+        session_row, expirations, contracts, quality, screening = collect_symbol_day(
+            symbol_cfg, trade_day, chunk_writer=chunk_writer)
+    except Exception as exc:
+        session_row = {**asdict(symbol_cfg), "trade_day": trade_day,
+                       "output_schema_version": OUTPUT_SCHEMA_VERSION, "config_digest": _CONFIG_DIGEST,
+                       "collection_status": "request_error", "unavailable_reason": repr(exc),
+                       "request_error_count": 1, "expected_contract_count": 0, "collected_contract_count": 0}
+        expirations, contracts, screening = [], [], []
+        quality = [{"symbol": symbol_cfg.symbol, "trade_day": trade_day, "dataset": "symbol_day",
+                    "request_error": repr(exc), "data_status": "request_error"}]
+    chunk_writer.extend_quality_rows(quality)
     chunk_writer.finalize()
+    session_row.update(contract_part_count=chunk_writer.parts["contracts"],
+                       quality_part_count=chunk_writer.parts["quality"],
+                       expiration_row_count=len(expirations), screening_row_count=len(screening))
+    write_session_chunks(symbol_cfg.symbol, trade_day, [], expirations, contracts, [], screening)
+    # The session manifest is published last, after its data parts have been written.
+    write_parquet_chunk(chunk_paths()["sessions"], "sessions", symbol_cfg.symbol, trade_day, [session_row])
     validate_written_symbol_day(symbol_cfg.symbol, trade_day, session_row)
     day_key = (symbol_cfg.symbol, pd.Timestamp(trade_day).strftime("%Y-%m-%d"))
-    return day_key, {"session": session_row, "expirations": len(session_expirations), "contracts": int(session_row.get("collected_contract_count", 0))}
+    return day_key, {"session": session_row, "expirations": len(expirations), "contracts": int(session_row.get("collected_contract_count", 0))}
 
 
 def main() -> None:
@@ -2952,13 +2666,11 @@ def main() -> None:
     ensure_dir(REFERENCE_DATA_DIR)
     ensure_dir(CANONICAL_DATA_DIR)
     ensure_dir(DIAGNOSTIC_DATA_DIR)
-    ensure_dir(CHAIN_METADATA_DIR)
     ensure_dir(CANONICAL_PARTS_DIR)
     ensure_dir(DIAGNOSTIC_PARTS_DIR)
-    write_json(CFG.output_dir / "run_context.json", run_context())
-
     anchors = candidate_anchor_dates()
     completed_symbol_days = load_existing_rows()
+    write_json(CFG.output_dir / "run_context.json", run_context())
 
     total_configs = len(anchors) * len(UNIVERSE)
     processed = 0
@@ -2967,7 +2679,7 @@ def main() -> None:
     print(f"Date range    : {CFG.start_date} to {CFG.end_date}")
     print("Requested freq: exchange sessions")
     print(f"Quote interval: {CFG.quote_interval}")
-    print(f"Trade interval: {CFG.trade_interval}")
+    print("Trades        : individual events")
     print(f"Symbols       : {', '.join(cfg.symbol for cfg in UNIVERSE)}")
     print(f"Resume state  : {len(completed_symbol_days)} symbol-days already saved")
 
@@ -3010,6 +2722,8 @@ def main() -> None:
     print(f"expiration rows       : {counts['expiration_rows']}")
     print(f"contract rows         : {counts['contract_rows']}")
     print(f"quality rows          : {counts['quality_rows']}")
+    print(f"unavailable days      : {counts['unavailable_symbol_days']}")
+    print(f"failed days           : {counts['failed_symbol_days']}")
     print(f"screening rows        : {counts['screening_rows']}")
     if not summary_df.empty:
         row = summary_df.iloc[0]
@@ -3021,23 +2735,10 @@ def main() -> None:
         print(f"full quote checks     : {int(row['contracts_with_full_quote_observed_checks'])}")
         print(f"full trade checks     : {int(row['contracts_with_full_trade_observed_checks'])}")
     print("-" * 60)
-    if CFG.assemble_csv_outputs:
-        print(f"Saved: {paths['sessions']}")
-        print(f"Saved: {paths['expirations']}")
-        print(f"Saved: {paths['contracts']}")
-        print(f"Saved: {paths['quality']}")
-    print(f"Saved: {paths['observed_instrument_index']}")
-    print(f"Saved: {paths['family_coverage']}")
-    print(f"Saved: {paths['summary']}")
-    print(f"Saved: {paths['dataset_quality']}")
-    print(f"Saved: {paths['schema']}")
-    print(f"Saved: {paths['symbol_quality']}")
-    print(f"Saved: {paths['timestamp_validation']}")
-    print(f"Saved: {paths['screening']}")
-    print(f"Saved: {paths['validation_targets']}")
-    print(f"Saved: {paths['reference_actions']}")
-    print(f"Saved: {paths['carry_inputs']}")
-    print(f"Saved: {paths['failures']}")
+    large_exports = {"sessions", "expirations", "contracts", "quality"}
+    for dataset, path in paths.items():
+        if dataset not in large_exports or CFG.assemble_csv_outputs:
+            print(f"Saved: {path}")
 
 
 if __name__ == "__main__":
