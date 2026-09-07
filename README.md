@@ -48,7 +48,7 @@ The mathematical specification, parameter units and time normalization, volatili
 
 ## Project status
 
-`collector.py` prepares historical market observations. Its current defaults request one-second quotes and individual trades, record evaluations at 10:30, 13:00, and 15:00 New York time, and provide a 30-minute later observation. These collection defaults do not select the paper's final comparison frequencies or require a forecasting study.
+`collector.py` saves historical quotes, individual trades with matched quotes, open-interest reports, stock end-of-day records, and the dated contract universe, with request provenance and coverage reports. Quotes default to one-second sampling; tick quotes are optional. Stock references at 10:30, 13:00, and 15:00 New York time select the contracts to download. Yahoo is an optional reference source. Evaluation samples, waiting-time features, regimes, and pricing inputs are left to later work; these collection settings do not select the paper's final comparison frequencies.
 
 No validated BSM or TFBSM pricer, calibration routine, frequency-comparison experiment, or empirical result is included yet. Implementation is being reviewed in pull requests before inclusion on `main`.
 

@@ -1,64 +1,104 @@
-"""Historical option-data collector, retained as one file for review.
+"""Historical stock/option collection, kept in one file for review.
 
-Python 3.11+; dependencies: exchange-calendars, numpy, pandas>=2, pyarrow,
-requests, yfinance. Run `python collector.py --help` for bounded collection.
-Example: python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
+Python 3.11+; dependencies: exchange-calendars, numpy, pandas>=2, pyarrow, requests.
+Yahoo is optional: install yfinance only when using --yahoo-actions.
 
-ThetaData v3 reference: https://docs.thetadata.us/openapiv3.yaml
-Contract discovery: /operations/option_list_contracts.html
-Condition codes: /Articles/Errors-Exchanges-Conditions/{Quote,Trade}-Conditions.html
-Open interest: /operations/option_history_open_interest.html
-(All documentation paths above are relative to https://docs.thetadata.us.)
+Examples (Theta Terminal v3 must be running for collection):
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval tick
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --references-only --rate-symbols SOFR
 
-Universe: contracts quoted on each historical date, sampled by the configured
-DTE and S/K grid. A trade is not required for collection. Quotes are sampled;
-trades are events. Missing symbol-days remain in the availability report.
-Pricing, calibration, and backtesting are outside this collector.
+The default universe and DTE/S/K sampling grid are retained. Discovery uses the
+contracts quoted on each historical date, not today's chain. The three stock
+reference times choose what to download; they are not evaluation samples.
+A contract does not need trades, positive OI, or narrow spreads to be collected.
 
-Research use: use eval_<time> entry fields and selection flags for predictors;
-exit fields are outcomes. Whole-day summaries, *_any_evaluation flags, and
-corporate-action annotations are retrospective diagnostics. Sampled quote
-intervals measure observed persistence, not the arrival times of every quote.
-Daily Yahoo inputs are prior-close proxies, not verified historical vintages.
+Raw Parquet preserves vendor columns, values, row order, duplicates, conditions,
+and exchange/sequence codes. CSV values remain strings to avoid rounding or
+silently coercing bad values. Added collector_*_utc columns are parsed clocks;
+the vendor clocks remain unchanged. Optional raw CSV saves the response bytes.
+Each request has metadata, a checksum, retrieval time, and coverage diagnostics.
+No pricing, waiting-time features, regimes, sample filters, or yield proxies run.
+
+Output (under --output-dir):
+  raw_cache/<dataset>/.../request=<id>/{data.parquet,meta.json}
+  collection/<policy-id>/sessions/<symbol-day>.json
+  collection/<policy-id>/contracts/<symbol-day>.parquet
+  collection/<policy-id>/availability.csv
+  collection/<policy-id>/runs/<run-id>.json
+  references/<run-id>.json (only when reference collection is requested)
+Successful raw requests are reused across policy changes. A day is resumable
+only after its selected-contract file and every referenced request are verified.
+"complete" means the requests finished, not that the vendor supplied full coverage.
+"no_data" is retained separately from request errors. --refresh-no-data retries it.
+
+Official API specification: https://docs.thetadata.us/openapiv3.yaml
+Relevant pages under https://docs.thetadata.us/operations/:
+  {stock,option}_history_{quote,trade_quote}.html
+  option_list_contracts.html; option_history_open_interest.html
+  stock_history_eod.html; interest_rate_history_eod.html
+
+Limits: the quote universe is a date-wide observation, not an intraday listing
+snapshot. 1s quotes are samples; use --quote-interval tick for quote events when
+your subscription supports them. Requests cover the exchange's regular session.
+OI is requested on the report date and describes the previous session's close.
+Theta stock EOD is generated around 17:15 ET, not a 16:00 quote. Optional rate
+series retain vendor percentage units and report dates; no curve is inferred.
+Yahoo actions are an optional, unverified reference snapshot. Authoritative
+historical dividends and adjusted-contract deliverables remain unresolved.
 """
 
 import argparse
-import json
+import csv
 import hashlib
+import json
 import os
 import platform
-import re
 import sys
-import time
-import threading
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal
 from functools import lru_cache
-from importlib.metadata import version as pkg_version
+from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from pathlib import Path
+import re
+from uuid import uuid4
 
 import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import requests
-import yfinance as yf
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-try:
+if os.name == "nt":
+    import msvcrt
+else:
     import fcntl
-except ImportError:  # pragma: no cover - Windows fallback keeps single-process tests importable.
-    fcntl = None
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+# Configuration and the existing research universe.
+OUTPUT_SCHEMA_VERSION = "2026-09-07-raw-collection-v1"
+RAW_SCHEMA_VERSION = 1
+# Keep the original default root so existing raw caches can be reused.
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "data" / "multi_year_bsm_backtest_output"
+QUOTE_INTERVALS = ("tick", "10ms", "100ms", "500ms", "1s", "5s", "10s", "15s",
+                   "30s", "1m", "5m", "10m", "15m", "30m", "1h")
+GOOD_REQUEST_STATUSES = {"available", "no_data"}
+QUOTE_FIELDS = ("bid_size", "bid_exchange", "bid", "bid_condition",
+                "ask_size", "ask_exchange", "ask", "ask_condition")
+TRADE_FIELDS = ("trade_timestamp", "quote_timestamp", "sequence", "condition", "size",
+                "exchange", "price", *QUOTE_FIELDS)
+CONTRACT_FIELDS = ("symbol", "expiration", "strike", "right")
+SELECTION_COLUMNS = (*CONTRACT_FIELDS, "contract_key", "dte_days", "selection_times")
+
+
 @dataclass(frozen=True)
 class SymbolConfig:
     symbol: str
@@ -66,81 +106,6 @@ class SymbolConfig:
     universe_bucket: str
     sector_proxy: str
 
-
-@dataclass(frozen=True)
-class CollectorConfig:
-    base_url: str
-    start_date: str
-    end_date: str
-    anchor_freq: str
-    option_rights: tuple[str, ...]
-    target_dtes: tuple[int, ...]
-    max_expirations_per_day: int
-    moneyness_targets: tuple[float, ...]
-    strikes_per_moneyness_target: int
-    min_dte: int
-    max_dte: int
-    exchange_tz: str
-    quote_interval: str
-    stock_venue: str
-    evaluation_times: tuple[str, ...]
-    horizon_minutes: int
-    max_stock_quote_age_seconds: int
-    max_option_quote_age_seconds: int
-    max_rel_spread: float
-    min_option_bid_size: int
-    min_option_ask_size: int
-    min_open_interest: int
-    min_recent_option_trades: int
-    recent_trade_lookback_minutes: int
-    max_symbol_day_workers: int
-    max_contract_workers: int
-    max_requests_per_second: float
-    max_inflight_requests: int
-    soft_failure_rate_threshold: float
-    stream_flush_row_count: int
-    store_raw_payloads: bool
-    assemble_csv_outputs: bool
-    output_dir: Path
-    raw_cache_dir: Path
-    market_data_dir: Path
-
-    def __post_init__(self) -> None:
-        valid_rights = {"call", "put"}
-        invalid_rights = set(self.option_rights) - valid_rights
-        if not self.option_rights or invalid_rights:
-            raise ValueError(f"Unsupported option_rights: {sorted(invalid_rights)}")
-        if pd.Timestamp(self.start_date) > pd.Timestamp(self.end_date):
-            raise ValueError("start_date must not follow end_date")
-        if not 0 <= self.min_dte <= self.max_dte or not self.target_dtes:
-            raise ValueError("Provide target_dtes and an ordered, nonnegative DTE range")
-        if not self.moneyness_targets or any(not np.isfinite(x) or x <= 0 for x in self.moneyness_targets):
-            raise ValueError("moneyness_targets must be finite and positive")
-        for name in ("max_expirations_per_day", "strikes_per_moneyness_target", "horizon_minutes",
-                     "recent_trade_lookback_minutes", "max_symbol_day_workers", "max_contract_workers",
-                     "max_requests_per_second", "max_inflight_requests", "stream_flush_row_count"):
-            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if (not self.evaluation_times or tuple(sorted(set(self.evaluation_times))) != self.evaluation_times
-                or any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d", t) for t in self.evaluation_times)):
-            raise ValueError("evaluation_times must be unique, ordered HH:MM:SS values")
-        if not 0.0 <= self.soft_failure_rate_threshold <= 1.0:
-            raise ValueError("soft_failure_rate_threshold must be between 0 and 1")
-
-
-BASE_URL = "http://127.0.0.1:25503/v3"
-DATA_DIR = Path(__file__).resolve().parent / "data"
-OUTPUT_DIR = DATA_DIR / "multi_year_bsm_backtest_output"
-RAW_CACHE_DIR = OUTPUT_DIR / "raw_cache"
-MARKET_DATA_DIR = OUTPUT_DIR / "market_inputs"
-REFERENCE_DATA_DIR = OUTPUT_DIR / "reference_data"
-CANONICAL_DATA_DIR = OUTPUT_DIR / "canonical"
-DIAGNOSTIC_DATA_DIR = OUTPUT_DIR / "diagnostics"
-CANONICAL_PARTS_DIR = CANONICAL_DATA_DIR / "parts"
-DIAGNOSTIC_PARTS_DIR = DIAGNOSTIC_DATA_DIR / "parts"
-# Bump this whenever canonical/session schemas change in a way that makes old
-# parquet chunks unsafe to treat as completed work.
-OUTPUT_SCHEMA_VERSION = "2026-09-07-causal_observations_v8"
 
 UNIVERSE = [
     SymbolConfig("SPY", "ETF", "broad_market_etf", "broad_market"),
@@ -166,146 +131,121 @@ UNIVERSE = [
     SymbolConfig("RIOT", "EQUITY", "small_cap_equity", "crypto_exposed"),
 ]
 
-CFG = CollectorConfig(
-    base_url=BASE_URL,
-    start_date="2018-01-01",
-    end_date="2025-12-31",
-    anchor_freq="B",
-    option_rights=("call", "put"),
-    target_dtes=(7, 14, 30, 60, 120),
-    max_expirations_per_day=5,
-    moneyness_targets=(0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20),
-    strikes_per_moneyness_target=1,
-    min_dte=7,
-    max_dte=180,
-    exchange_tz="America/New_York",
-    quote_interval="1s",
-    stock_venue="utp_cta",
-    evaluation_times=("10:30:00", "13:00:00", "15:00:00"),
-    horizon_minutes=30,
-    max_stock_quote_age_seconds=70,
-    max_option_quote_age_seconds=70,
-    max_rel_spread=0.35,
-    min_option_bid_size=1,
-    min_option_ask_size=1,
-    min_open_interest=100,
-    min_recent_option_trades=1,
-    recent_trade_lookback_minutes=30,
-    max_symbol_day_workers=2,
-    max_contract_workers=4,
-    max_requests_per_second=8.0,
-    max_inflight_requests=8,
-    soft_failure_rate_threshold=0.05,
-    stream_flush_row_count=500,
-    store_raw_payloads=False,
-    assemble_csv_outputs=False,
-    output_dir=OUTPUT_DIR,
-    raw_cache_dir=RAW_CACHE_DIR,
-    market_data_dir=MARKET_DATA_DIR,
-)
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+@dataclass(frozen=True)
+class CollectorConfig:
+    base_url: str = "http://127.0.0.1:25503/v3"
+    start_date: str = "2018-01-01"
+    end_date: str = "2025-12-31"
+    option_rights: tuple[str, ...] = ("call", "put")
+    target_dtes: tuple[int, ...] = (7, 14, 30, 60, 120)
+    max_expirations_per_day: int = 5
+    moneyness_targets: tuple[float, ...] = (0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20)
+    strikes_per_moneyness_target: int = 1
+    min_dte: int = 7
+    max_dte: int = 180
+    exchange_tz: str = "America/New_York"
+    quote_interval: str = "1s"
+    stock_venue: str = "utp_cta"
+    selection_times: tuple[str, ...] = ("10:30:00", "13:00:00", "15:00:00")
+    max_stock_quote_age_seconds: int = 70
+    trade_quote_exclusive: bool = True
+    max_symbol_day_workers: int = 2
+    max_contract_workers: int = 4
+    max_requests_per_second: float = 8.0
+    max_inflight_requests: int = 8
+    store_raw_payloads: bool = False
+    refresh_no_data: bool = False
+    output_dir: Path = DEFAULT_OUTPUT_DIR
 
+    def __post_init__(self):
+        if not self.option_rights or set(self.option_rights) - {"call", "put"}:
+            raise ValueError("option_rights must contain call and/or put")
+        if pd.Timestamp(self.start_date) > pd.Timestamp(self.end_date):
+            raise ValueError("start_date must not follow end_date")
+        if not 0 <= self.min_dte <= self.max_dte or not self.target_dtes:
+            raise ValueError("Provide target_dtes and an ordered, nonnegative DTE range")
+        if any(d < 0 for d in self.target_dtes):
+            raise ValueError("target_dtes must be nonnegative")
+        if not self.moneyness_targets or any(not np.isfinite(x) or x <= 0 for x in self.moneyness_targets):
+            raise ValueError("moneyness_targets must be finite and positive")
+        for name in ("max_expirations_per_day", "strikes_per_moneyness_target",
+                     "max_symbol_day_workers", "max_contract_workers",
+                     "max_requests_per_second", "max_inflight_requests", "max_stock_quote_age_seconds"):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if (not self.selection_times or tuple(sorted(set(self.selection_times))) != self.selection_times
+                or any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d", t) for t in self.selection_times)):
+            raise ValueError("selection_times must be unique, ordered HH:MM:SS values")
+        if self.quote_interval not in QUOTE_INTERVALS or self.stock_venue not in {"utp_cta", "nqb"}:
+            raise ValueError("Unsupported quote interval or stock venue")
 
-def sha256_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
+    def policy(self) -> dict:
+        # Worker counts, scope, and optional reference providers do not change
+        # which contracts are selected or invalidate already collected sessions.
+        names = ("option_rights", "target_dtes", "max_expirations_per_day", "moneyness_targets",
+                 "strikes_per_moneyness_target", "min_dte", "max_dte", "exchange_tz",
+                 "quote_interval", "stock_venue", "selection_times", "max_stock_quote_age_seconds",
+                 "trade_quote_exclusive")
+        return {"output_schema_version": OUTPUT_SCHEMA_VERSION,
+                **{name: getattr(self, name) for name in names}}
 
-
-def to_float(value: object, default: float = np.nan) -> float:
-    # Avoid the repeated one-row Series pattern when coercing scalar fields.
-    try:
-        numeric = pd.to_numeric(value, errors="coerce")
-    except Exception:
-        return default
-    return default if pd.isna(numeric) or not np.isfinite(numeric) else float(numeric)
-
-
-def to_int(value: object, default: int = 0) -> int:
-    numeric = to_float(value, np.nan)
-    return default if pd.isna(numeric) else int(numeric)
-
-
-def config_payload() -> dict:
-    cfg_payload = asdict(CFG)
-    cfg_payload["output_dir"] = str(CFG.output_dir)
-    cfg_payload["raw_cache_dir"] = str(CFG.raw_cache_dir)
-    cfg_payload["market_data_dir"] = str(CFG.market_data_dir)
-    return cfg_payload
+    @property
+    def policy_id(self) -> str:
+        return digest_json(self.policy())[:20]
 
 
-_CONFIG_PAYLOAD = config_payload()
-_CONFIG_DIGEST = sha256_bytes(json.dumps(_CONFIG_PAYLOAD, sort_keys=True).encode("utf-8"))
-_CODE_DIGEST = sha256_bytes(Path(__file__).read_bytes())
-_RUN_STARTED_UTC = pd.Timestamp.now("UTC").isoformat()
-_THREAD_LOCAL = threading.local()
-_PATH_LOCK_STRIPES = tuple(threading.Lock() for _ in range(256))
-_REQUEST_PACE_LOCK = threading.Lock()
-_REQUEST_NEXT_ALLOWED = 0.0
-_REQUEST_SEMAPHORE = threading.BoundedSemaphore(max(1, CFG.max_inflight_requests))
-_REQUEST_FAILURE_LOCK = threading.Lock()
-_REQUEST_FAILURE_COUNTS: dict[str, int] = {}
-SESSION_KEY_PATTERN = re.compile(r"^symbol=(?P<symbol>.+)__date=(?P<date>\d{4}-\d{2}-\d{2})$")
+@dataclass(frozen=True)
+class Request:
+    dataset: str
+    endpoint: str
+    params: dict
+    vendor: str = "ThetaData"
+
+    def identity(self) -> dict:
+        return asdict(self)
+
+    @property
+    def request_id(self) -> str:
+        return digest_json(self.identity())[:24]
+
+    @property
+    def required_columns(self) -> tuple[str, ...]:
+        kind = self.endpoint.rsplit("/", 1)[-1]
+        if self.dataset == "quoted_contracts":
+            return CONTRACT_FIELDS
+        if self.vendor == "Yahoo":
+            return ("Date", "Dividends", "Stock Splits")
+        if self.dataset == "interest_rate_eod":
+            return ("created", "rate")
+        fields = {"quote": ("timestamp", *QUOTE_FIELDS), "trade_quote": TRADE_FIELDS,
+                  "open_interest": ("timestamp", "open_interest"),
+                  "eod": ("created", "last_trade", "open", "high", "low", "close", "volume", "count")}
+        return ((*CONTRACT_FIELDS,) if self.endpoint.startswith("/option/") else ()) + fields[kind]
 
 
-def path_lock(path: Path) -> threading.Lock:
-    return _PATH_LOCK_STRIPES[hash(str(path.resolve())) % len(_PATH_LOCK_STRIPES)]
+def utc_now() -> str:
+    return pd.Timestamp.now("UTC").isoformat()
 
 
-@contextmanager
-def file_lock(path: Path):
-    ensure_dir(path.parent)
-    lock_path = path.with_name(f"{path.name}.lock")
-    if fcntl is None:
-        yield
-        return
-    with open(lock_path, "a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+def digest_json(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-@contextmanager
-def request_slot():
-    global _REQUEST_NEXT_ALLOWED
-    _REQUEST_SEMAPHORE.acquire()
-    try:
-        with _REQUEST_PACE_LOCK:
-            now = time.monotonic()
-            wait_seconds = max(0.0, _REQUEST_NEXT_ALLOWED - now)
-            spacing = 1.0 / max(CFG.max_requests_per_second, 0.001)
-            _REQUEST_NEXT_ALLOWED = max(now, _REQUEST_NEXT_ALLOWED) + spacing
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-        yield
-    finally:
-        _REQUEST_SEMAPHORE.release()
+def file_hash(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def adaptive_request_delay(endpoint: str) -> None:
-    with _REQUEST_FAILURE_LOCK:
-        failures = _REQUEST_FAILURE_COUNTS.get(endpoint, 0)
-        delay = min(5.0, 0.25 * (2 ** min(failures - 1, 4))) if failures > 0 else 0.0
-    if delay > 0:
-        time.sleep(delay)
-
-
-def record_request_result(endpoint: str, success: bool) -> None:
-    with _REQUEST_FAILURE_LOCK:
-        if success:
-            _REQUEST_FAILURE_COUNTS.pop(endpoint, None)
-        else:
-            _REQUEST_FAILURE_COUNTS[endpoint] = _REQUEST_FAILURE_COUNTS.get(endpoint, 0) + 1
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @contextmanager
 def atomic_output(path: Path):
-    """Replace a generated file only after its temporary output is complete."""
-    ensure_dir(path.parent)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False, suffix=path.suffix) as tmp:
-        temp_path = Path(tmp.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as handle:
+        temp_path = Path(handle.name)
     try:
         yield temp_path
         os.replace(temp_path, path)
@@ -313,2492 +253,819 @@ def atomic_output(path: Path):
         temp_path.unlink(missing_ok=True)
 
 
-def atomic_write_bytes(path: Path, payload: bytes) -> None:
-    with atomic_output(path) as temp_path:
-        temp_path.write_bytes(payload)
+def write_json(path: Path, value: dict) -> None:
+    with atomic_output(path) as temp:
+        temp.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
 
 
 def write_parquet(path: Path, frame: pd.DataFrame) -> None:
-    with atomic_output(path) as temp_path:
-        frame.to_parquet(temp_path, index=False, compression="zstd")
+    with atomic_output(path) as temp:
+        frame.to_parquet(temp, index=False, compression="zstd")
 
 
-def write_json(path: Path, payload: dict) -> None:
-    atomic_write_bytes(path, json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"))
+def file_receipt(path: Path, root: Path, frame: pd.DataFrame | None = None) -> dict:
+    stat = path.stat()
+    receipt = {"path": path.relative_to(root).as_posix(), "size": stat.st_size,
+               "mtime_ns": stat.st_mtime_ns, "sha256": file_hash(path)}
+    if frame is not None:
+        receipt.update(rows=len(frame), columns=list(frame.columns))
+    return receipt
 
 
-def build_request_session() -> requests.Session:
-    retry = Retry(
-        total=5,
-        backoff_factor=1.0,
-        status_forcelist=(429, 474, 500, 502, 503, 504, 571),
-        allowed_methods=("GET",),
-    )
-    pool_size = max(20, CFG.max_contract_workers * 4)
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_size, pool_maxsize=pool_size)
-    session = requests.Session()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-def get_request_session() -> requests.Session:
-    session = getattr(_THREAD_LOCAL, "request_session", None)
-    if session is None:
-        session = build_request_session()
-        _THREAD_LOCAL.request_session = session
-    return session
-
-
-XNYS = xcals.get_calendar("XNYS")
-
-
-def safe_pkg_version(name: str) -> str:
+def artifact_valid(receipt: dict, root: Path) -> bool:
+    """Check every referenced file; rehash changed files without scanning TBs on each resume."""
     try:
-        return pkg_version(name)
-    except Exception:
-        return "unknown"
+        path = root / receipt["path"]
+        stat = path.stat()
+        if stat.st_size != receipt["size"]:
+            return False
+        if stat.st_mtime_ns != receipt["mtime_ns"] and file_hash(path) != receipt["sha256"]:
+            return False
+        if "rows" in receipt:
+            with pq.ParquetFile(path) as parquet:
+                if (parquet.metadata.num_rows != receipt["rows"]
+                        or parquet.schema_arrow.names != receipt["columns"]):
+                    return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
-def run_context() -> dict:
-    return {
-        "collector_name": "collector",
-        "collector_mode": "neutral_surface_scrape",
-        "output_schema_version": OUTPUT_SCHEMA_VERSION,
-        "config_digest": _CONFIG_DIGEST,
-        "code_digest": _CODE_DIGEST,
-        "config": dict(_CONFIG_PAYLOAD),
-        "timestamp_policy": {
-            "assumption_for_naive_vendor_timestamps": f"localize_to_{CFG.exchange_tz}",
-            "dst_ambiguous_behavior": "NaT",
-            "dst_nonexistent_behavior": "NaT",
-            "note": "timestamp semantics are monitored and flagged, not proven by this collector",
-        },
-        "data_limitations": {
-            "is_tick_level": False,
-            "uses_requested_intervals": {
-                "quotes": CFG.quote_interval,
-                "trades": "events",
-            },
-            "contract_universe": "quoted_on_trade_date",
-            "contract_universe_is_intraday_listing_snapshot": False,
-            "selection_policy": "per_evaluation_spot_grid; union_used_only_for_downloads",
-            "quote_age_means": "time_since_last_sample; not_verified_quote_event_age",
-            "waiting_features": "observed_sample_persistence_and_trade_event_intervals",
-            "daily_input_policy": "source_date_strictly_before_trade_day; no_vintage_verification",
-            "retrospective_fields": "whole_day_summaries, any_evaluation_flags, corporate_action_annotations",
-            "stock_venue": CFG.stock_venue,
-            "condition_policy": "regular_auto_quotes_and_trades",
-            "open_interest_request_date": "trade_day; report reflects prior session close",
-            "missing_history_policy": "record_unavailable_symbol_days; no imputation",
-            "full_market_archive": False,
-            "instrument_identity_is_observed_not_authoritative": True,
-            "corporate_actions_source": "yfinance_reference_layer",
-            "bsm_implied_volatility_computed_in_collector": False,
-            "iv_validity_filter_required_downstream": True,
-        },
-        "python_version": sys.version,
-        "platform": platform.platform(),
-        "package_versions": {
-            "pandas": safe_pkg_version("pandas"),
-            "numpy": safe_pkg_version("numpy"),
-            "requests": safe_pkg_version("requests"),
-            "yfinance": safe_pkg_version("yfinance"),
-            "exchange_calendars": safe_pkg_version("exchange-calendars"),
-        },
-        "run_started_utc": _RUN_STARTED_UTC,
-    }
+@contextmanager
+def output_lock(output_dir: Path):
+    """One writer per output root, released by the OS even after a crash."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # This persistent lock file is intentional. Unlinking it would let another
+    # process lock a different inode while the current writer still owns this one.
+    with (output_dir / ".collector.lock").open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(f"Another collector is writing to {output_dir}") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def normalize_vendor_timestamp(series: pd.Series) -> pd.Series:
-    ts, _, _ = parse_vendor_timestamp(series)
-    return ts
+def parse_vendor_clock(values: pd.Series, exchange_tz: str) -> pd.Series:
+    # Naive Theta clocks are exchange local. Aware clocks keep their stated
+    # offset. Date-only interest-rate reports deliberately do not use this.
+    text = values.astype("string").str.strip()
+    aware = text.str.contains(r"(?:Z|[+-]\d{2}:?\d{2})$", case=False, na=False)
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns, UTC]")
+    parsed.loc[aware] = pd.to_datetime(text.loc[aware], format="mixed", errors="coerce", utc=True)
+    naive = pd.to_datetime(text.loc[~aware], format="mixed", errors="coerce")
+    parsed.loc[~aware] = naive.dt.tz_localize(
+        exchange_tz, ambiguous="NaT", nonexistent="NaT").dt.tz_convert("UTC")
+    return parsed
 
 
-def parse_vendor_timestamp(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    ts = pd.to_datetime(series, errors="coerce")
-    naive_assumed = pd.Series(False, index=series.index, dtype=bool)
-    if getattr(ts.dt, "tz", None) is None:
-        naive_assumed = ts.notna()
-        ts = ts.dt.tz_localize(CFG.exchange_tz, ambiguous="NaT", nonexistent="NaT")
-    else:
-        ts = ts.dt.tz_convert(CFG.exchange_tz)
-    return ts, ts.isna(), naive_assumed
-
-
-def attach_timestamp_metadata(df: pd.DataFrame, include_raw: bool = False) -> pd.DataFrame:
-    if "timestamp" not in df.columns:
-        return df
-    parsed, parse_failed, naive_assumed = parse_vendor_timestamp(df["timestamp"])
-    result = df.copy()
-    if include_raw:
-        result["timestamp_raw"] = result["timestamp"]
-    result["timestamp"] = parsed
-    result["timestamp_parse_failed"] = result.get("timestamp_parse_failed", parse_failed)
-    result["timestamp_naive_assumed"] = result.get("timestamp_naive_assumed", naive_assumed)
-    return result
-
-
-def optimize_frame_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    result = df
-    for col in ("bid", "ask", "bid_size", "ask_size", "price", "size", "open_interest"):
-        if col in result.columns and result[col].dtype == object:
-            result[col] = pd.to_numeric(result[col], errors="coerce")
-    return result
-
-
-def session_timestamp(day: pd.Timestamp, time_str: str) -> pd.Timestamp:
-    return pd.Timestamp(f"{day.strftime('%Y-%m-%d')} {time_str}", tz=CFG.exchange_tz)
-
-
-def time_label(time_str: str) -> str:
-    return time_str.replace(":", "")
-
-
-def evaluation_schedule(trade_day: pd.Timestamp) -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
-    session_open, session_close = market_session_bounds(trade_day)
-    schedule = []
-    for time_str in CFG.evaluation_times:
-        entry_ts = session_timestamp(trade_day, time_str)
-        if not session_open <= entry_ts < session_close:
+def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: CollectorConfig) -> tuple[pd.DataFrame, dict]:
+    result = frame.copy()
+    diagnostics = {"duplicate_rows": int(frame.duplicated().sum()), "clocks": {}}
+    clocks = ("timestamp", "trade_timestamp", "quote_timestamp", "last_trade", "created")
+    for name in clocks:
+        if name not in frame or (name == "created" and request.dataset == "interest_rate_eod"):
             continue
-        exit_ts = min(entry_ts + pd.Timedelta(minutes=CFG.horizon_minutes), session_close)
-        schedule.append((time_label(time_str), entry_ts, exit_ts))
-    return schedule
+        parsed = parse_vendor_clock(frame[name], cfg.exchange_tz)
+        if f"collector_{name}_utc" not in result:
+            result[f"collector_{name}_utc"] = parsed
+        valid = parsed.dropna()
+        diagnostics["clocks"][name] = {
+            "unparseable_or_missing": int(parsed.isna().sum()),
+            "out_of_order_transitions": int(valid.diff().lt(pd.Timedelta(0)).sum()),
+            "first_utc": valid.min().isoformat() if len(valid) else None,
+            "last_utc": valid.max().isoformat() if len(valid) else None,
+        }
+    if {"bid", "ask"}.issubset(frame):
+        bid, ask = (pd.to_numeric(frame[side], errors="coerce") for side in ("bid", "ask"))
+        diagnostics.update(invalid_bid_ask_rows=int((~np.isfinite(bid) | ~np.isfinite(ask)).sum()),
+                           nonpositive_bid_ask_rows=int((bid.le(0) | ask.le(0)).sum()),
+                           crossed_quote_rows=int(bid.gt(ask).sum()))
+    if request.endpoint.endswith("/quote") and "collector_timestamp_utc" in result:
+        interval = request.params.get("interval", "tick")
+        if interval != "tick":
+            seconds = interval_seconds(interval)
+            unique = result["collector_timestamp_utc"].dropna().drop_duplicates().sort_values()
+            gaps = unique.diff().dt.total_seconds().dropna()
+            # 09:30:00 -> 09:31:00 at 1s leaves 59 interior observations absent.
+            # Leading/trailing gaps are described by first/last clocks, not filled.
+            diagnostics["absent_interior_sample_slots"] = int(
+                np.maximum(np.ceil(gaps.to_numpy() / seconds - 1e-9) - 1, 0).sum())
+    return result, diagnostics
 
 
-def _longest_streak_duration(change_flags: pd.Series, durations: pd.Series) -> float:
-    change_arr = pd.Series(change_flags).fillna(True).to_numpy(dtype=bool)
-    duration_arr = pd.Series(durations).fillna(0.0).to_numpy(dtype=float)
-    if change_arr.size == 0 or duration_arr.size == 0:
-        return 0.0
-    usable = min(change_arr.size, duration_arr.size)
-    change_arr = change_arr[:usable]
-    duration_arr = duration_arr[:usable].copy()
-    duration_arr[change_arr] = 0.0
-    group_ids = np.cumsum(change_arr)
-    streak_sums = np.bincount(group_ids, weights=duration_arr)
-    return float(streak_sums.max()) if streak_sums.size else 0.0
-
-
-def window_observation_features(
-    df: pd.DataFrame,
-    target_ts: pd.Timestamp,
-    *,
-    window_minutes: int,
-    prefix: str,
-    observation_kind: str,
-    value_column: str,
-    expected_spacing_seconds: float | None = None,
-) -> dict:
-    """Describe observations through target_ts; never infer unobserved quote events.
-
-    Persistence uses backward differences between adjacent valid observations.
-    Sample gaps break streaks. Neither window boundary is extrapolated as an
-    unchanged price; coverage and censoring fields expose these missing spans.
-    For trades, unchanged prices mean equal consecutive prints, not a continuously
-    observed market price between prints. Event gaps include censored boundaries.
-    """
-    start = target_ts - pd.Timedelta(minutes=window_minutes)
-    seconds = float((target_ts - start).total_seconds())
-    result = dict(
-        window_start=start, window_end=target_ts, observation_kind=observation_kind,
-        observation_count=0, time_since_last_observation_seconds=np.nan,
-        median_observation_interval_seconds=np.nan, p95_observation_interval_seconds=np.nan,
-        max_observation_interval_seconds=np.nan, longest_observation_gap_seconds=seconds,
-        start_boundary_gap_seconds=seconds, end_boundary_gap_seconds=seconds,
-        comparable_value_pair_count=0, value_change_count=0, zero_return_fraction=np.nan,
-        longest_no_change_streak_seconds=np.nan, share_window_unchanged=np.nan,
-        share_window_observed=0.0, last_observed_value_change_age_seconds=np.nan,
-        last_value_change_left_censored=True,
-    )
-    past = df.loc[df["timestamp"].notna() & df["timestamp"].le(target_ts)].sort_values(
-        "timestamp", kind="stable") if "timestamp" in df.columns else pd.DataFrame()
-    if not past.empty:
-        result["time_since_last_observation_seconds"] = float((target_ts - past["timestamp"].iloc[-1]).total_seconds())
-    window = past.loc[past["timestamp"].ge(start)].copy() if not past.empty else past
-    if not window.empty:
-        result["observation_count"] = len(window)
-        intervals = window["timestamp"].diff().dt.total_seconds()
-        first_gap = float((window["timestamp"].iloc[0] - start).total_seconds())
-        last_gap = float((target_ts - window["timestamp"].iloc[-1]).total_seconds())
-        result.update(start_boundary_gap_seconds=first_gap, end_boundary_gap_seconds=last_gap,
-                      longest_observation_gap_seconds=max(first_gap, last_gap, intervals.max() if len(window) > 1 else 0))
-        if len(window) > 1:
-            result.update(median_observation_interval_seconds=float(intervals.median()),
-                          p95_observation_interval_seconds=float(intervals.quantile(0.95)),
-                          max_observation_interval_seconds=float(intervals.max()))
-        if value_column in window.columns:
-            values = pd.to_numeric(window[value_column], errors="coerce")
-            valid = pd.Series(np.isfinite(values), index=window.index)
-            comparable = valid & valid.shift(1, fill_value=False)
-            if expected_spacing_seconds is not None:
-                comparable &= intervals.le(expected_spacing_seconds * 1.01)
-            changed = comparable & values.ne(values.shift(1))
-            unchanged = comparable & ~changed
-            pairs = int(comparable.sum())
-            result.update(comparable_value_pair_count=pairs, value_change_count=int(changed.sum()),
-                          share_window_observed=float(intervals.loc[comparable].sum()) / seconds)
-            if pairs:
-                result.update(zero_return_fraction=float(unchanged.sum()) / pairs,
-                              share_window_unchanged=float(intervals.loc[unchanged].sum()) / seconds,
-                              longest_no_change_streak_seconds=_longest_streak_duration(~unchanged, intervals))
-            if changed.any():
-                result.update(last_observed_value_change_age_seconds=float(
-                    (target_ts - window.loc[changed, "timestamp"].iloc[-1]).total_seconds()),
-                    last_value_change_left_censored=False)
-    return {f"{prefix}_{key}": value for key, value in result.items()}
-
-
-def build_sample_flags(contract_row: dict) -> dict:
-    # The label-specific flags are authoritative. The first-evaluation aliases
-    # are explicitly named so downstream code cannot mistake them for all-day
-    # inclusion flags.
-    broad_max_quote_age = CFG.max_option_quote_age_seconds * 3
-    broad_max_rel_spread = max(0.75, CFG.max_rel_spread * 2.0)
-    output: dict[str, object] = {}
-    clean_any = False
-    broad_any = False
-    primary_label = time_label(CFG.evaluation_times[0])
-
-    for time_str in CFG.evaluation_times:
-        label = time_label(time_str)
-        common_reasons = []
-        if not contract_row.get(f"eval_{label}_in_session", False):
-            common_reasons.append("evaluation_outside_session")
-        if not contract_row.get(f"eval_{label}_selected_by_spot_grid", False):
-            common_reasons.append("not_selected_at_evaluation")
-        if contract_row.get(f"stock_eval_{label}_entry_quote_is_stale", True):
-            common_reasons.append("stale_underlying_observation")
-        lagged_oi = to_float(contract_row.get(f"eval_{label}_open_interest", contract_row.get("lagged_open_interest")))
-        entry_age = to_float(contract_row.get(f"eval_{label}_entry_quote_age_seconds", np.nan))
-        entry_rel_spread = to_float(contract_row.get(f"eval_{label}_entry_quote_rel_spread", np.nan))
-        entry_bid = to_float(contract_row.get(f"eval_{label}_entry_quote_bid", np.nan))
-        entry_ask = to_float(contract_row.get(f"eval_{label}_entry_quote_ask", np.nan))
-        entry_bid_size = to_float(contract_row.get(f"eval_{label}_entry_quote_bid_size", np.nan))
-        entry_ask_size = to_float(contract_row.get(f"eval_{label}_entry_quote_ask_size", np.nan))
-        entry_mid = to_float(contract_row.get(f"eval_{label}_entry_quote_option_mid", np.nan))
-        exit_mid = to_float(contract_row.get(f"eval_{label}_exit_quote_option_mid", np.nan))
-        exit_age = to_float(contract_row.get(f"eval_{label}_exit_quote_age_seconds", np.nan))
-        recent_trades = to_int(contract_row.get(f"eval_{label}_entry_trade_recent_trade_count", 0))
-        if not all(np.isfinite(v) for v in (entry_bid, entry_ask, entry_mid, entry_rel_spread)) or entry_mid <= 0:
-            common_reasons.append("invalid_entry_quote")
-
-        def clean_reasons_for(max_quote_age: float, max_rel_spread: float) -> list[str]:
-            reasons = common_reasons.copy()
-            if pd.isna(entry_age) or float(entry_age) > max_quote_age:
-                reasons.append("stale_entry_quote")
-            if pd.notna(entry_rel_spread) and float(entry_rel_spread) > max_rel_spread:
-                reasons.append("wide_entry_spread")
-            if pd.notna(entry_bid) and float(entry_bid) <= 0:
-                reasons.append("nonpositive_bid")
-            if pd.notna(entry_ask) and pd.notna(entry_bid) and float(entry_ask) <= float(entry_bid):
-                reasons.append("crossed_or_locked_entry_market")
-            if not np.isfinite(entry_bid_size) or float(entry_bid_size) < CFG.min_option_bid_size:
-                reasons.append("small_bid_size")
-            if not np.isfinite(entry_ask_size) or float(entry_ask_size) < CFG.min_option_ask_size:
-                reasons.append("small_ask_size")
-            if pd.isna(lagged_oi) or float(lagged_oi) < CFG.min_open_interest:
-                reasons.append("low_open_interest")
-            if recent_trades < CFG.min_recent_option_trades:
-                reasons.append("insufficient_recent_trades")
-            return reasons
-
-        clean_reasons = clean_reasons_for(CFG.max_option_quote_age_seconds, CFG.max_rel_spread)
-        # Store threshold variants now so robustness checks do not require
-        # re-scraping the raw option surface.
-        tight_clean_reasons = clean_reasons_for(CFG.max_option_quote_age_seconds * 0.5, CFG.max_rel_spread * 0.5)
-        loose_clean_reasons = clean_reasons_for(CFG.max_option_quote_age_seconds * 2.0, CFG.max_rel_spread * 2.0)
-        broad_reasons = common_reasons.copy()
-
-        if pd.isna(entry_age) or float(entry_age) > broad_max_quote_age:
-            broad_reasons.append("very_stale_entry_quote")
-        if pd.notna(entry_rel_spread) and float(entry_rel_spread) > broad_max_rel_spread:
-            broad_reasons.append("extreme_entry_spread")
-        if pd.notna(entry_bid) and float(entry_bid) < 0:
-            broad_reasons.append("negative_bid")
-        if pd.notna(entry_ask) and pd.notna(entry_bid) and float(entry_ask) < float(entry_bid):
-            broad_reasons.append("crossed_entry_market")
-        if pd.isna(lagged_oi) or float(lagged_oi) < 1:
-            broad_reasons.append("missing_or_zero_open_interest")
-
-        clean_included = not clean_reasons
-        tight_clean_included = not tight_clean_reasons
-        loose_clean_included = not loose_clean_reasons
-        broad_included = not broad_reasons
-        clean_any = clean_any or clean_included
-        broad_any = broad_any or broad_included
-        output[f"clean_sample_included_{label}"] = clean_included
-        output[f"clean_sample_exclusion_reasons_{label}"] = "|".join(clean_reasons)
-        output[f"clean_sample_tight_included_{label}"] = tight_clean_included
-        output[f"clean_sample_tight_exclusion_reasons_{label}"] = "|".join(tight_clean_reasons)
-        output[f"clean_sample_loose_included_{label}"] = loose_clean_included
-        output[f"clean_sample_loose_exclusion_reasons_{label}"] = "|".join(loose_clean_reasons)
-        output[f"broad_sample_included_{label}"] = broad_included
-        output[f"broad_sample_exclusion_reasons_{label}"] = "|".join(broad_reasons)
-        output[f"exit_quote_stale_{label}"] = bool(pd.isna(exit_age) or float(exit_age) > CFG.max_option_quote_age_seconds)
-        output[f"exit_quote_changed_{label}"] = bool(pd.notna(entry_mid) and pd.notna(exit_mid) and float(entry_mid) != float(exit_mid))
-        if label == primary_label:
-            output["primary_evaluation_label"] = label
-            output["clean_sample_included_first_eval"] = clean_included
-            output["clean_sample_exclusion_reasons_first_eval"] = "|".join(clean_reasons)
-            output["broad_sample_included_first_eval"] = broad_included
-            output["broad_sample_exclusion_reasons_first_eval"] = "|".join(broad_reasons)
-
-    output["clean_sample_included_any_evaluation"] = clean_any
-    output["broad_sample_included_any_evaluation"] = broad_any
-    return output
-
-
-def read_csv_cache(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
-    if "timestamp" in df.columns and str(df["timestamp"].dtype) != "datetime64[ns, America/New_York]":
-        df["timestamp"] = normalize_vendor_timestamp(df["timestamp"])
-    for col in ["observation_date", "Date"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
-
-
-def boolean_flag_series(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.Series:
-    for column in candidates:
-        if column in frame.columns:
-            return pd.to_numeric(frame[column], errors="coerce").fillna(0).astype(bool)
-    return pd.Series(False, index=frame.index, dtype=bool)
-
-
-def filter_condition_rows(df: pd.DataFrame, dataset: str) -> tuple[pd.DataFrame, int]:
-    # Explicit research policy; raw cached rows retain every vendor condition.
-    # Quotes: REGULAR=0, BID_ASK_AUTO_EXEC=1, NATIONAL_BBO=50.
-    # Trades: REGULAR=0, AUTO_EXECUTION=18. OPRA extended conditions are unused.
-    quotes = "quotes" in dataset
-    columns = ["bid_condition", "ask_condition"] if quotes else ["condition"]
-    if dataset.startswith("stock_trades"):
-        columns += [f"ext_condition{i}" for i in range(1, 5)]
-    allowed_codes = {0, 1, 50} if quotes else {0, 18}
-    allowed_labels = {"", "regular", "normal", "auto", "continuous", "nbbo"}
-    allowed_labels |= {"bid_ask_auto_exec", "national_bbo"} if quotes else {"auto_execution"}
-    keep = pd.Series(True, index=df.index)
-    missing = pd.Series(False, index=df.index)
-    for column in columns:
-        if column not in df:
-            continue
-        text = df[column].fillna("").astype(str).str.strip().str.lower()
-        missing |= text.eq("")
-        keep &= pd.to_numeric(text, errors="coerce").isin(allowed_codes) | text.isin(allowed_labels)
-    result = df.loc[keep].copy()
-    result.attrs["missing_condition_row_count"] = int(missing.sum())
-    return result, int((~keep).sum())
-
-
-def market_snapshot(
-    df: pd.DataFrame,
-    target_ts: pd.Timestamp,
-    *,
-    max_age_seconds: int | None = None,
-    trade_lookback_minutes: int | None = None,
-    prefix: str,
-) -> dict:
-    snapshot = {
-        f"{prefix}_target_timestamp": target_ts,
-        f"{prefix}_timestamp": pd.NaT,
-        f"{prefix}_age_seconds": np.nan,
-        # NaN means freshness was not evaluated for this snapshot type.
-        f"{prefix}_is_stale": True if max_age_seconds is not None else np.nan,
-    }
-    if trade_lookback_minutes is not None:
-        snapshot.update({f"{prefix}_recent_trade_count": 0, f"{prefix}_recent_trade_size": 0.0,
-                         f"{prefix}_recent_trade_vwap": np.nan})
-    if df.empty or "timestamp" not in df.columns:
-        return snapshot
-    clean = df.loc[df["timestamp"].notna()]
-    if clean.empty:
-        return snapshot
-    if not clean["timestamp"].is_monotonic_increasing:
-        clean = clean.sort_values("timestamp", kind="stable")
-    timestamps_ns = pd.DatetimeIndex(clean["timestamp"]).as_unit("ns").asi8
-    target_ns = pd.Timestamp(target_ts).value
-    row_pos = int(np.searchsorted(timestamps_ns, target_ns, side="right") - 1)
-    if row_pos < 0:
-        return snapshot
-    clean = clean.iloc[: row_pos + 1]
-    row = clean.iloc[-1]
-    snapshot[f"{prefix}_timestamp"] = row["timestamp"]
-    snapshot[f"{prefix}_age_seconds"] = float((target_ts - row["timestamp"]).total_seconds())
-    if max_age_seconds is not None:
-        snapshot[f"{prefix}_is_stale"] = bool(snapshot[f"{prefix}_age_seconds"] > max_age_seconds)
-    for column in ("bid", "ask", "bid_size", "ask_size", "price", "size", "open_interest", "stock_mid", "option_mid", "option_spread", "rel_spread"):
-        if column in clean.columns:
-            snapshot[f"{prefix}_{column}"] = row[column]
-    if trade_lookback_minutes is not None:
-        window_start = target_ts - pd.Timedelta(minutes=trade_lookback_minutes)
-        recent = clean.loc[clean["timestamp"].ge(window_start)]
-        snapshot[f"{prefix}_recent_trade_count"] = int(len(recent))
-        snapshot[f"{prefix}_recent_trade_size"] = float(pd.to_numeric(recent.get("size", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        if "price" in recent.columns and "size" in recent.columns and not recent.empty:
-            price = pd.to_numeric(recent["price"], errors="coerce")
-            size = pd.to_numeric(recent["size"], errors="coerce").fillna(0)
-            total_size = float(size.sum())
-            snapshot[f"{prefix}_recent_trade_vwap"] = float((price * size).sum() / total_size) if total_size > 0 else np.nan
+def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: CollectorConfig) -> list[str]:
+    """Flag misrouted responses without dropping or correcting vendor records."""
+    if frame.empty:
+        return []
+    issues = []
+    if "symbol" in frame and frame["symbol"].ne(request.params["symbol"]).any():
+        issues.append("unexpected_symbol")
+    if request.endpoint.startswith("/option/") and set(CONTRACT_FIELDS).issubset(frame):
+        expiry = pd.to_datetime(frame["expiration"], format="mixed", errors="coerce")
+        strike = pd.to_numeric(frame["strike"], errors="coerce")
+        right = frame["right"].str.lower().replace({"c": "call", "p": "put"})
+        if (expiry.isna().any() or (~np.isfinite(strike) | strike.le(0)).any()
+                or not right.isin(["call", "put"]).all()):
+            issues.append("invalid_contract_identity")
+        if "expiration" in request.params and (
+                expiry.ne(pd.Timestamp(request.params["expiration"])).any()
+                or strike.ne(float(request.params["strike"])).any()
+                or right.ne(request.params["right"]).any()):
+            issues.append("unexpected_contract_identity")
+    start = request.params.get("date", request.params.get("start_date"))
+    end = request.params.get("date", request.params.get("end_date"))
+    primary = next((name for name in ("timestamp", "trade_timestamp", "created") if name in frame), None)
+    if start and end and primary:
+        if request.dataset == "interest_rate_eod":
+            dates = pd.to_datetime(frame[primary].str.strip(), format="mixed", errors="coerce")
         else:
-            snapshot[f"{prefix}_recent_trade_vwap"] = np.nan
-    return snapshot
+            dates = parse_vendor_clock(frame[primary], cfg.exchange_tz).dt.tz_convert(
+                cfg.exchange_tz).dt.tz_localize(None).dt.normalize()
+        if (dates.notna() & ~dates.between(pd.Timestamp(start), pd.Timestamp(end))).any():
+            issues.append("timestamps_outside_requested_dates")
+        if dates.isna().all():
+            issues.append("no_parseable_report_dates")
+    return issues
 
 
-def nearest_clock_skew_seconds(reference_ts: pd.Series | np.ndarray, other_ts: pd.Series) -> dict:
-    output = {
-        "clock_alignment_pair_count": 0,
-        "clock_alignment_median_skew_seconds": np.nan,
-        "clock_alignment_p95_abs_skew_seconds": np.nan,
-    }
-    def timestamp_ns(values: pd.Series | np.ndarray, name: str) -> np.ndarray:
-        if isinstance(values, np.ndarray):
-            return values.astype(np.int64, copy=False)
-        clean = values.dropna()
-        if clean.empty:
-            return np.array([], dtype=np.int64)
-        if pd.api.types.is_numeric_dtype(clean):
-            raise TypeError(f"{name} must contain datetimes, not numeric timestamp surrogates")
-        if not pd.api.types.is_datetime64_any_dtype(clean):
-            clean = pd.to_datetime(clean, errors="coerce")
-            if pd.Series(clean).isna().any():
-                raise TypeError(f"{name} must contain datetime-like values")
-        return pd.DatetimeIndex(clean).as_unit("ns").asi8
-
-    ref = timestamp_ns(reference_ts, "reference_ts")
-    oth = timestamp_ns(other_ts, "other_ts")
-    if ref.size == 0 or oth.size == 0:
-        return output
-    ref = np.sort(ref)
-    positions = np.searchsorted(ref, oth)
-    right_idx = np.clip(positions, 0, ref.size - 1)
-    left_idx = np.clip(positions - 1, 0, ref.size - 1)
-    right_values = ref[right_idx]
-    left_values = ref[left_idx]
-    choose_right = positions == 0
-    choose_left = positions == ref.size
-    # Boundary masks prevent first/last observations from indexing outside the
-    # reference timestamp array; middle rows use nearest-neighbor comparison.
-    middle = (~choose_right) & (~choose_left)
-    choose_right[middle] = np.abs(right_values[middle] - oth[middle]) <= np.abs(left_values[middle] - oth[middle])
-    nearest = np.where(choose_right, right_values, left_values)
-    skew_seconds = (oth - nearest) / 1_000_000_000
-    output["clock_alignment_pair_count"] = int(skew_seconds.size)
-    output["clock_alignment_median_skew_seconds"] = float(np.median(skew_seconds))
-    output["clock_alignment_p95_abs_skew_seconds"] = float(np.quantile(np.abs(skew_seconds), 0.95))
-    return output
+def interval_seconds(interval: str) -> float:
+    # API "m" means minutes; pandas also accepts other, ambiguous abbreviations.
+    if interval.endswith("ms"):
+        return float(interval[:-2]) / 1000
+    return float(interval[:-1]) * {"s": 1, "m": 60, "h": 3600}[interval[-1]]
 
 
-def dataset_required_columns(dataset: str) -> tuple[str, ...]:
-    if dataset == "quoted_contracts":
-        return ("symbol", "expiration", "strike", "right")
-    if "quotes" in dataset:
-        return ("timestamp", "bid", "ask")
-    if "trades" in dataset:
-        return ("timestamp", "price", "size")
-    if dataset == "option_open_interest":
-        return ("timestamp", "open_interest")
-    raise ValueError(f"Unknown vendor dataset: {dataset}")
+def format_strike(value) -> str:
+    strike = Decimal(str(value))
+    if not strike.is_finite() or strike <= 0 or strike != strike.quantize(Decimal("0.001")):
+        raise ValueError(f"Invalid option strike: {value!r}")
+    return format(strike, ".3f").rstrip("0").rstrip(".")
 
 
-def normalize_strike_for_key(strike: float | None) -> str | None:
-    if strike is None:
-        return None
-    text = f"{strike:.6f}".rstrip("0").rstrip(".")
-    return text if text else "0"
+class ThetaClient:
+    def __init__(self, cfg: CollectorConfig):
+        self.cfg = cfg
+        self.local = threading.local()
+        self.semaphore = threading.BoundedSemaphore(cfg.max_inflight_requests)
+        self.pace_lock = threading.Lock()
+        self.next_allowed = 0.0
 
+    def session(self) -> requests.Session:
+        if not hasattr(self.local, "session"):
+            self.local.session = requests.Session()
+            # Retries are explicit so every attempt obeys the same request budget.
+            adapter = HTTPAdapter(max_retries=0, pool_connections=2, pool_maxsize=2)
+            self.local.session.mount("http://", adapter)
+            self.local.session.mount("https://", adapter)
+        return self.local.session
 
-def format_strike(strike: float) -> str:
-    return normalize_strike_for_key(strike) or "0"
+    @contextmanager
+    def request_slot(self):
+        with self.semaphore:
+            with self.pace_lock:
+                wait = max(0.0, self.next_allowed - time.monotonic())
+                self.next_allowed = max(time.monotonic(), self.next_allowed) + 1 / self.cfg.max_requests_per_second
+            if wait:
+                time.sleep(wait)
+            yield
 
-
-def session_key(symbol: str, trade_day: pd.Timestamp) -> str:
-    return f"symbol={symbol}__date={pd.Timestamp(trade_day).strftime('%Y-%m-%d')}"
-
-
-def parquet_chunk_stem(symbol: str, trade_day: pd.Timestamp) -> str:
-    return session_key(symbol, trade_day)
-
-
-def parquet_chunk_path(base_dir: Path, dataset: str, symbol: str, trade_day: pd.Timestamp, suffix: str = "") -> Path:
-    stem = parquet_chunk_stem(symbol, trade_day)
-    if suffix:
-        stem = f"{stem}__{suffix}"
-    return base_dir / dataset / f"{stem}.parquet"
-
-
-def write_parquet_chunk(base_dir: Path, dataset: str, symbol: str, trade_day: pd.Timestamp, rows: list[dict], suffix: str = "") -> Path:
-    path = parquet_chunk_path(base_dir, dataset, symbol, trade_day, suffix=suffix)
-    write_parquet(path, pd.DataFrame(rows))
-    return path
-
-
-class SymbolDayChunkWriter:
-    """Bound memory while writing the same contract and quality artifacts."""
-    def __init__(self, symbol: str, trade_day: pd.Timestamp):
-        self.symbol, self.trade_day = symbol, trade_day
-        self.paths = chunk_paths()
-        self.rows = {dataset: [] for dataset in ("contracts", "quality")}
-        self.parts = dict.fromkeys(self.rows, 0)
-
-    def _flush(self, dataset: str) -> None:
-        if self.rows[dataset]:
-            self.parts[dataset] += 1
-            write_parquet_chunk(self.paths[dataset], dataset, self.symbol, self.trade_day,
-                                self.rows[dataset], suffix=f"part={self.parts[dataset]:05d}")
-            self.rows[dataset] = []
-
-    def _extend(self, dataset: str, rows: list[dict]) -> None:
-        self.rows[dataset].extend(rows)
-        if len(self.rows[dataset]) >= CFG.stream_flush_row_count:
-            self._flush(dataset)
-
-    def append_contract_row(self, row: dict) -> None:
-        self._extend("contracts", [row])
-
-    def extend_quality_rows(self, rows: list[dict]) -> None:
-        self._extend("quality", rows)
-
-    def finalize(self) -> None:
-        for dataset in self.rows:
-            self._flush(dataset)
-
-
-# ============================================================
-# DATA ACCESS
-# ============================================================
-def get_csv(path: str, params: dict) -> tuple[pd.DataFrame, dict, bytes]:
-    adaptive_request_delay(path)
-    try:
-        with request_slot():
+    def download(self, request: Request) -> tuple[bytes | None, dict]:
+        meta = {}
+        for attempt in range(6):
             started = time.perf_counter()
-            response = get_request_session().get(f"{CFG.base_url}{path}", params=params, timeout=120)
-    except Exception:
-        record_request_result(path, success=False)
-        raise
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    payload = response.content
-    meta = {
-        "request_url": response.url,
-        "status_code": response.status_code,
-        "elapsed_ms": elapsed_ms,
-        "response_headers": dict(response.headers),
-        "payload_sha256": sha256_bytes(payload),
-        "payload_bytes": len(payload),
-    }
-    if response.status_code == 472:  # NO_DATA is an observation, not a transport failure.
-        record_request_result(path, success=True)
-        return pd.DataFrame(), meta, payload
-    if response.status_code != 200:
-        record_request_result(path, success=False)
-        raise RuntimeError(
-            f"Request failed: {response.url}\nstatus={response.status_code}\ntext={response.text[:1000]}"
-        )
-    record_request_result(path, success=True)
-    content_type = response.headers.get("Content-Type", "").lower()
-    if content_type and not any(t in content_type for t in ("csv", "text/plain", "octet-stream")):
-        raise ValueError(f"Unexpected response content type: {content_type}")
-    try:
-        frame = pd.read_csv(BytesIO(payload))
-    except pd.errors.EmptyDataError:
-        frame = pd.DataFrame()
-    return frame, meta, payload
+            retry_after = 0.0
+            try:
+                with self.request_slot():
+                    response = self.session().get(
+                        self.cfg.base_url.rstrip("/") + request.endpoint,
+                        params=request.params, timeout=(10, 120))
+                payload = response.content
+                meta = {"request_url": response.url, "status_code": response.status_code,
+                        "response_headers": dict(response.headers), "attempts": attempt + 1,
+                        "elapsed_ms": (time.perf_counter() - started) * 1000,
+                        "payload_sha256": hashlib.sha256(payload).hexdigest(), "payload_bytes": len(payload)}
+                if response.status_code in {200, 472}:
+                    return payload, meta
+                meta["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
+                if response.status_code not in {429, 474, 500, 502, 503, 504, 571} or attempt == 5:
+                    return payload, meta
+                try:
+                    retry_after = float(response.headers.get("Retry-After", 0))
+                except ValueError:
+                    pass
+            except requests.RequestException as exc:
+                payload = None
+                meta = {"error": repr(exc), "attempts": attempt + 1, "status_code": None}
+                if attempt == 5:
+                    return payload, meta
+            time.sleep(max(min(30.0, 2 ** attempt), min(max(retry_after, 0), 120.0)))
+        return None, meta
 
 
-def raw_cache_path(dataset: str, symbol: str, day: pd.Timestamp, expiration: str | None = None, strike: float | None = None, right: str | None = None) -> Path:
-    base = CFG.raw_cache_dir / dataset / f"symbol={symbol}" / f"date={day.strftime('%Y-%m-%d')}"
-    if expiration is not None:
-        base = base / f"expiration={expiration}"
-    if strike is not None:
-        base = base / f"strike={normalize_strike_for_key(strike)}"
-    if right is not None:
-        base = base / f"right={right.lower()}"
-    return base / "data.parquet"
+# Raw storage and request provenance are independent of contract selection.
+class RequestStore:
+    def __init__(self, cfg: CollectorConfig):
+        self.cfg = cfg
+        self.root = cfg.output_dir
+        self.client = ThetaClient(cfg)
+        self.locks = tuple(threading.Lock() for _ in range(128))
+
+    def directory(self, request: Request) -> Path:
+        date = request.params.get("date", request.params.get("start_date", "reference"))
+        date = str(date).replace("-", "")
+        symbol = request.params["symbol"]
+        return (self.root / "raw_cache" / request.dataset / f"symbol={symbol}" /
+                f"date={date}" / f"request={request.request_id}")
+
+    def cached(self, request: Request) -> dict | None:
+        path = self.directory(request) / "meta.json"
+        try:
+            meta = read_json(path)
+            if (meta["request"] != request.identity() or meta["raw_schema_version"] != RAW_SCHEMA_VERSION
+                    or meta["status"] not in GOOD_REQUEST_STATUSES
+                    or meta.get("timestamp_timezone") != self.cfg.exchange_tz):
+                return None
+            if self.cfg.refresh_no_data and meta["status"] == "no_data":
+                return None
+            if not artifact_valid(meta["data"], self.root):
+                return None
+            if meta.get("payload") and not artifact_valid(meta["payload"], self.root):
+                return None
+            if self.cfg.store_raw_payloads and request.vendor == "ThetaData" and not meta.get("payload"):
+                return None
+            return self.record(request, meta, path)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def record(self, request: Request, meta: dict, meta_path: Path) -> dict:
+        return {"request_id": request.request_id, "dataset": request.dataset,
+                "status": meta["status"], "row_count": meta.get("row_count", 0),
+                "error": meta.get("error", ""), "data": meta.get("data"),
+                "payload": meta.get("payload"), "metadata": file_receipt(meta_path, self.root)}
+
+    def collect(self, request: Request) -> dict:
+        with self.locks[hash(request.request_id) % len(self.locks)]:
+            cached = self.cached(request)
+            if cached:
+                return cached
+            if request.vendor == "Yahoo":
+                return self.collect_yahoo(request)
+            legacy = self.legacy_response(request)
+            if legacy is not None:
+                frame, response_meta, payload = legacy
+                return self.save(request, frame, response_meta, payload)
+            payload, response_meta = self.client.download(request)
+            status = response_meta.get("status_code")
+            frame = pd.DataFrame(columns=request.required_columns)
+            if status not in {200, 472}:
+                return self.save(request, frame, response_meta, payload, "request_error")
+            if status == 200:
+                try:
+                    content_type = response_meta.get("response_headers", {}).get("Content-Type", "").lower()
+                    if content_type and not any(t in content_type for t in ("csv", "text/plain", "octet-stream")):
+                        raise ValueError(f"Unexpected response content type: {content_type}")
+                    frame = pd.read_csv(BytesIO(payload), dtype="string", keep_default_na=False)
+                except pd.errors.EmptyDataError:
+                    # A successful empty body and 472 are distinct in HTTP metadata.
+                    pass
+                except Exception as exc:
+                    response_meta["error"] = f"Invalid CSV response: {exc}"
+                    return self.save(request, frame, response_meta, payload, "invalid_response")
+            return self.save(request, frame, response_meta, payload)
+
+    def save(self, request: Request, frame: pd.DataFrame, response_meta: dict,
+             payload: bytes | None = None, status: str | None = None) -> dict:
+        directory = self.directory(request)
+        missing = set(request.required_columns) - set(frame.columns)
+        if missing or any(str(column).startswith("collector_") for column in frame.columns):
+            status = status or "invalid_response"
+            response_meta["error"] = f"Missing required columns {sorted(missing)} or reserved collector_ column"
+        frame = frame.astype("string").fillna("")
+        frame, quality = raw_frame_with_diagnostics(frame, request, self.cfg)
+        quality["response_identity_issues"] = response_identity_issues(frame, request, self.cfg)
+        if quality["response_identity_issues"]:
+            status = status or "invalid_response"
+            response_meta["error"] = ", ".join(quality["response_identity_issues"])
+        if status is None:
+            status = "no_data" if frame.empty else "available"
+            # An unparseable primary clock indicates an unusable response, but
+            # preserve it for inspection. Bad individual rows are never discarded.
+            primary = next((name for name in ("timestamp", "trade_timestamp", "created")
+                            if name in quality["clocks"]), None)
+            if primary and len(frame) and quality["clocks"][primary]["unparseable_or_missing"] == len(frame):
+                status = "invalid_response"
+                response_meta["error"] = f"No parseable {primary} values"
+        meta = {"request": request.identity(), "request_id": request.request_id,
+                "raw_schema_version": RAW_SCHEMA_VERSION, "timestamp_timezone": self.cfg.exchange_tz,
+                "fetched_at_utc": response_meta.pop("fetched_at_utc", utc_now()), "saved_at_utc": utc_now(),
+                "status": status, "row_count": len(frame), "quality": quality,
+                "collector_code_sha256": file_hash(Path(__file__)), **response_meta}
+        data_path = directory / "data.parquet"
+        write_parquet(data_path, frame)
+        meta["data"] = file_receipt(data_path, self.root, frame)
+        # Preserve unsuccessful responses even without --store-raw-payloads.
+        # They explain schema errors, entitlement failures and vendor messages.
+        if payload is not None and (self.cfg.store_raw_payloads or status not in GOOD_REQUEST_STATUSES):
+            payload_path = directory / "raw_response.csv"
+            with atomic_output(payload_path) as temp:
+                temp.write_bytes(payload)
+            meta["payload"] = file_receipt(payload_path, self.root)
+        write_json(directory / "meta.json", meta)
+        return self.record(request, meta, directory / "meta.json")
+
+    def legacy_response(self, request: Request):
+        """Reuse valid pre-refactor raw quotes/OI/chains without changing old files."""
+        if request.dataset not in {"quoted_contracts", "option_open_interest",
+                                    "stock_quotes_" + self.cfg.quote_interval, "option_quotes_" + self.cfg.quote_interval}:
+            return None
+        params = request.params
+        day = pd.Timestamp(params["date"]).strftime("%Y-%m-%d")
+        directory = self.root / "raw_cache" / request.dataset / f"symbol={params['symbol']}" / f"date={day}"
+        if "expiration" in params:
+            directory /= f"expiration={params['expiration']}"
+            directory /= f"strike={format_strike(params['strike'])}"
+            directory /= f"right={params['right']}"
+        try:
+            old = read_json(directory / "meta.json")
+            path = directory / "data.parquet"
+            if (old["dataset"] != request.dataset or old["endpoint"] != request.endpoint or old["params"] != params
+                    or old["cache_status"] not in {"ok", "no_data"} or file_hash(path) != old["cache_data_sha256"]):
+                return None
+            if self.cfg.refresh_no_data and old["cache_status"] == "no_data":
+                return None
+            payload_path = directory / "raw_response.csv"
+            payload = payload_path.read_bytes() if payload_path.exists() else None
+            if payload is not None and hashlib.sha256(payload).hexdigest() != old.get("payload_sha256"):
+                return None
+            if self.cfg.store_raw_payloads and payload is None:
+                return None
+            if payload and old.get("status_code") == 200:
+                frame = pd.read_csv(BytesIO(payload), dtype="string", keep_default_na=False)
+            else:
+                frame = pd.read_parquet(path)
+                if "timestamp_raw" in frame:
+                    frame["timestamp"] = frame["timestamp_raw"]
+                frame = frame.loc[:, old["columns"]]
+            if set(request.required_columns) - set(frame.columns):
+                return None
+            meta = {name: old[name] for name in ("request_url", "status_code", "response_headers",
+                    "payload_sha256", "payload_bytes", "fetched_at_utc") if name in old}
+            meta.update(legacy_source=path.relative_to(self.root).as_posix(),
+                        legacy_values_previously_parsed=payload is None)
+            return frame, meta, payload
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def collect_yahoo(self, request: Request) -> dict:
+        # Separate, explicitly requested reference snapshot. Yahoo never supplies
+        # a required field to the Theta collection or an inferred zero dividend.
+        try:
+            import yfinance as yf
+            history = yf.Ticker(request.params["symbol"]).history(
+                start=request.params["start_date"],
+                end=(pd.Timestamp(request.params["end_date"]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=False, back_adjust=False, actions=True, repair=False,
+                keepna=True, rounding=False, raise_errors=True)
+            frame = history.reset_index()
+            meta = {"fetched_at_utc": utc_now(), "package_version": version("yfinance"),
+                    "reference_only": True, "historical_vintages_verified": False,
+                    "empty_does_not_prove_no_actions": True}
+            return self.save(request, frame, meta)
+        except Exception as exc:
+            return self.save(request, pd.DataFrame(columns=request.required_columns),
+                             {"error": repr(exc), "reference_only": True}, status="request_error")
+
+    def read(self, record: dict) -> pd.DataFrame:
+        if record["status"] not in GOOD_REQUEST_STATUSES or not record.get("data"):
+            return pd.DataFrame()
+        return pd.read_parquet(self.root / record["data"]["path"])
 
 
-def raw_cache_meta_path(dataset: str, symbol: str, day: pd.Timestamp, expiration: str | None = None, strike: float | None = None, right: str | None = None) -> Path:
-    return raw_cache_path(dataset, symbol, day, expiration=expiration, strike=strike, right=right).with_name("meta.json")
+@lru_cache(maxsize=1)
+def exchange_calendar():
+    return xcals.get_calendar("XNYS", start="2017-01-01", end="2026-12-31")
 
 
-def raw_cache_payload_path(dataset: str, symbol: str, day: pd.Timestamp, expiration: str | None = None, strike: float | None = None, right: str | None = None) -> Path:
-    return raw_cache_path(dataset, symbol, day, expiration=expiration, strike=strike, right=right).with_name("raw_response.csv")
+def session_bounds(day: pd.Timestamp, cfg: CollectorConfig) -> tuple[pd.Timestamp, pd.Timestamp]:
+    calendar = exchange_calendar()
+    return (calendar.session_open(day).tz_convert(cfg.exchange_tz),
+            calendar.session_close(day).tz_convert(cfg.exchange_tz))
 
 
-def raw_cache_meta(dataset: str, symbol: str, day: pd.Timestamp, expiration: str | None = None, strike: float | None = None, right: str | None = None) -> dict:
-    meta_path = raw_cache_meta_path(dataset, symbol, day, expiration=expiration, strike=strike, right=right)
-    if not meta_path.exists():
-        return {}
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
+                    day: pd.Timestamp, contract: dict | None = None) -> Request:
+    params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
+    if asset == "option":
+        if contract is None:
+            raise ValueError("Option history requires an observed contract")
+        params.update(expiration=contract["expiration"], strike=format_strike(contract["strike"]),
+                      right=contract["right"])
+    if kind == "quote":
+        params["interval"] = cfg.quote_interval
+        dataset = f"{asset}_quotes_{cfg.quote_interval}"
+    elif kind == "trade_quote":
+        params["exclusive"] = str(cfg.trade_quote_exclusive).lower()
+        dataset = f"{asset}_trade_quotes_tick"
+    else:
+        dataset = f"{asset}_{kind}"
+    if kind == "eod":
+        params.pop("date")
+        params.update(start_date=day.strftime("%Y%m%d"), end_date=day.strftime("%Y%m%d"))
+    elif kind != "open_interest":
+        opened, closed = session_bounds(day, cfg)
+        params.update(start_time=opened.strftime("%H:%M:%S"), end_time=closed.strftime("%H:%M:%S"))
+        if asset == "stock":
+            params["venue"] = cfg.stock_venue
+    return Request(dataset, f"/{asset}/history/{kind}", params)
 
 
-
-
-
-def cache_is_usable(data_path: Path, meta_path: Path, dataset: str, path: str, params: dict) -> bool:
-    if not data_path.exists() or not meta_path.exists():
-        return False
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    required = {"dataset", "endpoint", "params", "cache_status", "cache_data_sha256"}
-    if not required.issubset(meta):
-        return False
-    if meta["dataset"] != dataset or meta["endpoint"] != path or meta["params"] != params:
-        return False
-    if meta.get("cache_status") not in {"ok", "no_data"}:
-        return False
-    # Reuse is safe only when the stored parquet still matches its recorded
-    # hash/size metadata.
-    try:
-        stat = data_path.stat()
-        if meta.get("cache_data_size_bytes") == stat.st_size and meta.get("cache_data_mtime_ns") == stat.st_mtime_ns:
-            return True
-        return meta["cache_data_sha256"] == sha256_bytes(data_path.read_bytes())
-    except Exception:
-        return False
-
-
-def finalize_market_frame(
-    df: pd.DataFrame,
-    dataset: str,
-    *,
-    derived_columns: tuple[str, ...] = (),
-) -> pd.DataFrame:
-    if "timestamp" not in df.columns:
-        raise KeyError(f"Response missing timestamp column: {list(df.columns)}")
-    result = optimize_frame_dtypes(attach_timestamp_metadata(df))
-    result, filtered_condition_row_count = filter_condition_rows(result, dataset)
-    missing_condition_row_count = int(result.attrs.get("missing_condition_row_count", 0))
-    if {"bid", "ask"}.issubset(result.columns):
-        if "stock_mid" in derived_columns:
-            result["stock_mid"] = (result["bid"] + result["ask"]) / 2.0
-        if "option_mid" in derived_columns:
-            result["option_mid"] = (result["bid"] + result["ask"]) / 2.0
-        if "stock_spread" in derived_columns:
-            result["stock_spread"] = result["ask"] - result["bid"]
-        if "option_spread" in derived_columns:
-            result["option_spread"] = result["ask"] - result["bid"]
-        if "rel_spread" in derived_columns:
-            if "option_mid" not in result.columns:
-                result["option_mid"] = (result["bid"] + result["ask"]) / 2.0
-            if "option_spread" not in result.columns:
-                result["option_spread"] = result["ask"] - result["bid"]
-            result["rel_spread"] = result["option_spread"] / result["option_mid"].replace(0, np.nan)
-    result.attrs["filtered_condition_row_count"] = filtered_condition_row_count
-    result.attrs["missing_condition_row_count"] = missing_condition_row_count
-    return result.sort_values("timestamp", kind="stable", na_position="last").reset_index(drop=True)
-
-
-def fetch_market_frame(
-    dataset: str,
-    symbol: str,
-    day: pd.Timestamp,
-    path: str,
-    params: dict,
-    *,
-    expiration: str | None = None,
-    strike: float | None = None,
-    right: str | None = None,
-    derived_columns: tuple[str, ...] = (),
-) -> pd.DataFrame:
-    df = cached_request_frame(
-        dataset=dataset,
-        symbol=symbol,
-        day=day,
-        path=path,
-        params=params,
-        expiration=expiration,
-        strike=strike,
-        right=right,
-    )
-    return finalize_market_frame(df, dataset, derived_columns=derived_columns)
-
-
-def cached_request_frame(
-    dataset: str,
-    symbol: str,
-    day: pd.Timestamp,
-    path: str,
-    params: dict,
-    expiration: str | None = None,
-    strike: float | None = None,
-    right: str | None = None,
-) -> pd.DataFrame:
-    cache_path = raw_cache_path(dataset, symbol, day, expiration=expiration, strike=strike, right=right)
-    meta_path = raw_cache_meta_path(dataset, symbol, day, expiration=expiration, strike=strike, right=right)
-    payload_path = raw_cache_payload_path(dataset, symbol, day, expiration=expiration, strike=strike, right=right)
-    lock = path_lock(cache_path)
-    with lock:
-        with file_lock(cache_path):
-            if cache_is_usable(cache_path, meta_path, dataset, path, params):
-                return read_csv_cache(cache_path)
-
-            df, response_meta, payload = get_csv(path, params)
-            required = dataset_required_columns(dataset)
-            if df.empty and not len(df.columns):
-                df = pd.DataFrame(columns=required)
-            missing = set(required) - set(df.columns)
-            if missing:
-                raise ValueError(f"{dataset} response missing columns: {sorted(missing)}")
-            if "timestamp" in df and not df.empty and pd.to_datetime(df["timestamp"], errors="coerce").isna().all():
-                raise ValueError(f"{dataset} response has no parseable timestamps")
-            cache_status = "no_data" if df.empty else "ok"
-            cached_df = optimize_frame_dtypes(attach_timestamp_metadata(df, include_raw=True))
-            write_parquet(cache_path, cached_df)
-            cache_stat = cache_path.stat()
-            if CFG.store_raw_payloads:
-                atomic_write_bytes(payload_path, payload)
-            meta = {
-                "vendor": "ThetaData",
-                "dataset": dataset,
-                "endpoint": path,
-                "params": params,
-                "fetched_at_utc": pd.Timestamp.now("UTC").isoformat(),
-                "columns": list(df.columns),
-                "row_count": int(len(df)),
-                "column_signature": "|".join(df.columns.astype(str)),
-                "empty_pull": bool(df.empty),
-                "raw_duplicate_row_count": int(df.duplicated().sum()),
-                "raw_null_timestamp_count": int(df["timestamp"].isna().sum()) if "timestamp" in df.columns else 0,
-                "cache_status": cache_status,
-                "validation_issues": ["no_data"] if df.empty else [],
-                "cache_data_sha256": sha256_bytes(cache_path.read_bytes()),
-                "cache_data_size_bytes": cache_stat.st_size,
-                "cache_data_mtime_ns": cache_stat.st_mtime_ns,
-                **response_meta,
-                "config_digest": run_context()["config_digest"],
-                "code_digest": run_context()["code_digest"],
-            }
-            write_json(meta_path, meta)
-            return read_csv_cache(cache_path)
-
-def get_quoted_contracts(symbol: str, day: pd.Timestamp) -> pd.DataFrame:
-    """One dated universe; retain the vendor's actual expiration/strike/right tuples."""
-    frame = cached_request_frame("quoted_contracts", symbol, day,
-                                 "/option/list/contracts/quote",
-                                 {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"})
-    frame = frame.copy()
-    frame["expiration"] = pd.to_datetime(frame["expiration"], errors="raise").dt.normalize()
-    frame["strike"] = pd.to_numeric(frame["strike"], errors="raise")
-    frame["right"] = frame["right"].astype(str).str.lower().replace({"c": "call", "p": "put"})
-    if (frame["symbol"].ne(symbol).any() or frame[["expiration", "strike"]].isna().any().any()
-            or not np.isfinite(frame["strike"]).all() or frame["strike"].le(0).any()
-            or not frame["right"].isin(["call", "put"]).all()):
-        raise ValueError("Invalid contract identity in dated quote universe")
-    return (frame.loc[frame["right"].isin(CFG.option_rights)]
-            .drop_duplicates(["expiration", "strike", "right"])
+def normalize_chain(frame: pd.DataFrame, symbol: str, cfg: CollectorConfig) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=CONTRACT_FIELDS)
+    chain = frame.loc[:, CONTRACT_FIELDS].copy()
+    chain["expiration"] = pd.to_datetime(chain["expiration"], format="mixed", errors="raise").dt.normalize()
+    chain["strike"] = pd.to_numeric(chain["strike"], errors="raise")
+    chain["right"] = chain["right"].str.lower().replace({"c": "call", "p": "put"})
+    if (chain["symbol"].ne(symbol).any() or chain[["expiration", "strike"]].isna().any().any()
+            or not np.isfinite(chain["strike"]).all() or chain["strike"].le(0).any()
+            or not chain["right"].isin(["call", "put"]).all()):
+        raise ValueError("Invalid identity in dated quote universe")
+    for strike in chain["strike"].unique():
+        format_strike(strike)
+    return (chain.loc[chain["right"].isin(cfg.option_rights)].drop_duplicates()
             .sort_values(["expiration", "strike", "right"]).reset_index(drop=True))
 
 
-def history_dataset(asset: str, kind: str) -> str:
-    if kind == "quote":
-        return f"{asset}_quotes_{CFG.quote_interval}"
-    return f"{asset}_trades_tick" if kind == "trade" else f"{asset}_{kind}"
-
-
-def get_history(asset: str, kind: str, symbol: str, day: pd.Timestamp,
-                expiration: pd.Timestamp | None = None, strike: float | None = None,
-                right: str | None = None) -> pd.DataFrame:
-    params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
-    identity = {}
-    if asset == "option":
-        identity = {"expiration": expiration.strftime("%Y-%m-%d"), "strike": strike, "right": right}
-        params.update(identity, strike=format_strike(strike))
-    else:
-        params["venue"] = CFG.stock_venue
-    derived = ()
-    if kind == "quote":
-        params["interval"] = CFG.quote_interval
-        derived = (f"{asset}_mid", f"{asset}_spread") + (("rel_spread",) if asset == "option" else ())
-    if kind != "open_interest":
-        opened, closed = market_session_bounds(day)
-        params.update(start_time=opened.strftime("%H:%M:%S"), end_time=closed.strftime("%H:%M:%S"))
-    return fetch_market_frame(history_dataset(asset, kind), symbol, day, f"/{asset}/history/{kind}",
-                              params, derived_columns=derived, **identity)
-
-
-def collect_history(asset: str, kind: str, symbol: str, day: pd.Timestamp,
-                    expiration: pd.Timestamp | None = None, strike: float | None = None,
-                    right: str | None = None) -> tuple[pd.DataFrame, dict]:
-    """Keep absent data distinct from request errors without losing diagnostic rows."""
-    error = ""
-    try:
-        frame = get_history(asset, kind, symbol, day, expiration, strike, right)
-        status = "available" if not frame.empty else "no_data"
-        if frame.empty and frame.attrs.get("filtered_condition_row_count", 0):
-            status = "filtered_out"
-    except Exception as exc:
-        frame, error, status = pd.DataFrame(), repr(exc), "request_error"
-    dataset = f"{asset}_{kind}s" if kind in {"quote", "trade"} else f"{asset}_{kind}"
-    diagnostic = summarize_market_frame(frame, dataset, day, CFG.quote_interval if kind == "quote" else None)
-    diagnostic.update(symbol=symbol, trade_day=day, expiration=expiration, strike=strike,
-                      right=right.upper() if right else "", request_error=error, data_status=status,
-                      contract_id=occ_contract_id(symbol, expiration, right, strike) if expiration is not None else "")
-    return frame, diagnostic
-
-
-# ============================================================
-# NEUTRAL SURFACE COLLECTOR
-# ============================================================
-def candidate_anchor_dates() -> pd.DatetimeIndex:
-    sessions = XNYS.sessions_in_range(CFG.start_date, CFG.end_date).tz_localize(None)
-    freq = str(CFG.anchor_freq).strip().upper()
-    if freq in {"", "B", "SESSION", "SESSIONS", "XNYS"}:
-        return sessions
-    requested = pd.date_range(CFG.start_date, CFG.end_date, freq=CFG.anchor_freq).normalize()
-    requested_index = pd.Index(pd.Timestamp(ts).normalize() for ts in requested)
-    return sessions[sessions.isin(requested_index)]
-
-
-@lru_cache(maxsize=None)
-def market_session_bounds(day: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
-    session = pd.Timestamp(day).normalize()
-    open_ts = XNYS.session_open(session).tz_convert(CFG.exchange_tz)
-    close_ts = XNYS.session_close(session).tz_convert(CFG.exchange_tz)
-    return open_ts, close_ts
-
-
-@lru_cache(maxsize=None)
-def session_metadata(day: pd.Timestamp) -> dict:
-    session = pd.Timestamp(day).normalize()
-    open_ts, close_ts = market_session_bounds(session)
-    return {
-        "session_open": open_ts,
-        "session_close": close_ts,
-        "session_length_minutes": (close_ts - open_ts).total_seconds() / 60.0,
-        "is_early_close": (close_ts - open_ts).total_seconds() < (6.5 * 60 * 60),
-    }
-
-
-def expected_interval_seconds(interval: str) -> float | None:
-    return None if not interval or interval == "tick" else pd.Timedelta(interval).total_seconds()
-
-
-@lru_cache(maxsize=None)
-def previous_trade_day(trade_day: pd.Timestamp) -> pd.Timestamp | None:
-    try:
-        return pd.Timestamp(XNYS.previous_session(pd.Timestamp(trade_day).normalize())).normalize()
-    except Exception:
-        return None
-
-
-def eligible_expirations(trade_day: pd.Timestamp, expirations: tuple[pd.Timestamp, ...]) -> list[pd.Timestamp]:
-    eligible = []
-    trade_day_norm = pd.Timestamp(trade_day).normalize()
-    for expiration in expirations:
-        dte = int((pd.Timestamp(expiration).normalize() - trade_day_norm).days)
-        if CFG.min_dte <= dte <= CFG.max_dte:
-            eligible.append(pd.Timestamp(expiration))
-    if not eligible:
-        return []
-    selected: list[pd.Timestamp] = []
-    remaining = list(eligible)
-    for target_dte in CFG.target_dtes:
-        if not remaining:
-            break
-        best = min(
-            remaining,
-            key=lambda exp: (
-                abs(int((pd.Timestamp(exp).normalize() - trade_day_norm).days) - int(target_dte)),
-                int((pd.Timestamp(exp).normalize() - trade_day_norm).days),
-            ),
-        )
-        if best not in selected:
-            selected.append(best)
-        remaining = [exp for exp in remaining if exp != best]
-        if len(selected) >= CFG.max_expirations_per_day:
-            break
-    if len(selected) < CFG.max_expirations_per_day:
-        # This makes max_expirations_per_day a true ceiling: fill to the cap
-        # whenever enough eligible expirations exist, otherwise return fewer.
-        leftovers = sorted(
-            [exp for exp in eligible if exp not in selected],
-            key=lambda exp: min(abs(int((pd.Timestamp(exp).normalize() - trade_day_norm).days) - int(target)) for target in CFG.target_dtes),
-        )
-        selected.extend(leftovers[: max(CFG.max_expirations_per_day - len(selected), 0)])
-    return sorted(selected)
-
-
-def stock_selection_reference_mids(stock_quotes: pd.DataFrame, trade_day: pd.Timestamp) -> dict[str, float]:
-    reference_mids: dict[str, float] = {}
-    for label, entry_ts, _ in evaluation_schedule(trade_day):
-        snapshot = market_snapshot(
-            stock_quotes,
-            entry_ts,
-            max_age_seconds=CFG.max_stock_quote_age_seconds,
-            prefix=f"stock_reference_{label}",
-        )
-        mid = to_float(snapshot.get(f"stock_reference_{label}_stock_mid"))
-        bid, ask = (to_float(snapshot.get(f"stock_reference_{label}_{side}")) for side in ("bid", "ask"))
-        if (np.isfinite(mid) and mid > 0 and np.isfinite(bid) and np.isfinite(ask)
-                and 0 < bid <= ask and not snapshot[f"stock_reference_{label}_is_stale"]):
-            reference_mids[label] = float(mid)
-    return reference_mids
-
-
-def selected_strikes(strikes: tuple[float, ...], reference_mids: dict[str, float]) -> list[float]:
-    if not strikes or not reference_mids:
-        return []
-    chosen: list[float] = []
-    for reference_mid in reference_mids.values():
-        for target_moneyness in CFG.moneyness_targets:
-            target_strike = float(reference_mid / target_moneyness)
-            ranked = sorted(strikes, key=lambda strike: (abs(float(strike) - target_strike), float(strike)))
-            for strike in ranked[: CFG.strikes_per_moneyness_target]:
-                numeric = float(strike)
-                if numeric not in chosen:
-                    chosen.append(numeric)
-    return sorted(chosen)
-
-
-def occ_contract_id(symbol: str, expiration: pd.Timestamp, right: str, strike: float) -> str:
-    if len(symbol) > 6:
-        raise ValueError(f"OCC root requires an explicit vendor root for symbols longer than six characters: {symbol}")
-    root = symbol.ljust(6)[:6]
-    strike_mils = int((Decimal(str(strike)) * Decimal("1000")).to_integral_value(rounding=ROUND_HALF_UP))
-    return f"{root}{expiration.strftime('%y%m%d')}{right[:1].upper()}{strike_mils:08d}"
-
-
-def count_sync_missing(stock_ts_ns: np.ndarray, option_ts: pd.Series, tolerance_seconds: int = 5) -> float:
-    if len(stock_ts_ns) == 0 or option_ts.empty:
-        return np.nan
-    option_ns = pd.DatetimeIndex(option_ts.dropna()).as_unit("ns").asi8
-    if option_ns.size == 0:
-        return np.nan
-    positions = np.searchsorted(stock_ts_ns, option_ns)
-    tolerance_ns = tolerance_seconds * 1_000_000_000
-    nearest = np.full(option_ns.shape, np.iinfo(np.int64).max, dtype=np.int64)
-    valid_right = positions < len(stock_ts_ns)
-    if valid_right.any():
-        nearest[valid_right] = np.minimum(nearest[valid_right], np.abs(stock_ts_ns[positions[valid_right]] - option_ns[valid_right]))
-    valid_left = positions > 0
-    if valid_left.any():
-        left_idx = positions[valid_left] - 1
-        nearest[valid_left] = np.minimum(nearest[valid_left], np.abs(stock_ts_ns[left_idx] - option_ns[valid_left]))
-    return int((nearest > tolerance_ns).sum())
-
-
-def summarize_market_frame(
-    df: pd.DataFrame,
-    dataset: str,
-    trade_day: pd.Timestamp,
-    interval: str | None = None,
-) -> dict:
-    df = optimize_frame_dtypes(df)
-    dtype_signature = "|".join(f"{col}:{dtype}" for col, dtype in df.dtypes.astype(str).items()) if not df.empty else ""
-    summary = {
-        "dataset": dataset,
-        "row_count": int(len(df)),
-        "column_signature": "|".join(df.columns.astype(str)),
-        "dtype_signature": dtype_signature,
-        "empty_pull": bool(df.empty),
-        "filtered_condition_row_count": int(df.attrs.get("filtered_condition_row_count", 0)),
-        "missing_condition_row_count": int(df.attrs.get("missing_condition_row_count", 0)),
-        "null_timestamp_count": 0,
-        "timestamp_parse_failed_count": 0,
-        "timestamp_naive_assumed_count": 0,
-        "duplicate_timestamp_count": 0,
-        "duplicate_timestamp_conflict_count": 0,
-        "out_of_order_timestamp_count": 0,
-        "missing_interval_count": 0 if interval is not None else np.nan,
-        "max_gap_seconds": np.nan,
-        "p99_gap_seconds": np.nan,
-        "interval_alignment_miss_count": 0,
-        "first_timestamp": pd.NaT,
-        "last_timestamp": pd.NaT,
-        "session_start_gap_seconds": np.nan,
-        "session_end_gap_seconds": np.nan,
-        "in_session_row_count": 0,
-        "outside_session_row_count": 0,
-        "session_coverage_ratio": np.nan,
-        "partial_bid_ask_rows": 0,
-        "missing_bid_only_rows": 0,
-        "missing_ask_only_rows": 0,
-        "crossed_market_count": 0,
-        "locked_market_count": 0,
-        "negative_size_count": 0,
-        "negative_price_count": 0,
-        "zero_size_count": 0,
-        "zero_price_count": 0,
-        "null_bid_count": 0,
-        "null_ask_count": 0,
-        "null_price_count": 0,
-        "null_size_count": 0,
-        "absurd_price_count": 0,
-        "absurd_size_count": 0,
-        "median_rel_spread": np.nan,
-        "p95_rel_spread": np.nan,
-        "median_spread": np.nan,
-    }
-    if df.empty or "timestamp" not in df.columns:
-        return summary
-
-    ts = df["timestamp"]
-    summary["null_timestamp_count"] = int(ts.isna().sum())
-    if "timestamp_parse_failed" in df.columns:
-        summary["timestamp_parse_failed_count"] = int(pd.to_numeric(df["timestamp_parse_failed"], errors="coerce").fillna(0).astype(bool).sum())
-    if "timestamp_naive_assumed" in df.columns:
-        summary["timestamp_naive_assumed_count"] = int(pd.to_numeric(df["timestamp_naive_assumed"], errors="coerce").fillna(0).astype(bool).sum())
-    clean = df.loc[ts.notna()]
-    if clean.empty:
-        return summary
-
-    deltas = clean["timestamp"].diff().dt.total_seconds()
-    summary["duplicate_timestamp_count"] = int(clean["timestamp"].duplicated().sum())
-    if summary["duplicate_timestamp_count"] > 0:
-        non_ts_cols = [col for col in clean.columns if col != "timestamp"]
-        if non_ts_cols:
-            duplicate_rows = clean[clean["timestamp"].duplicated(keep=False)]
-            if not duplicate_rows.empty:
-                distinct_per_timestamp = duplicate_rows.groupby("timestamp", dropna=False)[non_ts_cols].apply(
-                    lambda frame: len(frame.drop_duplicates())
-                )
-                summary["duplicate_timestamp_conflict_count"] = int((distinct_per_timestamp > 1).sum())
-    summary["out_of_order_timestamp_count"] = int((deltas < 0).fillna(False).sum())
-    clean = clean.sort_values("timestamp", kind="stable").reset_index(drop=True)
-    deltas = clean["timestamp"].diff().dt.total_seconds()
-    summary["first_timestamp"] = clean["timestamp"].iloc[0]
-    summary["last_timestamp"] = clean["timestamp"].iloc[-1]
-
-    if dataset != "option_open_interest":
-        session_open, session_close = market_session_bounds(trade_day)
-        in_session = clean[(clean["timestamp"] >= session_open) & (clean["timestamp"] <= session_close)]
-        summary["in_session_row_count"] = int(len(in_session))
-        summary["outside_session_row_count"] = int(len(clean) - len(in_session))
-        metric_frame = in_session
-        if not metric_frame.empty:
-            summary["session_start_gap_seconds"] = (metric_frame["timestamp"].iloc[0] - session_open).total_seconds()
-            summary["session_end_gap_seconds"] = (session_close - metric_frame["timestamp"].iloc[-1]).total_seconds()
-            session_seconds = max((session_close - session_open).total_seconds(), 1.0)
-            expected = expected_interval_seconds(interval or "")
-            if expected is not None:
-                total_expected_intervals = max(int(np.floor(session_seconds / expected)) + 1, 1)
-                covered_offsets = (
-                    ((metric_frame["timestamp"] - session_open).dt.total_seconds().clip(lower=0.0, upper=session_seconds) // expected)
-                    .dropna()
-                    .astype(int)
-                )
-                summary["session_coverage_ratio"] = min(float(covered_offsets.nunique() / total_expected_intervals), 1.0)
-            else:
-                active_seconds = max((metric_frame["timestamp"].iloc[-1] - metric_frame["timestamp"].iloc[0]).total_seconds(), 0.0)
-                summary["session_coverage_ratio"] = active_seconds / session_seconds
-        metric_deltas = metric_frame["timestamp"].diff().dt.total_seconds() if len(metric_frame) > 1 else pd.Series(dtype=float)
-        if len(metric_frame) > 1:
-            summary["max_gap_seconds"] = float(metric_deltas.max())
-            summary["p99_gap_seconds"] = float(metric_deltas.quantile(0.99))
-            expected = expected_interval_seconds(interval or "")
-            if expected is not None:
-                summary["missing_interval_count"] = int((metric_deltas > (expected * 1.5)).fillna(False).sum())
-                summary["interval_alignment_miss_count"] = int(
-                    ((metric_frame["timestamp"] - session_open).dt.total_seconds().round() % expected != 0).sum()
-                )
-
-    if {"bid", "ask"}.issubset(clean.columns):
-        bid = clean["bid"]
-        ask = clean["ask"]
-        summary["null_bid_count"] = int(bid.isna().sum())
-        summary["null_ask_count"] = int(ask.isna().sum())
-        summary["partial_bid_ask_rows"] = int((bid.isna() ^ ask.isna()).sum())
-        summary["missing_bid_only_rows"] = int((bid.isna() & ask.notna()).sum())
-        summary["missing_ask_only_rows"] = int((ask.isna() & bid.notna()).sum())
-        summary["crossed_market_count"] = int(((ask < bid) & bid.notna() & ask.notna()).sum())
-        summary["locked_market_count"] = int(((ask == bid) & bid.notna() & ask.notna()).sum())
-        spread = ask - bid
-        mid = (ask + bid) / 2.0
-        rel_spread = spread / mid.replace(0, np.nan)
-        summary["median_spread"] = float(spread.dropna().median()) if spread.notna().any() else np.nan
-        summary["median_rel_spread"] = float(rel_spread.dropna().median()) if rel_spread.notna().any() else np.nan
-        summary["p95_rel_spread"] = float(rel_spread.dropna().quantile(0.95)) if rel_spread.notna().any() else np.nan
-
-    if "price" in clean.columns:
-        price = clean["price"]
-        summary["null_price_count"] = int(price.isna().sum())
-        summary["negative_price_count"] = int((price < 0).fillna(False).sum())
-        summary["zero_price_count"] = int((price == 0).fillna(False).sum())
-        valid_price = price.dropna()
-        if not valid_price.empty:
-            relative_ceiling = float(valid_price.quantile(0.999) * 10.0)
-            absolute_ceiling = 50_000.0
-            ceiling = min(relative_ceiling, absolute_ceiling) if relative_ceiling > 0 else absolute_ceiling
-            summary["absurd_price_count"] = int((price > ceiling).fillna(False).sum())
-
-    if "size" in clean.columns:
-        size = clean["size"]
-        summary["null_size_count"] = int(size.isna().sum())
-        summary["negative_size_count"] = int((size < 0).fillna(False).sum())
-        summary["zero_size_count"] = int((size == 0).fillna(False).sum())
-        summary["absurd_size_count"] = int((size > size.dropna().quantile(0.999) * 10).fillna(False).sum()) if size.notna().any() else 0
-
-    return summary
-
-
-def describe_stock_day(stock_quotes: pd.DataFrame, trade_day: pd.Timestamp) -> dict:
-    summary = summarize_market_frame(stock_quotes, "stock_quotes", trade_day, CFG.quote_interval)
-    valid = stock_quotes[
-        stock_quotes.get("bid", pd.Series(dtype=float)).gt(0)
-        & stock_quotes.get("ask", pd.Series(dtype=float)).gt(0)
-        & stock_quotes.get("ask", pd.Series(dtype=float)).ge(stock_quotes.get("bid", pd.Series(dtype=float)))
-        & stock_quotes.get("stock_mid", pd.Series(dtype=float)).gt(0)
-    ].copy()
-    if valid.empty:
-        summary["stock_open_mid"] = np.nan
-        summary["stock_close_mid"] = np.nan
-        summary["stock_median_spread"] = np.nan
-        return summary
-
-    mids = pd.to_numeric(valid["stock_mid"], errors="coerce")
-    spreads = pd.to_numeric(valid["stock_spread"], errors="coerce")
-    rel_spread = spreads / mids.replace(0, np.nan)
-    summary["stock_open_mid"] = float(mids.dropna().iloc[0]) if mids.notna().any() else np.nan
-    summary["stock_close_mid"] = float(mids.dropna().iloc[-1]) if mids.notna().any() else np.nan
-    summary["stock_median_spread"] = float(spreads.dropna().median()) if spreads.notna().any() else np.nan
-    summary["stock_median_rel_spread"] = float(rel_spread.dropna().median()) if rel_spread.notna().any() else np.nan
-    return summary
-
-
-def collect_contract_day(
-    symbol_cfg: SymbolConfig,
-    trade_day: pd.Timestamp,
-    expiration: pd.Timestamp,
-    strike: float,
-    right: str,
-    prev_trade_day: pd.Timestamp | None,
-    stock_timestamp_ns: np.ndarray,
-    stock_day: dict,
-    stock_context: dict,
-    chain_context: dict,
-) -> tuple[dict, list[dict]]:
-    contract_key = occ_contract_id(symbol_cfg.symbol, expiration, right, strike)
-    frames, diagnostics = {}, {}
-    for kind in ("open_interest", "quote", "trade"):
-        frames[kind], diagnostics[kind] = collect_history(
-            "option", kind, symbol_cfg.symbol, trade_day, expiration, strike, right)
-    option_oi, option_quotes, option_trades = (frames[k] for k in ("open_interest", "quote", "trade"))
-    oi_diag, quote_diag, trade_diag = (diagnostics[k] for k in ("open_interest", "quote", "trade"))
-    quality_rows = list(diagnostics.values())
-    oi_diag.update(open_interest_trade_day=prev_trade_day, open_interest_report_date=trade_day)
-    # The report on D describes D-1 close. Use only reports received by evaluation time.
-    primary_entry = next(iter(stock_context["evaluation_contexts"].values()))["entry_ts"]
-    primary_oi = market_snapshot(option_oi, primary_entry, prefix="oi")
-    open_interest = to_float(primary_oi.get("oi_open_interest"))
-    quote_mid = option_quotes["option_mid"] if "option_mid" in option_quotes.columns else pd.Series(dtype=float)
-    quote_spread = option_quotes["option_spread"] if "option_spread" in option_quotes.columns else pd.Series(dtype=float)
-    trade_price = option_trades["price"] if "price" in option_trades.columns else pd.Series(dtype=float)
-    trade_size = option_trades["size"] if "size" in option_trades.columns else pd.Series(dtype=float)
-    total_trade_size = float(trade_size.fillna(0).sum()) if not trade_size.empty else 0.0
-    vwap = float((trade_price * trade_size).sum() / total_trade_size) if total_trade_size > 0 else np.nan
-    stock_open_mid = stock_day.get("stock_open_mid", np.nan)
-    primary_reference_mid = to_float(chain_context.get("primary_reference_mid", np.nan))
-    moneyness = primary_reference_mid / strike if strike > 0 and not pd.isna(primary_reference_mid) else np.nan
-    option_ts = option_quotes["timestamp"].dropna() if "timestamp" in option_quotes.columns else pd.Series(dtype="datetime64[ns, America/New_York]")
-    sync_missing = count_sync_missing(stock_timestamp_ns, option_ts)
-    clock_alignment = nearest_clock_skew_seconds(stock_context["stock_quote_timestamps_ns"], option_ts)
-    option_quote_trade_alignment = nearest_clock_skew_seconds(
-        option_quotes["timestamp"] if "timestamp" in option_quotes.columns else pd.Series(dtype="datetime64[ns, America/New_York]"),
-        option_trades["timestamp"] if "timestamp" in option_trades.columns else pd.Series(dtype="datetime64[ns, America/New_York]"),
-    )
-    observed_quote_quality_pass_count = int(
-        sum(
-            [
-                len(option_quotes) > 10,
-                quote_diag["crossed_market_count"] == 0,
-                quote_diag["partial_bid_ask_rows"] == 0,
-                pd.notna(quote_diag["median_rel_spread"]) and quote_diag["median_rel_spread"] < 1.0,
-                quote_diag["outside_session_row_count"] == 0,
-                quote_diag["timestamp_naive_assumed_count"] == 0,
-            ]
-        )
-    )
-    observed_trade_quality_pass_count = int(
-        sum(
-            [
-                len(option_trades) > 5,
-                total_trade_size >= 10,
-                trade_diag["outside_session_row_count"] == 0,
-                trade_diag["timestamp_naive_assumed_count"] == 0,
-                trade_diag["data_status"] == "available",
-            ]
-        )
-    )
-    metadata = {
-        kind: raw_cache_meta(history_dataset("option", kind), symbol_cfg.symbol, trade_day,
-                             expiration=expiration.strftime("%Y-%m-%d"), strike=strike, right=right)
-        for kind in ("quote", "trade", "open_interest")
-    }
-    option_quote_meta, option_trade_meta, option_oi_meta = (metadata[k] for k in ("quote", "trade", "open_interest"))
-
-    corporate_actions = stock_context.get("corporate_actions", pd.DataFrame())
-    # Corporate-action flags are annotations, not hard exclusions. The modeling
-    # layer decides whether to drop dividend/split-sensitive rows.
-    if isinstance(corporate_actions, pd.DataFrame) and not corporate_actions.empty and "date" in corporate_actions.columns:
-        action_dates = pd.to_datetime(corporate_actions["date"], errors="coerce").dt.normalize()
-        dividends = pd.to_numeric(corporate_actions.get("dividends", pd.Series(index=corporate_actions.index, dtype=float)), errors="coerce").fillna(0.0)
-        splits = pd.to_numeric(corporate_actions.get("stock_splits", pd.Series(index=corporate_actions.index, dtype=float)), errors="coerce").fillna(0.0)
-        dividend_dates = action_dates.loc[dividends > 0].dropna()
-        split_dates = action_dates.loc[splits > 0].dropna()
-    else:
-        dividend_dates = pd.Series(dtype="datetime64[ns]")
-        split_dates = pd.Series(dtype="datetime64[ns]")
-    trade_date = pd.Timestamp(trade_day).normalize()
-    expiration_date = pd.Timestamp(expiration).normalize()
-    split_in_contract_horizon = bool(((split_dates >= trade_date) & (split_dates <= expiration_date)).any()) if not split_dates.empty else False
-    split_prior_to_trade_day = bool((split_dates < trade_date).any()) if not split_dates.empty else False
-
-    evaluation_fields: dict[str, object] = {}
-    dividend_in_any_eval_horizon = False
-    for label, eval_context in stock_context["evaluation_contexts"].items():
-        entry_ts = eval_context["entry_ts"]
-        exit_ts = eval_context["exit_ts"]
-        # Per-evaluation moneyness depends on stock history deriving
-        # stock_mid; if that input is unavailable, the value is intentionally NaN.
-        underlying_reference_mid = to_float(eval_context["entry_quote"].get(f"stock_eval_{label}_entry_quote_stock_mid", np.nan))
-        entry_date = pd.Timestamp(entry_ts.date())
-        exit_date = pd.Timestamp(exit_ts.date())
-        dividend_in_eval_horizon = bool(((dividend_dates >= entry_date) & (dividend_dates <= exit_date)).any()) if not dividend_dates.empty else False
-        dividend_in_any_eval_horizon = dividend_in_any_eval_horizon or dividend_in_eval_horizon
-        evaluation_fields[f"eval_{label}_underlying_reference_mid"] = underlying_reference_mid
-        evaluation_fields[f"eval_{label}_in_session"] = True
-        evaluation_fields[f"eval_{label}_selected_by_spot_grid"] = label in chain_context["selected_evaluation_labels"]
-        evaluation_fields[f"eval_{label}_moneyness"] = underlying_reference_mid / strike if strike > 0 and pd.notna(underlying_reference_mid) else np.nan
-        evaluation_fields[f"eval_{label}_dividend_in_horizon_flag"] = dividend_in_eval_horizon
-        contexts = evaluation_observations(option_quotes, option_trades, entry_ts, exit_ts,
-                                            f"eval_{label}", "option", CFG.max_option_quote_age_seconds)
-        for values in contexts.values():
-            evaluation_fields.update(values)
-        oi = market_snapshot(option_oi, entry_ts, prefix="oi")
-        evaluation_fields[f"eval_{label}_open_interest"] = to_float(oi.get("oi_open_interest"))
-        evaluation_fields[f"eval_{label}_open_interest_report_timestamp"] = oi["oi_timestamp"]
-        for key, values in eval_context.items():
-            if isinstance(values, dict):
-                evaluation_fields.update(values)
-
-    contract_row = {
-        "symbol": symbol_cfg.symbol,
-        "asset_type": symbol_cfg.asset_type,
-        "universe_bucket": symbol_cfg.universe_bucket,
-        "sector_proxy": symbol_cfg.sector_proxy,
-        "trade_day": trade_day,
-        "expiration": expiration,
-        "right": right.upper(),
-        "strike": strike,
-        "contract_id": contract_key,
-        "dte_days": int((expiration.normalize() - trade_day.normalize()).days),
-        "stock_open_mid": stock_open_mid,
-        "primary_reference_mid": primary_reference_mid,
-        "moneyness_open": moneyness,
-        "quote_row_count": len(option_quotes),
-        "trade_row_count": len(option_trades),
-        "open_interest_row_count": len(option_oi),
-        "quote_first_timestamp": quote_diag["first_timestamp"],
-        "quote_last_timestamp": quote_diag["last_timestamp"],
-        "trade_first_timestamp": trade_diag["first_timestamp"],
-        "trade_last_timestamp": trade_diag["last_timestamp"],
-        "median_option_mid": float(quote_mid.dropna().median()) if not quote_mid.dropna().empty else np.nan,
-        "median_option_spread": float(quote_spread.dropna().median()) if not quote_spread.dropna().empty else np.nan,
-        "trade_vwap": vwap,
-        "total_trade_size": total_trade_size,
-        "lagged_open_interest": open_interest,
-        "open_interest_report_date": trade_day,
-        "open_interest_report_timestamp": primary_oi["oi_timestamp"],
-        "request_error_count": sum(bool(d["request_error"]) for d in quality_rows),
-        "quote_data_status": quote_diag["data_status"],
-        "trade_data_status": trade_diag["data_status"],
-        "open_interest_data_status": oi_diag["data_status"],
-        "option_to_stock_sync_missing_count": sync_missing,
-        "quote_missing_interval_count": quote_diag["missing_interval_count"],
-        "trade_missing_interval_count": trade_diag["missing_interval_count"],
-        "quote_duplicate_timestamp_count": quote_diag["duplicate_timestamp_count"],
-        "trade_duplicate_timestamp_count": trade_diag["duplicate_timestamp_count"],
-        "quote_out_of_order_timestamp_count": quote_diag["out_of_order_timestamp_count"],
-        "trade_out_of_order_timestamp_count": trade_diag["out_of_order_timestamp_count"],
-        "crossed_market_count": quote_diag["crossed_market_count"],
-        "locked_market_count": quote_diag["locked_market_count"],
-        "partial_bid_ask_rows": quote_diag["partial_bid_ask_rows"],
-        "quote_column_signature": quote_diag["column_signature"],
-        "quote_dtype_signature": quote_diag["dtype_signature"],
-        "trade_column_signature": trade_diag["column_signature"],
-        "trade_dtype_signature": trade_diag["dtype_signature"],
-        "oi_column_signature": oi_diag["column_signature"],
-        "oi_dtype_signature": oi_diag["dtype_signature"],
-        "selection_status": "observed",
-        "screening_reasons": "",
-        "observed_quote_quality_pass_count": observed_quote_quality_pass_count,
-        "observed_trade_quality_pass_count": observed_trade_quality_pass_count,
-        "observed_quote_median_rel_spread": quote_diag["median_rel_spread"],
-        "observed_quote_p95_rel_spread": quote_diag["p95_rel_spread"],
-        "open_interest_trade_day": prev_trade_day,
-        "evaluation_times": "|".join(stock_context["evaluation_contexts"].keys()),
-        "stock_quote_vendor_clock_verified": False,
-        "option_quote_vendor_clock_verified": False,
-        "quote_nbbo_provenance_verified": False,
-        "contract_identity_adjustment_verified": False,
-        "corporate_action_annotations_are_retrospective": True,
-        "stock_split_prior_to_trade_day_flag": split_prior_to_trade_day,
-        "stock_split_in_contract_horizon_flag": split_in_contract_horizon,
-        "dividend_in_any_eval_horizon_flag": dividend_in_any_eval_horizon,
-        **stock_context["carry_context"],
-        **clock_alignment,
-        "option_quote_trade_clock_alignment_pair_count": option_quote_trade_alignment["clock_alignment_pair_count"],
-        "option_quote_trade_clock_alignment_median_skew_seconds": option_quote_trade_alignment["clock_alignment_median_skew_seconds"],
-        "option_quote_trade_clock_alignment_p95_abs_skew_seconds": option_quote_trade_alignment["clock_alignment_p95_abs_skew_seconds"],
-        "total_strike_count_for_expiration": chain_context["total_strike_count_for_expiration"],
-        "total_quoted_contract_count_for_expiration": chain_context["total_quoted_contract_count_for_expiration"],
-        "sampled_strike_count_for_expiration": chain_context["sampled_strike_count_for_expiration"],
-        "sampled_contract_count_for_expiration": chain_context["sampled_contract_count_for_expiration"],
-        "sampled_contract_fraction_for_expiration": chain_context["sampled_contract_fraction_for_expiration"],
-        "strike_rank_in_expiration": chain_context["strike_rank_in_expiration"],
-        "strike_percentile_in_expiration": chain_context["strike_percentile_in_expiration"],
-        "quote_payload_sha256": option_quote_meta.get("payload_sha256", ""),
-        "trade_payload_sha256": option_trade_meta.get("payload_sha256", ""),
-        "oi_payload_sha256": option_oi_meta.get("payload_sha256", ""),
-        "quote_cache_data_sha256": option_quote_meta.get("cache_data_sha256", ""),
-        "trade_cache_data_sha256": option_trade_meta.get("cache_data_sha256", ""),
-        "oi_cache_data_sha256": option_oi_meta.get("cache_data_sha256", ""),
-    }
-    contract_row.update(evaluation_fields)
-    contract_row.update(build_sample_flags(contract_row))
-    return contract_row, quality_rows
-
-
-def evaluation_observations(quotes: pd.DataFrame, trades: pd.DataFrame,
-                            entry: pd.Timestamp, exit: pd.Timestamp, prefix: str,
-                            asset: str, max_quote_age: int) -> dict[str, dict]:
-    result = {}
-    for moment, timestamp in (("entry", entry), ("exit", exit)):
-        for kind, frame in (("quote", quotes), ("trade", trades)):
-            key = f"{moment}_{kind}"
-            options = ({"max_age_seconds": max_quote_age} if kind == "quote"
-                       else {"trade_lookback_minutes": CFG.recent_trade_lookback_minutes})
-            result[key] = market_snapshot(frame, timestamp, prefix=f"{prefix}_{key}", **options)
-            result[f"{key}_window"] = window_observation_features(
-                frame, timestamp, window_minutes=CFG.recent_trade_lookback_minutes,
-                prefix=f"{prefix}_{key}_window", value_column=f"{asset}_mid" if kind == "quote" else "price",
-                observation_kind=("quote_sample" if CFG.quote_interval != "tick" else "quote_event") if kind == "quote" else "trade_event",
-                expected_spacing_seconds=expected_interval_seconds(CFG.quote_interval) if kind == "quote" else None)
-    return result
-
-
-def collect_symbol_day(
-    symbol_cfg: SymbolConfig,
-    trade_day: pd.Timestamp,
-    chunk_writer: SymbolDayChunkWriter | None = None,
-) -> tuple[dict, list[dict], list[dict], list[dict], list[dict]]:
-    symbol = symbol_cfg.symbol
-    stock_quotes, quote_diag = collect_history("stock", "quote", symbol, trade_day)
-    stock_trades, trade_diag = collect_history("stock", "trade", symbol, trade_day)
-    stock_day = describe_stock_day(stock_quotes, trade_day)
-    stock_available = pd.notna(stock_day.get("stock_open_mid"))
-    prev_trade = previous_trade_day(trade_day)
-    request_errors = sum(bool(d["request_error"]) for d in (quote_diag, trade_diag))
-    clock = nearest_clock_skew_seconds(stock_quotes.get("timestamp", pd.Series(dtype=object)),
-                                      stock_trades.get("timestamp", pd.Series(dtype=object)))
-    session_row = {
-        "output_schema_version": OUTPUT_SCHEMA_VERSION, "config_digest": _CONFIG_DIGEST,
-        **asdict(symbol_cfg), "requested_day": trade_day, "trade_day": trade_day,
-        "stock_request_error": quote_diag["request_error"],
-        "stock_trade_request_error": trade_diag["request_error"],
-        "stock_quote_data_status": quote_diag["data_status"],
-        "stock_trade_data_status": trade_diag["data_status"],
-        "stock_data_available": stock_available, "stock_trade_data_available": not stock_trades.empty,
-        "open_interest_asof_trade_day": prev_trade, "open_interest_report_date": trade_day,
-        "contract_universe": "quoted_on_trade_date", "stock_venue": CFG.stock_venue,
-        "collection_status": "request_error" if request_errors else "unavailable",
-        "unavailable_reason": "" if stock_available else f"stock_quotes:{quote_diag['data_status']}",
-        "request_error_count": request_errors,
-        "expected_contract_count": 0, "collected_contract_count": 0,
-        "screened_out_contract_count": 0, "contract_task_failure_count": 0,
-        **session_metadata(trade_day), **stock_day,
-        "active_evaluation_times": "|".join(label for label, _, _ in evaluation_schedule(trade_day)),
-        **{f"stock_quote_trade_{key}": value for key, value in clock.items()},
-    }
-    quality_rows = [quote_diag, trade_diag]
-    expiration_rows, contract_rows, screening_rows = [], [], []
-    result = (session_row, expiration_rows, contract_rows, quality_rows, screening_rows)
-    if not stock_available:
-        return result
-
-    try:
-        chain = get_quoted_contracts(symbol, trade_day)
-    except Exception as exc:
-        session_row.update(collection_status="request_error", unavailable_reason="contract_discovery_failed",
-                           request_error_count=request_errors + 1)
-        quality_rows.append({"symbol": symbol, "trade_day": trade_day, "dataset": "quoted_contracts",
-                             "request_error": repr(exc), "data_status": "request_error"})
-        return result
-    session_row["quoted_contract_count_on_date"] = len(chain)
-    if chain.empty:
-        session_row["unavailable_reason"] = "no_quoted_contracts_on_date"
-        return result
-    all_expirations = tuple(sorted(chain["expiration"].unique()))
-    all_expirations = tuple(pd.Timestamp(value) for value in all_expirations)
-    in_window = [exp for exp in all_expirations if CFG.min_dte <= (exp - trade_day).days <= CFG.max_dte]
-    expirations = eligible_expirations(trade_day, all_expirations)
-    reference_mids = stock_selection_reference_mids(stock_quotes, trade_day)
-    if not reference_mids or not expirations:
-        session_row["unavailable_reason"] = "no_reference_quotes" if not reference_mids else "no_eligible_expirations"
-        return result
-
-    carry_context = carry_snapshot(symbol, trade_day)
-    session_row.update(carry_context)
-    evaluation_contexts = {}
-    for label, entry_ts, exit_ts in evaluation_schedule(trade_day):
-        configured_exit = entry_ts + pd.Timedelta(minutes=CFG.horizon_minutes)
-        context = {
-            "entry_ts": entry_ts, "exit_ts": exit_ts,
-            "metadata": {
-                f"eval_{label}_entry_timestamp": entry_ts,
-                f"eval_{label}_configured_exit_timestamp": configured_exit,
-                f"eval_{label}_actual_exit_timestamp": exit_ts,
-                f"eval_{label}_configured_horizon_minutes": CFG.horizon_minutes,
-                f"eval_{label}_actual_horizon_minutes": (exit_ts - entry_ts).total_seconds() / 60,
-                f"eval_{label}_exit_clipped_to_session_close": exit_ts < configured_exit,
-            },
-            **evaluation_observations(stock_quotes, stock_trades, entry_ts, exit_ts,
-                                      f"stock_eval_{label}", "stock", CFG.max_stock_quote_age_seconds),
-        }
-        evaluation_contexts[label] = context
-        for values in context.values():
-            if isinstance(values, dict):
-                session_row.update(values)
-    stock_timestamp_ns = pd.DatetimeIndex(stock_quotes["timestamp"].dropna()).as_unit("ns").asi8
-    stock_context = {"evaluation_contexts": evaluation_contexts,
-                     "stock_quote_timestamps_ns": stock_timestamp_ns,
-                     "carry_context": carry_context, "corporate_actions": get_corporate_actions(symbol)}
-    clean_counts = dict.fromkeys(evaluation_contexts, 0)
-    broad_counts = dict.fromkeys(evaluation_contexts, 0)
-    expected = collected = failures = eligible_count = 0
-    with ThreadPoolExecutor(max_workers=CFG.max_contract_workers) as executor:
-        futures = {}
-        for expiration in in_window:
-            family = chain.loc[chain["expiration"].eq(expiration)]
-            strikes = tuple(sorted(family["strike"].unique()))
-            selection_by_time = {label: selected_strikes(strikes, {label: mid}) for label, mid in reference_mids.items()}
-            chosen = sorted(set().union(*map(set, selection_by_time.values()))) if expiration in expirations else []
-            selected = family.loc[family["strike"].isin(chosen)]
-            common = {
-                "total_strike_count_for_expiration": len(strikes),
-                "total_quoted_contract_count_for_expiration": len(family),
-                "sampled_strike_count_for_expiration": len(chosen),
-                "sampled_contract_count_for_expiration": len(selected),
-            }
-            identity = {"symbol": symbol, "trade_day": trade_day, "expiration": expiration,
-                        "dte_days": (expiration - trade_day).days}
-            rank = {float(value): i + 1 for i, value in enumerate(strikes)}
-            def strike_context(value):
-                return {"strike_rank_in_expiration": rank[float(value)],
-                        "strike_percentile_in_expiration": (rank[float(value)] - 1) / max(len(strikes) - 1, 1)}
-            if expiration not in expirations:
-                screening_rows.append({**identity, **common, "strike": np.nan, "right": "", "contract_id": "",
-                                       "selection_status": "unsampled_expiration",
-                                       "unsampled_reason": "not_targeted_expiration_bucket"})
-                continue
-            eligible_count += len(family)
-            expiration_rows.append({**identity, "strike_count": len(strikes), "selected_strike_count": len(chosen),
-                                    "quoted_contract_count": len(family), "observed_contract_target_count": len(selected),
-                                    "sampled_contract_fraction_of_quoted": len(selected) / max(len(family), 1),
-                                    "rights_collected": ",".join(sorted(selected["right"].str.upper().unique())),
-                                    "excluded_expiration_count_outside_window": len(all_expirations) - len(in_window)})
-            for strike in strikes:
-                if strike not in chosen:
-                    screening_rows.append({**identity, **common, **strike_context(strike), "strike": strike,
-                                           "right": "", "contract_id": "", "selection_status": "unsampled_strike",
-                                           "unsampled_reason": "not_targeted_moneyness_grid"})
-            for contract in selected.itertuples(index=False):
-                context = {**common, **strike_context(contract.strike),
-                           "sampled_contract_fraction_for_expiration": len(selected) / max(len(family), 1),
-                           "selected_evaluation_labels": [label for label, values in selection_by_time.items() if contract.strike in values],
-                           "primary_reference_mid": next(iter(reference_mids.values()))}
-                future = executor.submit(collect_contract_day, symbol_cfg, trade_day, expiration,
-                                         contract.strike, contract.right, prev_trade, stock_timestamp_ns,
-                                         stock_day, stock_context, context)
-                futures[future] = (expiration, contract.strike, contract.right)
-                expected += 1
-        for future in as_completed(futures):
-            expiration, strike, right = futures[future]
-            try:
-                row, diagnostics = future.result()
-            except Exception as exc:
-                failures += 1
-                diagnostics = [{"symbol": symbol, "trade_day": trade_day, "expiration": expiration,
-                                "strike": strike, "right": right.upper(), "dataset": "contract_collection",
-                                "data_status": "request_error", "request_error": repr(exc)}]
-            else:
-                collected += 1
-                request_errors += row["request_error_count"]
-                for label in evaluation_contexts:
-                    clean_counts[label] += int(row.get(f"clean_sample_included_{label}", False))
-                    broad_counts[label] += int(row.get(f"broad_sample_included_{label}", False))
-                if chunk_writer:
-                    chunk_writer.append_contract_row(row)
-                else:
-                    contract_rows.append(row)
-            if chunk_writer:
-                chunk_writer.extend_quality_rows(diagnostics)
-            else:
-                quality_rows.extend(diagnostics)
-    contract_rows.sort(key=lambda r: (r["expiration"], r["strike"], r["right"]))
-    session_row.update(
-        collection_status="request_error" if request_errors or failures else "complete", unavailable_reason="",
-        request_error_count=request_errors, expected_contract_count=expected, collected_contract_count=collected,
-        contract_task_failure_count=failures, contract_task_failure_rate=failures / max(expected, 1),
-        eligible_expiration_count=len(expirations), in_window_expiration_count=len(in_window),
-        excluded_expiration_count_outside_window=len(all_expirations) - len(in_window),
-        skipped_in_window_expiration_count=len(in_window) - len(expirations),
-        stock_selection_reference_times="|".join(reference_mids), stock_selection_reference_mid_count=len(reference_mids),
-        unsampled_chain_context_count=len(screening_rows), total_quoted_contract_count_eligible=eligible_count,
-        sampled_contract_target_count=expected, sampled_contract_fraction_eligible=expected / max(eligible_count, 1),
-    )
-    for label in evaluation_contexts:
-        session_row[f"clean_contract_count_{label}"] = clean_counts[label]
-        session_row[f"broad_contract_count_{label}"] = broad_counts[label]
-    return result
-
-
-def download_market_history(ticker: str, cache_name: str, value_name: str) -> pd.DataFrame:
-    # All daily sources need warm-up and a prior close for the first collection day.
-    start = (pd.Timestamp(CFG.start_date) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
-    end = (pd.Timestamp(CFG.end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    cache_path = CFG.market_data_dir / f"{Path(cache_name).stem}__{start}__{end}_v2.csv"
-    with path_lock(cache_path), file_lock(cache_path):
-        if cache_path.exists():
-            return pd.read_csv(cache_path, parse_dates=["date"])
-        history = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False,
-                              threads=False, multi_level_index=False)
-        if history is None or history.empty:
-            # Retry an empty Yahoo response on a later run; do not persist it as data.
-            return pd.DataFrame(columns=["date", value_name, "source", "retrieved_utc"])
-        close = history["Close"]
-        if isinstance(close, pd.DataFrame):
-            if close.shape[1] != 1:
-                raise ValueError(f"Expected one Yahoo close series for {ticker}")
-            close = close.iloc[:, 0]
-        frame = pd.DataFrame({"date": pd.DatetimeIndex(close.index).tz_localize(None),
-                              value_name: pd.to_numeric(close, errors="coerce").to_numpy()})
-        frame = frame.dropna(subset=["date", value_name]).sort_values("date").drop_duplicates("date", keep="last")
-        frame["source"] = f"yfinance_{ticker}_close"
-        frame["retrieved_utc"] = pd.Timestamp.now("UTC").isoformat()
-        if not frame.empty:
-            atomic_write_bytes(cache_path, frame.to_csv(index=False).encode("utf-8"))
-        return frame
-
-
-@lru_cache(maxsize=1)
-def get_risk_free_rate_history() -> pd.DataFrame:
-    series = []
-    for ticker, tenor in (("^IRX", "13w"), ("^FVX", "5y"), ("^TNX", "10y")):
-        column = f"risk_free_rate_{tenor}"
-        frame = download_market_history(ticker, f"risk_free_{tenor}_history.csv", column)
-        # Yahoo yield-index values are percentage points, even below 1 percent.
-        # These remain yield proxies, not continuously compounded zero rates.
-        series.append(pd.to_numeric(frame.set_index("date")[column], errors="coerce") / 100.0)
-    merged = pd.concat(series, axis=1).reset_index()
-    merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
-    merged["risk_free_rate_short_term_proxy"] = merged["risk_free_rate_13w"]
-    merged["rate_source"] = "yfinance_curve_proxies_^IRX_^FVX_^TNX"
-    merged["rate_unit"] = "decimal_annual_yield_proxy"
-    return merged.sort_values("date").reset_index(drop=True)
-
-
-@lru_cache(maxsize=1)
-def get_vix_history() -> pd.DataFrame:
-    frame = download_market_history("^VIX", "vix_history.csv", "vix_close")
+def stock_selection_references(frame: pd.DataFrame, day: pd.Timestamp, cfg: CollectorConfig) -> list[dict]:
     if frame.empty:
-        return pd.DataFrame(columns=["date", "vix_close", "vix_regime"])
-    frame["vix_regime"] = np.where(
-        frame["vix_close"] >= 25.0,
-        "high_vol",
-        np.where(frame["vix_close"] <= 15.0, "low_vol", "medium_vol"),
-    )
-    return frame[["date", "vix_close", "vix_regime"]]
+        return []
+    # Only the stock spot used to choose strikes needs a usable quote. Raw storage
+    # never uses this condition policy, and option observations are never filtered.
+    quotes = frame.copy()
+    quotes["_clock"] = parse_vendor_clock(quotes["timestamp"], cfg.exchange_tz)
+    allowed = pd.Series(True, index=quotes.index)
+    for column in ("bid_condition", "ask_condition"):
+        text = quotes[column].astype("string").str.strip()
+        allowed &= text.eq("") | pd.to_numeric(text, errors="coerce").isin([0, 1, 50])
+    quotes = quotes.loc[allowed & quotes["_clock"].notna()].sort_values("_clock", kind="stable")
+    opened, closed = session_bounds(day, cfg)
+    references = []
+    for selection_time in cfg.selection_times:
+        at = pd.Timestamp(f"{day.date()} {selection_time}", tz=cfg.exchange_tz)
+        if not opened <= at < closed:
+            continue
+        prior = quotes.loc[quotes["_clock"].between(opened, at)]
+        if prior.empty:
+            continue
+        row = prior.iloc[-1]
+        bid, ask = (pd.to_numeric(row[side], errors="coerce") for side in ("bid", "ask"))
+        age = (at - row["_clock"]).total_seconds()
+        if not (np.isfinite(bid) and np.isfinite(ask) and 0 < bid <= ask
+                and age <= cfg.max_stock_quote_age_seconds):
+            continue
+        references.append({"selection_time": selection_time, "stock_mid": float((bid + ask) / 2),
+                           "quote_timestamp": str(row["timestamp"]), "quote_timestamp_utc": row["_clock"].isoformat(),
+                           "sample_age_seconds": age})
+    return references
 
 
-@lru_cache(maxsize=None)
-def get_underlying_price_history(symbol: str) -> pd.DataFrame:
-    frame = download_market_history(symbol, f"{symbol}_daily_history.csv", "close")
-    return frame.assign(symbol=symbol)
-
-
-@lru_cache(maxsize=None)
-def build_dividend_yield_proxy(symbol: str) -> pd.DataFrame:
-    prices = get_underlying_price_history(symbol)
-    actions = get_corporate_actions(symbol)
-    if prices.empty:
-        return pd.DataFrame(columns=["date", "symbol", "dividend_yield_proxy"])
-    frame = prices[["date", "symbol", "close"]].copy().sort_values("date").reset_index(drop=True)
-    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    dividends = actions[["date", "dividends"]].copy() if not actions.empty and "dividends" in actions.columns else pd.DataFrame(columns=["date", "dividends"])
-    dividends["date"] = pd.to_datetime(dividends["date"], errors="coerce")
-    dividends["dividends"] = pd.to_numeric(dividends.get("dividends", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-    if dividends.empty or dividends["date"].dropna().empty:
-        frame["trailing_365d_dividends"] = 0.0
-    else:
-        daily = (
-            dividends.dropna(subset=["date"])
-            .groupby("date", as_index=True)["dividends"]
-            .sum()
-            .sort_index()
-        )
-        calendar = pd.date_range(min(frame["date"].min(), daily.index.min()), frame["date"].max(), freq="D")
-        trailing = daily.reindex(calendar, fill_value=0.0).rolling("365D").sum().rename("trailing_365d_dividends")
-        frame = pd.merge_asof(
-            frame.sort_values("date"),
-            trailing.reset_index().rename(columns={"index": "date"}).sort_values("date"),
-            on="date",
-            direction="backward",
-        )
-        frame["trailing_365d_dividends"] = frame["trailing_365d_dividends"].fillna(0.0)
-    frame["dividend_yield_proxy"] = frame["trailing_365d_dividends"] / frame["close"].replace(0, np.nan)
-    return frame[["date", "symbol", "dividend_yield_proxy"]]
-
-
-@lru_cache(maxsize=None)
-def build_regime_labels(symbol: str) -> pd.DataFrame:
-    prices = get_underlying_price_history(symbol)
-    vix = get_vix_history()
-    if prices.empty:
-        return pd.DataFrame(columns=["date", "symbol", "symbol_daily_return_1d", "symbol_realized_vol_20d", "symbol_realized_vol_60d", "vix_close", "vix_regime", "market_regime"])
-    frame = prices[["date", "symbol", "close"]].copy().sort_values("date").reset_index(drop=True)
-    close_to_close_return = frame["close"].pct_change(fill_method=None)
-    realized_vol_20d = close_to_close_return.rolling(20).std() * np.sqrt(252.0)
-    realized_vol_60d = close_to_close_return.rolling(60).std() * np.sqrt(252.0)
-    # date is the SOURCE close date. daily_asof_snapshot applies the lag once.
-    frame["symbol_daily_return_1d"] = close_to_close_return
-    frame["symbol_realized_vol_20d"] = realized_vol_20d
-    frame["symbol_realized_vol_60d"] = realized_vol_60d
-    frame = frame.merge(vix, on="date", how="left")
-    low_cut = frame["symbol_realized_vol_20d"].expanding(min_periods=20).quantile(0.33).shift(1)
-    high_cut = frame["symbol_realized_vol_20d"].expanding(min_periods=20).quantile(0.67).shift(1)
-    frame["market_regime"] = np.where(low_cut.notna() & high_cut.notna(), "medium_realized_vol", "unknown")
-    frame.loc[frame["symbol_realized_vol_20d"].notna() & high_cut.notna() & frame["symbol_realized_vol_20d"].ge(high_cut), "market_regime"] = "high_realized_vol"
-    frame.loc[frame["symbol_realized_vol_20d"].notna() & low_cut.notna() & frame["symbol_realized_vol_20d"].le(low_cut), "market_regime"] = "low_realized_vol"
-    frame.loc[pd.to_numeric(frame.get("vix_close", pd.Series(dtype=float)), errors="coerce").fillna(0.0).ge(25.0), "market_regime"] = "stress"
-    return frame[["date", "symbol", "symbol_daily_return_1d", "symbol_realized_vol_20d", "symbol_realized_vol_60d", "vix_close", "vix_regime", "market_regime"]]
-
-
-def merge_no_overwrite(*items: dict[str, object]) -> dict[str, object]:
-    merged: dict[str, object] = {}
-    for item in items:
-        duplicates = sorted(set(merged).intersection(item))
-        if duplicates:
-            raise KeyError(f"Duplicate carry snapshot keys: {duplicates}")
-        merged.update(item)
-    return merged
-
-
-def daily_asof_snapshot(
-    frame: pd.DataFrame,
-    trade_day: pd.Timestamp,
-    defaults: dict[str, object],
-    *,
-    provenance_prefix: str | None = None,
-    stale_after_days: int = 7,
-) -> dict[str, object]:
-    """Use only prior-date closes, retaining the actual source date for audit."""
-    output = defaults.copy()
-    trade_date = pd.Timestamp(trade_day)
-    if trade_date.tz is not None:
-        trade_date = trade_date.tz_convert(CFG.exchange_tz).tz_localize(None)
-    trade_date = trade_date.normalize()
-    asof_date, days_stale = pd.NaT, np.nan
-    if not frame.empty and "date" in frame.columns:
-        dates = pd.to_datetime(frame["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
-        eligible = frame.loc[dates.lt(trade_date)].copy()
-        eligible["date"] = dates.loc[eligible.index]
-        if not eligible.empty:
-            row = eligible.sort_values("date").iloc[-1]
-            output.update({key: row[key] for key in defaults if key in row.index})
-            asof_date = row["date"]
-            days_stale = int((trade_date - asof_date).days)
-    if provenance_prefix:
-        output.update({f"{provenance_prefix}_asof_date": asof_date,
-                       f"{provenance_prefix}_days_stale": days_stale,
-                       f"{provenance_prefix}_is_stale": bool(pd.isna(days_stale) or days_stale > stale_after_days)})
-    return output
-
-
-def regime_snapshot(symbol: str, trade_day: pd.Timestamp) -> dict:
-    snapshot = daily_asof_snapshot(build_regime_labels(symbol), trade_day, {
-        "symbol_daily_return_1d": np.nan, "symbol_realized_vol_20d": np.nan,
-        "symbol_realized_vol_60d": np.nan, "market_regime": "unknown",
-    }, provenance_prefix="regime")
-    snapshot.update(daily_asof_snapshot(get_vix_history(), trade_day,
-                    {"vix_close": np.nan, "vix_regime": ""}, provenance_prefix="vix"))
-    for suffix in ("asof_date", "days_stale", "is_stale"):
-        snapshot[f"symbol_realized_vol_{suffix}"] = snapshot[f"regime_{suffix}"]
-    if snapshot["vix_close"] >= 25.0:
-        snapshot["market_regime"] = "stress"
-    return snapshot
-
-
-def carry_snapshot(symbol: str, trade_day: pd.Timestamp) -> dict[str, object]:
-    risk_free = daily_asof_snapshot(
-        get_risk_free_rate_history(),
-        trade_day,
-        {
-            "risk_free_rate_13w": np.nan,
-            "risk_free_rate_5y": np.nan,
-            "risk_free_rate_10y": np.nan,
-            "risk_free_rate_short_term_proxy": np.nan,
-            "rate_source": "",
-            "rate_unit": "decimal_annual_yield_proxy",
-        },
-        provenance_prefix="risk_free_rate",
-    )
-    dividend = daily_asof_snapshot(
-        build_dividend_yield_proxy(symbol),
-        trade_day,
-        {"dividend_yield_proxy": np.nan},
-        provenance_prefix="dividend_yield",
-    )
-    return merge_no_overwrite(risk_free, dividend, regime_snapshot(symbol, trade_day))
-
-
-def collect_carry_inputs(symbols: list[SymbolConfig]) -> pd.DataFrame:
-    risk_free = get_risk_free_rate_history()
-    frames = []
-    for cfg in symbols:
-        dividend_yield = build_dividend_yield_proxy(cfg.symbol)
-        regime = build_regime_labels(cfg.symbol)
-        merged = dividend_yield.merge(risk_free, on="date", how="left").merge(regime, on=["date", "symbol"], how="left")
-        # Export date means source close date; never merge this onto intraday D directly.
-        merged["daily_input_date_semantics"] = "source_close_date; usable_from_next_session"
-        merged["asset_type"] = cfg.asset_type
-        merged["universe_bucket"] = cfg.universe_bucket
-        merged["sector_proxy"] = cfg.sector_proxy
-        merged["borrow_rate_proxy"] = np.nan
-        merged["borrow_rate_source"] = "unavailable"
-        merged["borrow_constraint_risk_flag"] = bool(cfg.sector_proxy == "crypto_exposed" or "small_cap" in cfg.universe_bucket)
-        frames.append(merged)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-@lru_cache(maxsize=None)
-def get_corporate_actions(symbol: str) -> pd.DataFrame:
-    ensure_dir(REFERENCE_DATA_DIR)
-    cache_path = REFERENCE_DATA_DIR / f"{symbol}_corporate_actions.csv"
-    with path_lock(cache_path):
-        with file_lock(cache_path):
-            if cache_path.exists():
-                df = pd.read_csv(cache_path)
-                if "date" in df.columns:
-                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-                return df
-            ticker = yf.Ticker(symbol)
-            actions = ticker.actions
-            if actions is None or actions.empty:
-                df = pd.DataFrame(columns=["date", "dividends", "stock_splits", "symbol", "source"])
-            else:
-                df = actions.reset_index().rename(columns={"Date": "date", "Dividends": "dividends", "Stock Splits": "stock_splits"})
-                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
-                df["symbol"] = symbol
-                df["source"] = "yfinance"
-            atomic_write_bytes(cache_path, df.to_csv(index=False).encode("utf-8"))
-            return df
-
-
-def collect_reference_actions(symbols: list[SymbolConfig]) -> pd.DataFrame:
-    frames = []
-    for cfg in symbols:
-        df = get_corporate_actions(cfg.symbol).copy()
-        if df.empty:
-            df = pd.DataFrame([{"date": pd.NaT, "dividends": np.nan, "stock_splits": np.nan, "symbol": cfg.symbol, "source": "yfinance"}])
-        df["asset_type"] = cfg.asset_type
-        df["universe_bucket"] = cfg.universe_bucket
-        df["sector_proxy"] = cfg.sector_proxy
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-def build_validation_targets() -> pd.DataFrame:
-    sessions = candidate_anchor_dates()
-    if len(sessions) == 0:
-        return pd.DataFrame()
-    samples = {
-        pd.Timestamp(sessions[0]),
-        pd.Timestamp(sessions[min(len(sessions) - 1, 1)]),
-        pd.Timestamp(sessions[len(sessions) // 2]),
-        pd.Timestamp(sessions[-1]),
-    }
-    early_closes = []
-    for sess in sessions:
-        meta = session_metadata(pd.Timestamp(sess))
-        if meta["is_early_close"]:
-            early_closes.append(pd.Timestamp(sess))
-        if len(early_closes) >= 3:
+def eligible_expirations(day: pd.Timestamp, expirations, cfg: CollectorConfig) -> list[pd.Timestamp]:
+    remaining = sorted(exp for exp in expirations if cfg.min_dte <= (exp - day).days <= cfg.max_dte)
+    selected = []
+    for target in cfg.target_dtes:
+        if not remaining or len(selected) >= cfg.max_expirations_per_day:
             break
-    samples.update(early_closes)
+        best = min(remaining, key=lambda exp: (abs((exp - day).days - target), (exp - day).days))
+        selected.append(best)
+        remaining.remove(best)
+    remaining.sort(key=lambda exp: (min(abs((exp - day).days - target) for target in cfg.target_dtes), exp))
+    return sorted(selected + remaining[:max(cfg.max_expirations_per_day - len(selected), 0)])
+
+
+def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[dict],
+                     cfg: CollectorConfig) -> pd.DataFrame:
     rows = []
-    for sess in sorted(samples):
-        meta = session_metadata(sess)
-        rows.append(
-            {
-                "session": sess,
-                **meta,
-                "validation_purpose": "calendar_edge_check" if meta["is_early_close"] else "general_session_check",
-            }
-        )
-    return pd.DataFrame(rows)
+    for expiration in eligible_expirations(day, chain["expiration"].unique(), cfg):
+        family = chain.loc[chain["expiration"].eq(expiration)]
+        strikes = sorted(family["strike"].unique())
+        chosen_by_time = {}
+        for reference in references:
+            chosen = set()
+            for target in cfg.moneyness_targets:
+                target_strike = reference["stock_mid"] / target
+                ranked = sorted(strikes, key=lambda strike: (abs(strike - target_strike), strike))
+                chosen.update(ranked[:cfg.strikes_per_moneyness_target])
+            chosen_by_time[reference["selection_time"]] = chosen
+        selected = set().union(*chosen_by_time.values()) if chosen_by_time else set()
+        for contract in family.loc[family["strike"].isin(selected)].itertuples(index=False):
+            expiry, strike = expiration.strftime("%Y-%m-%d"), format_strike(contract.strike)
+            rows.append({"symbol": contract.symbol, "expiration": expiry, "strike": strike,
+                         "right": contract.right, "contract_key": f"{contract.symbol}|{expiry}|{strike}|{contract.right}",
+                         "dte_days": (expiration - day).days,
+                         "selection_times": "|".join(at for at, values in chosen_by_time.items() if contract.strike in values)})
+    return pd.DataFrame(rows, columns=SELECTION_COLUMNS)
 
 
-@lru_cache(maxsize=1)
-def output_paths() -> dict[str, Path]:
-    return {
-        "sessions": CANONICAL_DATA_DIR / "requested_sessions.csv",
-        "availability": DIAGNOSTIC_DATA_DIR / "symbol_day_availability.csv",
-        "expirations": CANONICAL_DATA_DIR / "chain_expirations.csv",
-        "contracts": CANONICAL_DATA_DIR / "contract_universe.csv",
-        "carry_inputs": MARKET_DATA_DIR / "carry_inputs.csv",
-        "observed_instrument_index": CANONICAL_DATA_DIR / "observed_instrument_index.csv",
-        "family_coverage": DIAGNOSTIC_DATA_DIR / "contract_family_coverage.csv",
-        "quality": DIAGNOSTIC_DATA_DIR / "raw_pull_quality.csv",
-        "screening": DIAGNOSTIC_DATA_DIR / "screening_decisions.csv",
-        "summary": DIAGNOSTIC_DATA_DIR / "collection_summary.csv",
-        "dataset_quality": DIAGNOSTIC_DATA_DIR / "dataset_quality_summary.csv",
-        "schema": DIAGNOSTIC_DATA_DIR / "schema_signatures.csv",
-        "symbol_quality": DIAGNOSTIC_DATA_DIR / "symbol_quality_summary.csv",
-        "timestamp_validation": DIAGNOSTIC_DATA_DIR / "timestamp_validation_summary.csv",
-        "validation_targets": DIAGNOSTIC_DATA_DIR / "validation_targets.csv",
-        "reference_actions": REFERENCE_DATA_DIR / "corporate_actions_reference.csv",
-        "failures": DIAGNOSTIC_DATA_DIR / "failure_ledger.csv",
-        "progress": DIAGNOSTIC_DATA_DIR / "progress.json",
-    }
+# Session manifests describe collection coverage; they contain no research features.
+class Collector:
+    def __init__(self, cfg: CollectorConfig):
+        self.cfg = cfg
+        self.store = RequestStore(cfg)
+        self.directory = cfg.output_dir / "collection" / cfg.policy_id
 
+    def session_path(self, symbol: str, day: pd.Timestamp) -> Path:
+        return self.directory / "sessions" / f"symbol={symbol}__date={day.date()}.json"
 
-@lru_cache(maxsize=1)
-def chunk_paths() -> dict[str, Path]:
-    return {
-        "sessions": CANONICAL_PARTS_DIR,
-        "expirations": CANONICAL_PARTS_DIR,
-        "contracts": CANONICAL_PARTS_DIR,
-        "quality": DIAGNOSTIC_PARTS_DIR,
-        "screening": DIAGNOSTIC_PARTS_DIR,
-    }
-
-
-def completed_session_keys() -> set[tuple[str, str]]:
-    dataset_dir = CANONICAL_PARTS_DIR / "sessions"
-    if not dataset_dir.exists():
-        return set()
-    completed: set[tuple[str, str]] = set()
-    for path in dataset_dir.glob("*.parquet"):
+    def manifest_valid(self, manifest: dict) -> bool:
         try:
-            frame = pd.read_parquet(path)
-            row = frame.iloc[0].to_dict() if not frame.empty else {}
-            # Do not let old-schema chunks satisfy resume checks after a schema
-            # bump; stale chunks should be archived or collected into a new run.
-            if (row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION
-                    or row.get("config_digest") != _CONFIG_DIGEST
-                    or row.get("collection_status") not in {"complete", "unavailable"}):
-                continue
-            symbol = str(row.get("symbol", ""))
-            trade_day = pd.to_datetime(row.get("trade_day"), errors="coerce")
-            if not symbol or pd.isna(trade_day):
-                match = SESSION_KEY_PATTERN.match(path.stem)
-                if not match:
-                    continue
-                symbol = match.group("symbol")
-                trade_day = pd.Timestamp(match.group("date"))
-            expected_contracts = int(row.get("expected_contract_count", 0))
-            collected_contracts = int(row.get("collected_contract_count", 0))
-            screened_out_contracts = int(row.get("screened_out_contract_count", 0))
-            contract_failures = int(row.get("contract_task_failure_count", 0))
-            reconciles = collected_contracts + screened_out_contracts + contract_failures == expected_contracts
-            failure_rate = contract_failures / max(expected_contracts, 1)
-            if reconciles and failure_rate <= CFG.soft_failure_rate_threshold:
-                completed.add((symbol, pd.Timestamp(trade_day).strftime("%Y-%m-%d")))
-        except Exception:
-            continue
-    return completed
+            if (manifest["output_schema_version"] != OUTPUT_SCHEMA_VERSION
+                    or manifest["policy_id"] != self.cfg.policy_id
+                    or manifest["status"] not in {"complete", "unavailable"}):
+                return False
+            records = manifest["requests"]
+            selected_count = manifest["selected_contract_count"]
+            if (len(records) != 4 + 3 * selected_count
+                    or len({r["request_id"] for r in records}) != len(records)
+                    or manifest["contracts"]["rows"] != selected_count):
+                return False
+            if not artifact_valid(manifest["contracts"], self.cfg.output_dir):
+                return False
+            for record in records:
+                if record["status"] not in GOOD_REQUEST_STATUSES:
+                    return False
+                if self.cfg.refresh_no_data and record["status"] == "no_data":
+                    return False
+                if self.cfg.store_raw_payloads and not record.get("payload"):
+                    return False
+                for name in ("data", "metadata", "payload"):
+                    if name != "payload" or record.get(name):
+                        if not artifact_valid(record[name], self.cfg.output_dir):
+                            return False
+            return True
+        except (KeyError, TypeError, ValueError):
+            return False
 
+    def resumable(self, symbol: str, day: pd.Timestamp) -> bool:
+        try:
+            manifest = read_json(self.session_path(symbol, day))
+            return (manifest.get("symbol") == symbol and manifest.get("trade_day") == str(day.date())
+                    and self.manifest_valid(manifest))
+        except (OSError, ValueError):
+            return False
 
-def write_session_chunks(
-    symbol: str,
-    trade_day: pd.Timestamp,
-    session_rows: list[dict],
-    expiration_rows: list[dict],
-    contract_rows: list[dict],
-    quality_rows: list[dict],
-    screening_rows: list[dict] | None = None,
-) -> None:
-    paths = chunk_paths()
-    rows_by_dataset = {"sessions": session_rows, "expirations": expiration_rows, "contracts": contract_rows,
-                       "quality": quality_rows, "screening": screening_rows}
-    for dataset, rows in rows_by_dataset.items():
-        if rows:
-            write_parquet_chunk(paths[dataset], dataset, symbol, trade_day, rows)
+    def collect_day(self, symbol_cfg: SymbolConfig, day: pd.Timestamp) -> dict:
+        symbol = symbol_cfg.symbol
+        records, references = [], []
+        selected = pd.DataFrame(columns=SELECTION_COLUMNS)
+        reason, error, discovered = "", "", 0
+        try:
+            stock = self.store.collect(history_request(self.cfg, "stock", "quote", symbol, day))
+            records.append(stock)
+            # Discovery is independent of stock availability. Keep the dated
+            # universe even when stock quotes cannot support strike selection.
+            chain_record = self.store.collect(Request("quoted_contracts", "/option/list/contracts/quote",
+                                              {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}))
+            records.append(chain_record)
+            for kind in ("trade_quote", "eod"):
+                records.append(self.store.collect(history_request(self.cfg, "stock", kind, symbol, day)))
+            chain = normalize_chain(self.store.read(chain_record), symbol, self.cfg)
+            discovered = len(chain)
+            references = stock_selection_references(self.store.read(stock), day, self.cfg)
+            selected = select_contracts(chain, day, references, self.cfg)
+            if chain.empty:
+                reason = "no_quoted_contracts"
+            elif not references:
+                reason = "stock_selection_reference_unavailable"
+            elif selected.empty:
+                reason = "no_contracts_in_sampling_window"
+            with ThreadPoolExecutor(max_workers=self.cfg.max_contract_workers) as pool:
+                futures = []
+                for contract in selected.to_dict("records"):
+                    for kind in ("quote", "trade_quote", "open_interest"):
+                        request = history_request(self.cfg, "option", kind, symbol, day, contract)
+                        futures.append(pool.submit(self.store.collect, request))
+                for future in as_completed(futures):
+                    records.append(future.result())
+        except Exception as exc:
+            # Completed raw pulls survive; a failed day never satisfies resume.
+            error = repr(exc)
+        failures = sum(record["status"] not in GOOD_REQUEST_STATUSES for record in records)
+        status = "request_error" if error or failures else ("unavailable" if selected.empty else "complete")
+        contract_path = self.directory / "contracts" / f"symbol={symbol}__date={day.date()}.parquet"
+        write_parquet(contract_path, selected)
+        opened, closed = session_bounds(day, self.cfg)
+        scheduled = [at for at in self.cfg.selection_times
+                     if opened <= pd.Timestamp(f"{day.date()} {at}", tz=self.cfg.exchange_tz) < closed]
+        manifest = {**asdict(symbol_cfg), "trade_day": str(day.date()), "status": status,
+                    "reason": reason, "error": error, "output_schema_version": OUTPUT_SCHEMA_VERSION,
+                    "policy_id": self.cfg.policy_id, "updated_at_utc": utc_now(),
+                    "session_open": opened.isoformat(), "session_close": closed.isoformat(),
+                    "quoted_contract_count": discovered, "selected_contract_count": len(selected),
+                    "stock_selection_references": references,
+                    "missing_selection_times": [at for at in scheduled
+                                                if at not in {r["selection_time"] for r in references}],
+                    "requests": sorted(records, key=lambda r: (r["dataset"], r["request_id"])),
+                    "contracts": file_receipt(contract_path, self.cfg.output_dir, selected),
+                    "request_error_count": failures, "expected_request_count": 4 + 3 * len(selected)}
+        # Publish last. The manifest references exact artifacts, not a filename glob.
+        write_json(self.session_path(symbol, day), manifest)
+        return manifest
 
-
-def iter_parquet_chunk_paths(base_dir: Path, dataset: str):
-    for session_path in sorted((CANONICAL_PARTS_DIR / "sessions").glob("*.parquet")):
-        session = pd.read_parquet(session_path)
-        if session.empty:
-            continue
-        row = session.iloc[0]
-        if row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION or row.get("config_digest") != _CONFIG_DIGEST:
-            continue
-        if dataset == "sessions":
-            yield session_path
-        elif dataset in {"contracts", "quality"}:
-            count = int(row.get("contract_part_count" if dataset == "contracts" else "quality_part_count", 0))
-            for part in range(1, count + 1):
-                path = base_dir / dataset / f"{session_path.stem}__part={part:05d}.parquet"
-                yield path
-        elif int(row.get("expiration_row_count" if dataset == "expirations" else "screening_row_count", 0)):
-            path = base_dir / dataset / session_path.name
-            yield path
-
-
-def iter_parquet_chunk_frames(base_dir: Path, dataset: str):
-    for path in iter_parquet_chunk_paths(base_dir, dataset):
-        yield path, pd.read_parquet(path)
-
-
-def append_csv_frame(path: Path, frame: pd.DataFrame, state: dict[str, bool], key: str,
-                     columns: list[str] | None = None) -> None:
-    if frame.empty:
-        return
-    ensure_dir(path.parent)
-    header = not state.get(key, False)
-    frame.reindex(columns=columns if columns is not None else frame.columns).to_csv(
-        path, mode="w" if header else "a", header=header, index=False)
-    state[key] = True
-
-
-def update_progress_manifest(completed_keys: set[tuple[str, str]]) -> None:
-    paths = output_paths()
-    write_json(
-        paths["progress"],
-        {
-            "completed_symbol_days": len(completed_keys),
-            "last_write_utc": pd.Timestamp.now("UTC").isoformat(),
-            "config_digest": run_context()["config_digest"],
-            "output_schema_version": OUTPUT_SCHEMA_VERSION,
-        },
-    )
-
-
-def assemble_outputs() -> dict:
-    paths = output_paths()
-    ensure_dir(REFERENCE_DATA_DIR)
-    ensure_dir(CANONICAL_DATA_DIR)
-    ensure_dir(DIAGNOSTIC_DATA_DIR)
-    csv_state: dict[str, bool] = {}
-    csv_columns = {}
-    if CFG.assemble_csv_outputs:
-        # Early closes and failed pulls have different columns. Read only parquet
-        # schemas up front so every appended row uses the same CSV column order.
-        for dataset in ("sessions", "expirations", "contracts", "quality"):
-            columns = dict.fromkeys(column for path in iter_parquet_chunk_paths(chunk_paths()[dataset], dataset)
-                                    for column in pq.read_schema(path).names)
-            csv_columns[dataset] = list(columns)
-            pd.DataFrame(columns=csv_columns[dataset]).to_csv(paths[dataset], index=False)
-            csv_state[dataset] = True
-    availability_columns = ["symbol", "trade_day", "collection_status", "unavailable_reason",
-                            "stock_quote_data_status", "stock_trade_data_status", "request_error_count",
-                            "expected_contract_count", "collected_contract_count", "stock_venue", "contract_universe"]
-    # Always write this compact report, even when the large CSV exports are disabled.
-    pd.DataFrame(columns=availability_columns).to_csv(paths["availability"], index=False)
-    csv_state["availability"] = True
-    stats = {
-        "unavailable_symbol_days": 0,
-        "failed_symbol_days": 0,
-        "requested_symbol_days": 0,
-        "expiration_rows": 0,
-        "contract_rows": 0,
-        "quality_rows": 0,
-        "screening_rows": 0,
-        "stock_available_days": 0,
-        "option_quote_rows_with_data": 0,
-        "option_trade_rows_with_data": 0,
-        "clean_sample_contract_rows": 0,
-        "broad_sample_contract_rows": 0,
-        "contracts_with_full_quote_observed_checks": 0,
-        "contracts_with_full_trade_observed_checks": 0,
-    }
-    symbols_seen: set[str] = set()
-    stock_rel_spreads: list[float] = []
-    observed_index: dict[tuple, dict] = {}
-    family_coverage: dict[tuple, dict] = {}
-    dataset_quality: dict[str, dict] = {}
-    schema_counts: dict[tuple[str, str], int] = {}
-    symbol_quality: dict[tuple[str, str], dict] = {}
-    timestamp_validation: dict[str, dict] = {}
-
-    for _, frame in iter_parquet_chunk_frames(CANONICAL_PARTS_DIR, "sessions"):
-        stats["requested_symbol_days"] += len(frame)
-        status = frame.get("collection_status", pd.Series(dtype=str))
-        stats["unavailable_symbol_days"] += int(status.eq("unavailable").sum())
-        stats["failed_symbol_days"] += int(status.eq("request_error").sum())
-        append_csv_frame(paths["availability"], frame.reindex(columns=availability_columns), csv_state, "availability")
-        if "symbol" in frame.columns:
-            symbols_seen.update(frame["symbol"].dropna().astype(str).tolist())
-        if "stock_data_available" in frame.columns:
-            stats["stock_available_days"] += int(pd.to_numeric(frame["stock_data_available"], errors="coerce").fillna(0).astype(bool).sum())
-        if "stock_median_rel_spread" in frame.columns:
-            stock_rel_spreads.extend(pd.to_numeric(frame["stock_median_rel_spread"], errors="coerce").dropna().tolist())
-        if CFG.assemble_csv_outputs:
-            append_csv_frame(paths["sessions"], frame, csv_state, "sessions", csv_columns["sessions"])
-
-    for _, frame in iter_parquet_chunk_frames(CANONICAL_PARTS_DIR, "expirations"):
-        stats["expiration_rows"] += len(frame)
-        if CFG.assemble_csv_outputs:
-            append_csv_frame(paths["expirations"], frame, csv_state, "expirations", csv_columns["expirations"])
-
-    for _, frame in iter_parquet_chunk_frames(CANONICAL_PARTS_DIR, "contracts"):
-        stats["contract_rows"] += len(frame)
-        quote_rows = pd.to_numeric(frame.get("quote_row_count", pd.Series(dtype=float)), errors="coerce").fillna(0)
-        trade_rows = pd.to_numeric(frame.get("trade_row_count", pd.Series(dtype=float)), errors="coerce").fillna(0)
-        full_quote = pd.to_numeric(frame.get("observed_quote_quality_pass_count", pd.Series(dtype=float)), errors="coerce").fillna(0)
-        full_trade = pd.to_numeric(frame.get("observed_trade_quality_pass_count", pd.Series(dtype=float)), errors="coerce").fillna(0)
-        clean_sample = boolean_flag_series(
-            frame,
-            ("clean_sample_included_any_evaluation", "clean_sample_included_first_eval", "clean_sample_included"),
-        )
-        broad_sample = boolean_flag_series(
-            frame,
-            ("broad_sample_included_any_evaluation", "broad_sample_included_first_eval", "broad_sample_included"),
-        )
-        stats["option_quote_rows_with_data"] += int((quote_rows > 0).sum())
-        stats["option_trade_rows_with_data"] += int((trade_rows > 0).sum())
-        stats["clean_sample_contract_rows"] += int(clean_sample.sum())
-        stats["broad_sample_contract_rows"] += int(broad_sample.sum())
-        stats["contracts_with_full_quote_observed_checks"] += int((full_quote == 6).sum())
-        stats["contracts_with_full_trade_observed_checks"] += int((full_trade == 5).sum())
-        if CFG.assemble_csv_outputs:
-            append_csv_frame(paths["contracts"], frame, csv_state, "contracts", csv_columns["contracts"])
-        for row in frame.to_dict("records"):
-            trade_day = pd.to_datetime(row.get("trade_day"), errors="coerce")
-            observed_key = (
-                row.get("contract_id"),
-                row.get("symbol"),
-                row.get("asset_type"),
-                row.get("universe_bucket"),
-                row.get("sector_proxy"),
-                row.get("expiration"),
-                row.get("right"),
-                row.get("strike"),
-            )
-            state = observed_index.setdefault(
-                observed_key,
-                {
-                    "contract_id": row.get("contract_id"),
-                    "symbol": row.get("symbol"),
-                    "asset_type": row.get("asset_type"),
-                    "universe_bucket": row.get("universe_bucket"),
-                    "sector_proxy": row.get("sector_proxy"),
-                    "expiration": row.get("expiration"),
-                    "right": row.get("right"),
-                    "strike": row.get("strike"),
-                    "first_seen_trade_day": trade_day,
-                    "last_seen_trade_day": trade_day,
-                    "observed_trade_days": set(),
-                },
-            )
-            if pd.notna(trade_day):
-                state["first_seen_trade_day"] = min(state["first_seen_trade_day"], trade_day) if pd.notna(state["first_seen_trade_day"]) else trade_day
-                state["last_seen_trade_day"] = max(state["last_seen_trade_day"], trade_day) if pd.notna(state["last_seen_trade_day"]) else trade_day
-                state["observed_trade_days"].add(trade_day.normalize())
-
-            trade_month = trade_day.to_period("M").strftime("%Y-%m") if pd.notna(trade_day) else ""
-            family_key = (row.get("symbol"), row.get("right"), row.get("dte_days"), trade_month)
-            family_state = family_coverage.setdefault(
-                family_key,
-                {
-                    "symbol": row.get("symbol"),
-                    "right": row.get("right"),
-                    "dte_days": row.get("dte_days"),
-                    "trade_month": trade_month,
-                    "contract_rows": 0,
-                    "quote_rows_with_data": 0,
-                    "trade_rows_with_data": 0,
-                    "median_option_spread_values": [],
-                    "median_trade_size_values": [],
-                },
-            )
-            family_state["contract_rows"] += 1
-            family_state["quote_rows_with_data"] += int(to_int(row.get("quote_row_count")) > 0)
-            family_state["trade_rows_with_data"] += int(to_int(row.get("trade_row_count")) > 0)
-            spread_value = to_float(row.get("median_option_spread"))
-            trade_size_value = to_float(row.get("total_trade_size"))
-            if pd.notna(spread_value):
-                family_state["median_option_spread_values"].append(float(spread_value))
-            if pd.notna(trade_size_value):
-                family_state["median_trade_size_values"].append(float(trade_size_value))
-            symbol = str(row.get("symbol", ""))
-            validation_state = timestamp_validation.setdefault(
-                symbol,
-                {
-                    "symbol": symbol,
-                    "stock_option_skew_values": [],
-                    "option_quote_trade_skew_values": [],
-                    "stock_option_abs_skew_values": [],
-                    "option_quote_trade_abs_skew_values": [],
-                },
-            )
-            stock_option_skew = to_float(row.get("clock_alignment_median_skew_seconds"))
-            option_trade_skew = to_float(row.get("option_quote_trade_clock_alignment_median_skew_seconds"))
-            if pd.notna(stock_option_skew):
-                validation_state["stock_option_skew_values"].append(float(stock_option_skew))
-                validation_state["stock_option_abs_skew_values"].append(abs(float(stock_option_skew)))
-            if pd.notna(option_trade_skew):
-                validation_state["option_quote_trade_skew_values"].append(float(option_trade_skew))
-                validation_state["option_quote_trade_abs_skew_values"].append(abs(float(option_trade_skew)))
-
-    failures_written = False
-    for _, frame in iter_parquet_chunk_frames(DIAGNOSTIC_PARTS_DIR, "quality"):
-        stats["quality_rows"] += len(frame)
-        if CFG.assemble_csv_outputs:
-            append_csv_frame(paths["quality"], frame, csv_state, "quality", csv_columns["quality"])
-        if "request_error" in frame.columns:
-            failures = frame.loc[frame["request_error"].fillna("").astype(str).ne("")]
-            if not failures.empty:
-                failures = failures.reindex(columns=["symbol", "trade_day", "expiration", "strike", "right",
-                                                     "contract_id", "dataset", "data_status", "request_error"])
-                failures.to_csv(paths["failures"], mode="w" if not failures_written else "a", header=not failures_written, index=False)
-                failures_written = True
-        for row in frame.to_dict("records"):
-            dataset_name = str(row.get("dataset", ""))
-            state = dataset_quality.setdefault(
-                dataset_name,
-                {
-                    "dataset": dataset_name,
-                    "pulls": 0,
-                    "empty_pulls": 0,
-                    "filtered_condition_row_count": 0,
-                    "missing_condition_row_count": 0,
-                    "duplicate_timestamp_count": 0,
-                    "duplicate_timestamp_conflict_count": 0,
-                    "out_of_order_timestamp_count": 0,
-                    "missing_interval_count": 0,
-                    "crossed_market_count": 0,
-                    "locked_market_count": 0,
-                    "partial_bid_ask_rows": 0,
-                    "zero_price_count": 0,
-                    "zero_size_count": 0,
-                    "unique_column_signatures": set(),
-                    "unique_dtype_signatures": set(),
-                },
-            )
-            state["pulls"] += 1
-            for key in ("empty_pulls", "filtered_condition_row_count", "missing_condition_row_count", "duplicate_timestamp_count", "duplicate_timestamp_conflict_count", "out_of_order_timestamp_count", "missing_interval_count", "crossed_market_count", "locked_market_count", "partial_bid_ask_rows", "zero_price_count", "zero_size_count"):
-                value = row.get("empty_pull", False) if key == "empty_pulls" else row.get(key, 0)
-                state[key] += to_int(value)
-            state["unique_column_signatures"].add(str(row.get("column_signature", "")))
-            state["unique_dtype_signatures"].add(str(row.get("dtype_signature", "")))
-            schema_key = (dataset_name, str(row.get("column_signature", "")))
-            schema_counts[schema_key] = schema_counts.get(schema_key, 0) + 1
-            symbol_key = (str(row.get("symbol", "")), dataset_name)
-            symbol_state = symbol_quality.setdefault(
-                symbol_key,
-                {
-                    "symbol": str(row.get("symbol", "")),
-                    "dataset": dataset_name,
-                    "pulls": 0,
-                    "empty_pulls": 0,
-                    "missing_interval_count": 0,
-                    "crossed_market_count": 0,
-                    "partial_bid_ask_rows": 0,
-                },
-            )
-            symbol_state["pulls"] += 1
-            for key in ("empty_pulls", "missing_interval_count", "crossed_market_count", "partial_bid_ask_rows"):
-                value = row.get("empty_pull", False) if key == "empty_pulls" else row.get(key, 0)
-                symbol_state[key] += to_int(value)
-
-    if not failures_written:
-        pd.DataFrame().to_csv(paths["failures"], index=False)
-
-    screening_frames = []
-    for _, frame in iter_parquet_chunk_frames(DIAGNOSTIC_PARTS_DIR, "screening"):
-        stats["screening_rows"] += len(frame)
-        screening_frames.append(frame)
-    screening_df = pd.concat(screening_frames, ignore_index=True) if screening_frames else pd.DataFrame()
-
-    observed_instrument_index_df = pd.DataFrame(
-        [
-            {
-                **{k: v for k, v in row.items() if k != "observed_trade_days"},
-                "observed_trade_days": len(row["observed_trade_days"]),
-            }
-            for row in observed_index.values()
+    def collect_references(self, symbols: list[SymbolConfig], start: str, end: str,
+                           rate_symbols: list[str], yahoo_actions: bool, run_id: str) -> list[dict]:
+        requests_to_make = [
+            Request("interest_rate_eod", "/interest_rate/history/eod",
+                    {"symbol": symbol, "start_date": start, "end_date": end, "format": "csv"})
+            for symbol in sorted(set(rate_symbols))
         ]
-    )
-    family_coverage_df = pd.DataFrame(
-        [
-            {
-                "symbol": row["symbol"],
-                "right": row["right"],
-                "dte_days": row["dte_days"],
-                "trade_month": row["trade_month"],
-                "contract_rows": row["contract_rows"],
-                "quote_rows_with_data": row["quote_rows_with_data"],
-                "trade_rows_with_data": row["trade_rows_with_data"],
-                "median_option_spread": float(np.median(row["median_option_spread_values"])) if row["median_option_spread_values"] else np.nan,
-                "median_trade_size": float(np.median(row["median_trade_size_values"])) if row["median_trade_size_values"] else np.nan,
-            }
-            for row in family_coverage.values()
-        ]
-    )
-    summary_df = pd.DataFrame(
-        [
-            {
-                "symbols": len(symbols_seen),
-                "requested_symbol_days": stats["requested_symbol_days"],
-                "unavailable_symbol_days": stats["unavailable_symbol_days"],
-                "failed_symbol_days": stats["failed_symbol_days"],
-                "stock_available_days": stats["stock_available_days"],
-                "expiration_rows": stats["expiration_rows"],
-                "contract_rows": stats["contract_rows"],
-                "quality_rows": stats["quality_rows"],
-                "screening_rows": stats["screening_rows"],
-                "option_quote_rows_with_data": stats["option_quote_rows_with_data"],
-                "option_trade_rows_with_data": stats["option_trade_rows_with_data"],
-                "clean_sample_contract_rows": stats["clean_sample_contract_rows"],
-                "broad_sample_contract_rows": stats["broad_sample_contract_rows"],
-                "contracts_with_full_quote_observed_checks": stats["contracts_with_full_quote_observed_checks"],
-                "contracts_with_full_trade_observed_checks": stats["contracts_with_full_trade_observed_checks"],
-                "median_stock_rel_spread": float(np.median(stock_rel_spreads)) if stock_rel_spreads else np.nan,
-            }
-        ]
-    )
-    dataset_quality_df = pd.DataFrame(
-        [
-            {
-                **{k: v for k, v in row.items() if k not in {"unique_column_signatures", "unique_dtype_signatures"}},
-                "unique_column_signatures": len(row["unique_column_signatures"] - {""}),
-                "unique_dtype_signatures": len(row["unique_dtype_signatures"] - {""}),
-            }
-            for row in dataset_quality.values()
-        ]
-    )
-    schema_df = pd.DataFrame(
-        [
-            {"dataset": dataset, "column_signature": column_signature, "pull_count": count}
-            for (dataset, column_signature), count in schema_counts.items()
-        ]
-    ).sort_values(["dataset", "pull_count"], ascending=[True, False]) if schema_counts else pd.DataFrame()
-    symbol_quality_df = pd.DataFrame(symbol_quality.values())
-    timestamp_validation_df = pd.DataFrame(
-        [
-            {
-                "symbol": row["symbol"],
-                "median_stock_option_skew_seconds": float(np.median(row["stock_option_skew_values"])) if row["stock_option_skew_values"] else np.nan,
-                "p95_abs_stock_option_skew_seconds": float(np.quantile(row["stock_option_abs_skew_values"], 0.95)) if row["stock_option_abs_skew_values"] else np.nan,
-                "median_option_quote_trade_skew_seconds": float(np.median(row["option_quote_trade_skew_values"])) if row["option_quote_trade_skew_values"] else np.nan,
-                "p95_abs_option_quote_trade_skew_seconds": float(np.quantile(row["option_quote_trade_abs_skew_values"], 0.95)) if row["option_quote_trade_abs_skew_values"] else np.nan,
-            }
-            for row in timestamp_validation.values()
-        ]
-    )
-    validation_targets_df = build_validation_targets()
-    collected_symbols = [cfg for cfg in UNIVERSE if cfg.symbol in symbols_seen]
-    reference_actions_df = collect_reference_actions(collected_symbols)
-    carry_inputs_df = collect_carry_inputs(collected_symbols)
+        if yahoo_actions:
+            requests_to_make.extend(
+                Request("yahoo_actions_reference", "Ticker.history",
+                        {"symbol": symbol.symbol, "start_date": start, "end_date": end}, vendor="Yahoo")
+                for symbol in symbols)
+        records = []
+        for request in requests_to_make:
+            try:
+                record = self.store.collect(request)
+            except Exception as exc:
+                record = {"request_id": request.request_id, "dataset": request.dataset,
+                          "status": "request_error", "error": repr(exc)}
+            records.append(record)
+            # The ledger is separate: reference failures do not invalidate Theta days.
+            write_json(self.cfg.output_dir / "references" / f"{run_id}.json",
+                       {"updated_at_utc": utc_now(), "requests": records,
+                        "requested_rates": sorted(set(rate_symbols)), "rate_units": "percent",
+                        "rate_publication_timestamps_verified": False,
+                        "yahoo_actions_requested": yahoo_actions,
+                        "authoritative_adjusted_contract_deliverables": "not_collected"})
+            print(f"Reference {request.params['symbol']} {request.dataset}: {record['status']}")
+        return records
 
-    exports = {"observed_instrument_index": observed_instrument_index_df, "family_coverage": family_coverage_df,
-               "summary": summary_df, "dataset_quality": dataset_quality_df, "schema": schema_df,
-               "symbol_quality": symbol_quality_df, "timestamp_validation": timestamp_validation_df,
-               "screening": screening_df, "validation_targets": validation_targets_df,
-               "reference_actions": reference_actions_df, "carry_inputs": carry_inputs_df}
-    for dataset, frame in exports.items():
-        with atomic_output(paths[dataset]) as path:
-            frame.to_csv(path, index=False)
-    update_progress_manifest(completed_session_keys())
-    return {
-        "summary_df": summary_df,
-        "counts": stats,
-    }
+    def write_availability(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex) -> dict:
+        path = self.directory / "availability.csv"
+        columns = ("symbol", "trade_day", "status", "reason", "quoted_contract_count", "selected_contract_count",
+                   "selection_reference_count", "missing_selection_times", "request_count", "request_error_count",
+                   "no_data_request_count", "stored_rows", "stored_parquet_bytes", "error")
+        counts = dict.fromkeys(("complete", "unavailable", "request_error", "not_attempted"), 0)
+        with atomic_output(path) as temp:
+            with temp.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns)
+                writer.writeheader()
+                for day in anchors:
+                    for symbol in symbols:
+                        row = {"symbol": symbol.symbol, "trade_day": str(day.date()), "status": "not_attempted"}
+                        try:
+                            manifest = read_json(self.session_path(symbol.symbol, day))
+                        except FileNotFoundError:
+                            pass
+                        except (OSError, ValueError) as exc:
+                            row.update(status="request_error", error=repr(exc))
+                        else:
+                            row.update({key: manifest.get(key, "") for key in columns if key in manifest})
+                            records = manifest["requests"]
+                            row.update(selection_reference_count=len(manifest["stock_selection_references"]),
+                                       missing_selection_times="|".join(manifest["missing_selection_times"]),
+                                       request_count=len(records),
+                                       no_data_request_count=sum(r["status"] == "no_data" for r in records),
+                                       stored_rows=sum(r.get("row_count", 0) for r in records),
+                                       stored_parquet_bytes=sum((r.get("data") or {}).get("size", 0) for r in records))
+                        counts[row["status"]] += 1
+                        writer.writerow(row)
+        return counts
 
 
-def load_existing_rows() -> set[tuple[str, str]]:
-    paths = output_paths()
-    if not paths["progress"].exists():
-        return completed_session_keys()
-    try:
-        progress = json.loads(paths["progress"].read_text(encoding="utf-8"))
-    except Exception:
-        return completed_session_keys()
-    if (progress.get("config_digest") != _CONFIG_DIGEST
-            or progress.get("output_schema_version") != OUTPUT_SCHEMA_VERSION):
-        # A mismatched manifest means the already-written parquet set may not
-        # correspond to the requested run; fail loudly instead of mixing states.
-        raise RuntimeError(
-            "Progress manifest config_digest differs from the current run. "
-            "Use a new output_dir or explicitly archive/clear the existing canonical parts before reprocessing, "
-            "so old-schema parquet chunks cannot mix with new output."
-        )
-    return completed_session_keys()
-
-
-def validate_written_symbol_day(symbol: str, trade_day: pd.Timestamp, session_row: dict) -> None:
-    session_path = parquet_chunk_path(chunk_paths()["sessions"], "sessions", symbol, trade_day)
-    if not session_path.exists():
-        raise RuntimeError(f"missing_session_chunk:{session_path}")
-    if session_row.get("collection_status") == "request_error":
-        raise RuntimeError("symbol_day_request_errors; see availability and quality reports")
-    contract_pattern = f"{parquet_chunk_stem(symbol, trade_day)}*.parquet"
-    contract_parts = list((chunk_paths()["contracts"] / "contracts").glob(contract_pattern))
-    screening_parts = list((chunk_paths()["screening"] / "screening").glob(contract_pattern))
-    expected_contracts = int(session_row.get("expected_contract_count", 0))
-    collected_contracts = int(session_row.get("collected_contract_count", 0))
-    screened_out_contracts = int(session_row.get("screened_out_contract_count", 0))
-    contract_failures = int(session_row.get("contract_task_failure_count", 0))
-    if collected_contracts > 0 and not contract_parts:
-        raise RuntimeError("missing_contract_chunks")
-    if screened_out_contracts > 0 and not screening_parts:
-        raise RuntimeError("missing_screening_chunks")
-    if collected_contracts + screened_out_contracts + contract_failures != expected_contracts:
-        raise RuntimeError(
-            f"contract_reconciliation_failed expected={expected_contracts} collected={collected_contracts} screened={screened_out_contracts} failed={contract_failures}"
-        )
-    failure_rate = contract_failures / max(expected_contracts, 1)
-    # Tiny transient failure rates are retained in diagnostics but do not force
-    # an otherwise reconciled symbol-day to be recollected forever.
-    if contract_failures > 0 and failure_rate > CFG.soft_failure_rate_threshold:
-        raise RuntimeError(f"contract_task_failures:{contract_failures}; failure_rate={failure_rate:.4f}")
-
-
-def process_symbol_day(symbol_cfg: SymbolConfig, trade_day: pd.Timestamp) -> tuple[tuple[str, str], dict]:
-    chunk_writer = SymbolDayChunkWriter(symbol_cfg.symbol, trade_day)
-    try:
-        session_row, expirations, contracts, quality, screening = collect_symbol_day(
-            symbol_cfg, trade_day, chunk_writer=chunk_writer)
-    except Exception as exc:
-        session_row = {**asdict(symbol_cfg), "trade_day": trade_day,
-                       "output_schema_version": OUTPUT_SCHEMA_VERSION, "config_digest": _CONFIG_DIGEST,
-                       "collection_status": "request_error", "unavailable_reason": repr(exc),
-                       "request_error_count": 1, "expected_contract_count": 0, "collected_contract_count": 0}
-        expirations, contracts, screening = [], [], []
-        quality = [{"symbol": symbol_cfg.symbol, "trade_day": trade_day, "dataset": "symbol_day",
-                    "request_error": repr(exc), "data_status": "request_error"}]
-    chunk_writer.extend_quality_rows(quality)
-    chunk_writer.finalize()
-    session_row.update(contract_part_count=chunk_writer.parts["contracts"],
-                       quality_part_count=chunk_writer.parts["quality"],
-                       expiration_row_count=len(expirations), screening_row_count=len(screening))
-    write_session_chunks(symbol_cfg.symbol, trade_day, [], expirations, contracts, [], screening)
-    # The session manifest is published last, after its data parts have been written.
-    write_parquet_chunk(chunk_paths()["sessions"], "sessions", symbol_cfg.symbol, trade_day, [session_row])
-    validate_written_symbol_day(symbol_cfg.symbol, trade_day, session_row)
-    day_key = (symbol_cfg.symbol, pd.Timestamp(trade_day).strftime("%Y-%m-%d"))
-    return day_key, {"session": session_row, "expirations": len(expirations), "contracts": int(session_row.get("collected_contract_count", 0))}
+def package_versions() -> dict:
+    result = {}
+    for package in ("pandas", "numpy", "pyarrow", "requests", "exchange-calendars", "yfinance"):
+        try:
+            result[package] = version(package)
+        except PackageNotFoundError:
+            result[package] = "not_installed"
+    return result
 
 
 def parse_run_scope(argv: list[str] | None = None):
+    defaults = CollectorConfig()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--symbols", nargs="+", type=str.upper, choices=[cfg.symbol for cfg in UNIVERSE],
-                        help="Collect only these configured symbols")
-    parser.add_argument("--start", default=CFG.start_date, help="First date within the configured research period (YYYY-MM-DD)")
-    parser.add_argument("--end", default=CFG.end_date, help="Last date within the configured research period (YYYY-MM-DD)")
+    parser.add_argument("--symbols", nargs="+", type=str.upper, choices=[cfg.symbol for cfg in UNIVERSE])
+    parser.add_argument("--start", default=defaults.start_date, help="Inclusive first date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=defaults.end_date, help="Inclusive last date (YYYY-MM-DD)")
+    parser.add_argument("--quote-interval", default=defaults.quote_interval, choices=QUOTE_INTERVALS)
+    parser.add_argument("--output-dir", type=Path, default=defaults.output_dir)
+    parser.add_argument("--store-raw-payloads", action="store_true", help="Also preserve exact Theta response bytes")
+    parser.add_argument("--refresh-no-data", action="store_true", help="Retry previously empty requests")
+    parser.add_argument("--max-inflight-requests", type=int, default=defaults.max_inflight_requests,
+                        help="Set within your Theta subscription's concurrency allowance")
+    parser.add_argument("--max-requests-per-second", type=float, default=defaults.max_requests_per_second)
+    parser.add_argument("--rate-symbols", nargs="+", default=[], type=str.upper,
+                        help="Optional Theta rate series, e.g. SOFR; no default rate is assumed")
+    parser.add_argument("--yahoo-actions", action="store_true", help="Optional Yahoo daily history/actions reference")
+    parser.add_argument("--references-only", action="store_true", help="Fetch only the explicitly requested references")
     parser.add_argument("--plan", action="store_true", help="Show scope without network requests or output writes")
     args = parser.parse_args(argv)
     try:
         if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in (args.start, args.end)):
             raise ValueError("Dates must use YYYY-MM-DD")
         start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
-        if not pd.Timestamp(CFG.start_date) <= start <= end <= pd.Timestamp(CFG.end_date):
-            raise ValueError(f"Dates must be ordered and within {CFG.start_date} through {CFG.end_date}")
+        if not pd.Timestamp(defaults.start_date) <= start <= end <= pd.Timestamp(defaults.end_date):
+            raise ValueError(f"Dates must be ordered and within {defaults.start_date} through {defaults.end_date}")
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9_.-]{0,31}", symbol) for symbol in args.rate_symbols):
+            raise ValueError("Rate symbols must be explicit series names")
+        if args.references_only and not (args.rate_symbols or args.yahoo_actions):
+            raise ValueError("--references-only requires --rate-symbols or --yahoo-actions")
+        cfg = replace(defaults, quote_interval=args.quote_interval, output_dir=args.output_dir.expanduser().resolve(),
+                      store_raw_payloads=args.store_raw_payloads, refresh_no_data=args.refresh_no_data,
+                      max_inflight_requests=args.max_inflight_requests,
+                      max_requests_per_second=args.max_requests_per_second)
     except ValueError as exc:
         parser.error(str(exc))
-    anchors = candidate_anchor_dates()
-    anchors = anchors[(anchors >= start) & (anchors <= end)]
+    anchors = exchange_calendar().sessions_in_range(start, end).tz_localize(None)
     symbols = [cfg for cfg in UNIVERSE if args.symbols is None or cfg.symbol in args.symbols]
-    return args, symbols, anchors
+    return args, cfg, symbols, anchors
 
 
 def main(argv: list[str] | None = None) -> int:
-    args, symbols, anchors = parse_run_scope(argv)
-    total_configs = len(anchors) * len(symbols)
-    print(f"Scope: {', '.join(cfg.symbol for cfg in symbols)}; {args.start} to {args.end}; {total_configs} symbol-days")
-    print(f"Output: {CFG.output_dir}")
-    if args.plan or not total_configs:
+    args, cfg, symbols, anchors = parse_run_scope(argv)
+    total = 0 if args.references_only else len(symbols) * len(anchors)
+    print(f"Scope: {', '.join(s.symbol for s in symbols)}; {args.start} to {args.end}; {total} symbol-days")
+    print(f"Quotes: {cfg.quote_interval}; trades: events with matched quotes; stock venue: {cfg.stock_venue}")
+    print(f"Output: {cfg.output_dir}")
+    print(f"Optional references: rates={','.join(args.rate_symbols) or 'none'}, Yahoo actions={args.yahoo_actions}")
+    if args.plan:
         return 0
-    ensure_dir(CFG.output_dir)
-    ensure_dir(CFG.raw_cache_dir)
-    ensure_dir(CFG.market_data_dir)
-    ensure_dir(REFERENCE_DATA_DIR)
-    ensure_dir(CANONICAL_DATA_DIR)
-    ensure_dir(DIAGNOSTIC_DATA_DIR)
-    ensure_dir(CANONICAL_PARTS_DIR)
-    ensure_dir(DIAGNOSTIC_PARTS_DIR)
-    completed_symbol_days = load_existing_rows()
-    write_json(CFG.output_dir / "run_context.json", {**run_context(),
-               "run_scope": {"symbols": [cfg.symbol for cfg in symbols], "start": args.start, "end": args.end}})
-
-    processed = failed = 0
-
-    print("Collecting neutral multi-symbol option surface data")
-    print(f"Date range    : {args.start} to {args.end}")
-    print("Requested freq: exchange sessions")
-    print(f"Quote interval: {CFG.quote_interval}")
-    print("Trades        : individual events")
-    print(f"Symbols       : {', '.join(cfg.symbol for cfg in symbols)}")
-    print(f"Resume state  : {len(completed_symbol_days)} symbol-days already saved")
-
-    for trade_day in anchors:
-        pending: list[tuple[SymbolConfig, pd.Timestamp]] = []
-        for symbol_cfg in symbols:
-            processed += 1
-            day_key = (symbol_cfg.symbol, pd.Timestamp(trade_day).strftime("%Y-%m-%d"))
-            if day_key in completed_symbol_days:
-                print(f"[{processed}/{total_configs}] {symbol_cfg.symbol} {trade_day.date()}... cached summary")
-                continue
-            print(f"[{processed}/{total_configs}] {symbol_cfg.symbol} {trade_day.date()}...")
-            pending.append((symbol_cfg, trade_day))
-        if not pending:
-            continue
-        with ThreadPoolExecutor(max_workers=CFG.max_symbol_day_workers) as executor:
-            futures = {
-                executor.submit(process_symbol_day, symbol_cfg, day): (symbol_cfg, day)
-                for symbol_cfg, day in pending
-            }
-            for future in as_completed(futures):
-                symbol_cfg, day = futures[future]
-                try:
-                    day_key, _ = future.result()
-                except Exception as exc:
-                    failed += 1
-                    print(f"FAILED {symbol_cfg.symbol} {day.date()}: {exc!r}")
-                    continue
-                completed_symbol_days.add(day_key)
-                if len(completed_symbol_days) % 25 == 0:
-                    update_progress_manifest(completed_symbol_days)
-
-    assembled = assemble_outputs()
-    paths = output_paths()
-    summary_df = assembled["summary_df"]
-    counts = assembled["counts"]
-
-    print("\nCollection summary")
-    print("-" * 60)
-    print(f"requested symbol-days : {counts['requested_symbol_days']}")
-    print(f"expiration rows       : {counts['expiration_rows']}")
-    print(f"contract rows         : {counts['contract_rows']}")
-    print(f"quality rows          : {counts['quality_rows']}")
-    print(f"unavailable days      : {counts['unavailable_symbol_days']}")
-    print(f"failed days           : {counts['failed_symbol_days']}")
-    print(f"screening rows        : {counts['screening_rows']}")
-    if not summary_df.empty:
-        row = summary_df.iloc[0]
-        print(f"stock-available days  : {int(row['stock_available_days'])}")
-        print(f"quote-covered rows    : {int(row['option_quote_rows_with_data'])}")
-        print(f"trade-covered rows    : {int(row['option_trade_rows_with_data'])}")
-        print(f"clean sample rows     : {int(row['clean_sample_contract_rows'])}")
-        print(f"broad sample rows     : {int(row['broad_sample_contract_rows'])}")
-        print(f"full quote checks     : {int(row['contracts_with_full_quote_observed_checks'])}")
-        print(f"full trade checks     : {int(row['contracts_with_full_trade_observed_checks'])}")
-    print("-" * 60)
-    large_exports = {"sessions", "expirations", "contracts", "quality"}
-    for dataset, path in paths.items():
-        if dataset not in large_exports or CFG.assemble_csv_outputs:
-            print(f"Saved: {path}")
-    return 1 if failed else 0
+    collector = Collector(cfg)
+    run_id = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex[:8]
+    run_path = collector.directory / "runs" / f"{run_id}.json"
+    run = {"run_id": run_id, "started_at_utc": utc_now(), "status": "running",
+           "policy_id": cfg.policy_id, "policy": cfg.policy(), "config": {**asdict(cfg), "output_dir": str(cfg.output_dir)},
+           "scope": {"symbols": [s.symbol for s in symbols], "start": args.start, "end": args.end,
+                     "references_only": args.references_only, "rate_symbols": args.rate_symbols,
+                     "yahoo_actions": args.yahoo_actions},
+           "code_sha256": file_hash(Path(__file__)), "python": sys.version, "platform": platform.platform(),
+           "packages": package_versions(), "resumed_days": 0, "processed_days": 0}
+    failed = reference_failures = 0
+    try:
+        with output_lock(cfg.output_dir):
+            write_json(run_path, run)
+            try:
+                if not args.references_only:
+                    for day in anchors:
+                        pending = []
+                        for symbol in symbols:
+                            if collector.resumable(symbol.symbol, day):
+                                run["resumed_days"] += 1
+                            else:
+                                pending.append(symbol)
+                        with ThreadPoolExecutor(max_workers=cfg.max_symbol_day_workers) as pool:
+                            futures = {pool.submit(collector.collect_day, symbol, day): symbol for symbol in pending}
+                            for future in as_completed(futures):
+                                symbol = futures[future]
+                                run["processed_days"] += 1
+                                try:
+                                    manifest = future.result()
+                                    failed += manifest["status"] == "request_error"
+                                    print(f"{symbol.symbol} {day.date()}: {manifest['status']}; "
+                                          f"{manifest['selected_contract_count']} contracts, "
+                                          f"{manifest['request_error_count']} failed requests")
+                                except Exception as exc:
+                                    failed += 1
+                                    print(f"FAILED {symbol.symbol} {day.date()}: {exc!r}")
+                references = collector.collect_references(
+                    symbols, args.start, args.end, args.rate_symbols, args.yahoo_actions, run_id)
+                reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES for r in references)
+                run["status"] = "partial_failure" if failed or reference_failures else "complete"
+            except BaseException:
+                run["status"] = "interrupted"
+                raise
+            finally:
+                run.update(finished_at_utc=utc_now(), failed_days=int(failed), reference_failures=reference_failures)
+                if not args.references_only:
+                    run["coverage"] = collector.write_availability(symbols, anchors)
+                write_json(run_path, run)
+    except (RuntimeError, OSError, KeyboardInterrupt) as exc:
+        print(f"Collector stopped: {exc}", file=sys.stderr)
+        return 1
+    print(f"Finished: {run['processed_days']} processed, {run['resumed_days']} resumed, "
+          f"{failed} failed days, {reference_failures} failed references")
+    print(f"Run record: {run_path}")
+    if not args.references_only:
+        print(f"Coverage: {collector.directory / 'availability.csv'}")
+    return 1 if failed or reference_failures else 0
 
 
 if __name__ == "__main__":
