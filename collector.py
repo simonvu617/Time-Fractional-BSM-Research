@@ -1,3 +1,30 @@
+# READING GUIDE
+# This file downloads and records inputs for the research. It does not fit a
+# model or decide whether TFBSM performs better than classical Black-Scholes.
+#
+# For the overall sequence, start at main() near the bottom. For the work done
+# on one stock/ETF on one trading day, read Collector.collect_day(). The other
+# functions supply the requests, contract selection, storage, and bookkeeping.
+#
+# Normal run:
+#   settings -> available-date check -> dividends/splits/rates/VIX
+#            -> each trading day and underlying -> coverage/run reports
+# One underlying on one day:
+#   stock quotes + dated option list + stock trades/EOD
+#   -> stock prices at the selection times -> selected option contracts
+#   -> option quotes + option trades + open interest -> saved session record
+#
+# Vocabulary used throughout:
+#   underlying: the stock or ETF on which an option is written.
+#   strike: the option's agreed exercise price; expiration: its expiry date.
+#   symbol-day/session: one underlying on one exchange trading day.
+#   quote: displayed buying/selling prices; trade: an actual reported transaction.
+#   frame: a pandas table in memory, with named columns and rows.
+#   cache: previously saved responses that can be reused instead of downloaded.
+#   manifest/ledger: a JSON record of what was requested, saved, or missing.
+#   receipt: a file's location, size, and fingerprint, used to check reuse.
+# The numbered sections below follow the file's order, not its execution order.
+
 """Historical stock/option collection, kept in one file for review.
 
 Python 3.11+; dependencies: exchange-calendars, numpy, pandas>=2, pyarrow, requests.
@@ -101,20 +128,29 @@ else:
     import fcntl
 
 
-# Configuration and the existing research universe.
+# 1. Collection settings and the existing research universe.
+# Schema versions identify the layout/meaning of our saved files. They let the
+# resume checks distinguish compatible data from an older output format.
 OUTPUT_SCHEMA_VERSION = "2026-09-07-raw-collection-v1"
 RAW_SCHEMA_VERSION = 1
 # Keep the original default root so existing raw caches can be reused.
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "data" / "multi_year_bsm_backtest_output"
 QUOTE_INTERVALS = ("tick", "10ms", "100ms", "500ms", "1s", "5s", "10s", "15s",
                    "30s", "1m", "5m", "10m", "15m", "30m", "1h")
+# Both statuses mean a request finished successfully. "no_data" means Theta
+# returned no rows; it does not mean that an asset had zero prices or activity.
 GOOD_REQUEST_STATUSES = {"available", "no_data"}
+# These are minimum expected vendor columns, not a list of columns to keep.
+# Extra vendor fields also survive in raw storage.
 QUOTE_FIELDS = ("bid_size", "bid_exchange", "bid", "bid_condition",
                 "ask_size", "ask_exchange", "ask", "ask_condition")
 TRADE_FIELDS = ("trade_timestamp", "quote_timestamp", "sequence", "condition", "size",
                 "exchange", "price", *QUOTE_FIELDS)
+# An option's identity needs all four fields. "right" means call or put.
 CONTRACT_FIELDS = ("symbol", "expiration", "strike", "right")
 SELECTION_COLUMNS = (*CONTRACT_FIELDS, "contract_key", "dte_days", "selection_times")
+# SOFR is an overnight reference rate; Treasury suffixes specify months/years.
+# Collecting several maturities keeps the later choice of a pricing rate open.
 RATE_SYMBOLS = ("SOFR", "TREASURY_M1", "TREASURY_M3", "TREASURY_M6", "TREASURY_Y1",
                 "TREASURY_Y2", "TREASURY_Y3", "TREASURY_Y5", "TREASURY_Y7",
                 "TREASURY_Y10", "TREASURY_Y20", "TREASURY_Y30")
@@ -124,18 +160,24 @@ REFERENCE_COLUMNS = {
                            "amount", "event_code", "is_component", "distribution_type"),
     "corporate_split": ("effective_date", "before_shares", "after_shares", "split_ratio", "event_code"),
 }
+# Each date-range check must use the date on which that endpoint filters.
+# A dividend's announcement/payment dates can legitimately fall outside it.
 REPORT_DATE_COLUMNS = {"interest_rate_eod": "created", "corporate_dividend": "ex_dividend_date",
                        "corporate_split": "effective_date"}
 
 
 @dataclass(frozen=True)
 class SymbolConfig:
+    # Descriptive research labels for one underlying. They are saved with its
+    # session record; they do not create vendor requests or compute features.
     symbol: str
     asset_type: str
     universe_bucket: str
     sector_proxy: str
 
 
+# This is the explicit study list, not a historical list of all listed assets.
+# --symbols selects a subset. A listed symbol can still lack data on some dates.
 UNIVERSE = [
     SymbolConfig("SPY", "ETF", "broad_market_etf", "broad_market"),
     SymbolConfig("QQQ", "ETF", "growth_etf", "technology"),
@@ -163,31 +205,52 @@ UNIVERSE = [
 
 @dataclass(frozen=True)
 class CollectorConfig:
+    # Requests go through the user's local Theta Terminal v3 application.
     base_url: str = "http://127.0.0.1:25503/v3"
+    # Default study bounds. The CLI can request a smaller slice within them.
     start_date: str = "2018-01-01"
     end_date: str = "2025-12-31"
     option_rights: tuple[str, ...] = ("call", "put")
+    # DTE = calendar days to expiration. Choose actual listed expirations near
+    # these targets, with an overall limit on the number chosen per day.
     target_dtes: tuple[int, ...] = (7, 14, 30, 60, 120)
     max_expirations_per_day: int = 5
+    # Moneyness here is S/K: underlying price divided by option strike.
+    # At S=$100, target 0.80 implies K=$125; target 1.00 implies K=$100.
+    # We choose nearby listed strikes, not invented contracts at those prices.
     moneyness_targets: tuple[float, ...] = (0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20)
     strikes_per_moneyness_target: int = 1
+    # Expirations outside this window cannot enter the download selection.
     min_dte: int = 7
     max_dte: int = 180
     exchange_tz: str = "America/New_York"
+    # "1s" requests sampled quotes. "tick" requests quote events. Trades are
+    # requested as individual events regardless of this quote setting.
     quote_interval: str = "1s"
     stock_venue: str = "utp_cta"
+    # At these New York times, use a recent stock quote to choose option strikes.
+    # These times select downloads; all requested session observations are saved.
     selection_times: tuple[str, ...] = ("10:30:00", "13:00:00", "15:00:00")
+    # A selection reference cannot use a stock quote older than this many seconds.
     max_stock_quote_age_seconds: int = 70
+    # Ask Theta to match a trade to a quote strictly before its timestamp.
     trade_quote_exclusive: bool = True
+    # Workers overlap downloads: first across symbol-days, then option requests.
+    # The shared client below still caps total requests in flight and start rate.
     max_symbol_day_workers: int = 2
     max_contract_workers: int = 4
     max_requests_per_second: float = 8.0
     max_inflight_requests: int = 8
+    # Parquet tables and request metadata are always saved. This flag also keeps
+    # the exact successful response bytes, which use additional disk space.
     store_raw_payloads: bool = False
+    # Normally an empty response is cached too. Enable this to ask Theta again.
     refresh_no_data: bool = False
     output_dir: Path = DEFAULT_OUTPUT_DIR
 
     def __post_init__(self):
+        # Reject inconsistent settings when the configuration is constructed,
+        # before creating files or sending any requests.
         if not self.option_rights or set(self.option_rights) - {"call", "put"}:
             raise ValueError("option_rights must contain call and/or put")
         if pd.Timestamp(self.start_date) > pd.Timestamp(self.end_date):
@@ -221,11 +284,16 @@ class CollectorConfig:
 
     @property
     def policy_id(self) -> str:
+        # A short fingerprint names the folder for this selection policy.
+        # Changing selection settings keeps the old policy's results separate.
         return digest_json(self.policy())[:20]
 
 
+# 2. Describe a single Theta request before deciding whether to download it.
 @dataclass(frozen=True)
 class Request:
+    # dataset names our output group; endpoint is Theta's URL path; params is
+    # the exact set of URL arguments (symbol, date, contract, interval, etc.).
     dataset: str
     endpoint: str
     params: dict
@@ -236,10 +304,14 @@ class Request:
 
     @property
     def request_id(self) -> str:
+        # Identical requests get the same cache key even in different runs.
+        # Changing a date, strike, interval, or another argument changes this key.
         return digest_json(self.identity())[:24]
 
     @property
     def required_columns(self) -> tuple[str, ...]:
+        # A successful HTTP response must also look like the requested table.
+        # This catches error pages or incompatible schemas before cache reuse.
         kind = self.endpoint.rsplit("/", 1)[-1]
         if self.dataset == "quoted_contracts":
             return CONTRACT_FIELDS
@@ -254,15 +326,20 @@ class Request:
         return ((*CONTRACT_FIELDS,) if self.endpoint.startswith("/option/") else ()) + fields[kind]
 
 
+# 3. File writing, receipts, and locking.
+# JSON holds readable metadata; Parquet holds compressed column-based tables.
+# UTC is the common clock used for collection times and parsed market timestamps.
 def utc_now() -> str:
     return pd.Timestamp.now("UTC").isoformat()
 
 
 def digest_json(value) -> str:
+    # Sorting dictionary keys makes the fingerprint independent of key order.
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def file_hash(path: Path) -> str:
+    # Fingerprint the actual file bytes, separately from the request's identity.
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
@@ -273,6 +350,9 @@ def read_json(path: Path) -> dict:
 
 @contextmanager
 def atomic_output(path: Path):
+    # Write a complete temporary file beside the destination, then replace it.
+    # A failed write therefore cannot leave a half-written final file. The
+    # finally block cleans up our temporary file if writing raises an exception.
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as handle:
         temp_path = Path(handle.name)
@@ -294,6 +374,8 @@ def write_parquet(path: Path, frame: pd.DataFrame) -> None:
 
 
 def file_receipt(path: Path, root: Path, frame: pd.DataFrame | None = None) -> dict:
+    # Relative paths keep receipts usable if the whole output folder is moved.
+    # Table receipts additionally remember row counts and column names.
     stat = path.stat()
     receipt = {"path": path.relative_to(root).as_posix(), "size": stat.st_size,
                "mtime_ns": stat.st_mtime_ns, "sha256": file_hash(path)}
@@ -307,11 +389,14 @@ def artifact_valid(receipt: dict, root: Path) -> bool:
     try:
         path = root / receipt["path"]
         stat = path.stat()
+        # Check cheap file information first. Recompute the byte fingerprint
+        # when the modification time changed, rather than rereading every file.
         if stat.st_size != receipt["size"]:
             return False
         if stat.st_mtime_ns != receipt["mtime_ns"] and file_hash(path) != receipt["sha256"]:
             return False
         if "rows" in receipt:
+            # The Parquet footer exposes rows/columns without loading all rows.
             with pq.ParquetFile(path) as parquet:
                 if (parquet.metadata.num_rows != receipt["rows"]
                         or parquet.schema_arrow.names != receipt["columns"]):
@@ -324,6 +409,8 @@ def artifact_valid(receipt: dict, root: Path) -> bool:
 @contextmanager
 def output_lock(output_dir: Path):
     """One writer per output root, released by the OS even after a crash."""
+    # This prevents two collector processes from updating the same output tree.
+    # Worker threads inside the one process can still download concurrently.
     output_dir.mkdir(parents=True, exist_ok=True)
     # This persistent lock file is intentional. Unlinking it would let another
     # process lock a different inode while the current writer still owns this one.
@@ -350,6 +437,7 @@ def output_lock(output_dir: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+# 4. Understand response clocks and identity without rewriting the vendor data.
 def parse_vendor_clock(values: pd.Series, exchange_tz: str) -> pd.Series:
     # Naive Theta clocks are exchange local. Aware clocks keep their stated
     # offset. Date-only interest-rate reports deliberately do not use this.
@@ -358,12 +446,16 @@ def parse_vendor_clock(values: pd.Series, exchange_tz: str) -> pd.Series:
     parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns, UTC]")
     parsed.loc[aware] = pd.to_datetime(text.loc[aware], format="mixed", errors="coerce", utc=True)
     naive = pd.to_datetime(text.loc[~aware], format="mixed", errors="coerce")
+    # Daylight-saving transitions can make a local clock ambiguous or impossible.
+    # Keep those parsed values missing (NaT) instead of guessing their UTC time.
     parsed.loc[~aware] = naive.dt.tz_localize(
         exchange_tz, ambiguous="NaT", nonexistent="NaT").dt.tz_convert("UTC")
     return parsed
 
 
 def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: CollectorConfig) -> tuple[pd.DataFrame, dict]:
+    # Return the raw table plus separate diagnostics. Counts of duplicates,
+    # bad quotes, and clock problems describe the data; they do not delete rows.
     result = frame.copy()
     diagnostics = {"duplicate_rows": int(frame.duplicated().sum()), "clocks": {}}
     clocks = ("timestamp", "trade_timestamp", "quote_timestamp", "last_trade", "created")
@@ -381,11 +473,15 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
             "last_utc": valid.max().isoformat() if len(valid) else None,
         }
     if {"bid", "ask"}.issubset(frame):
+        # Bid = displayed buying price; ask = displayed selling price. A crossed
+        # quote has bid > ask. Numeric conversion here is only for counting.
         bid, ask = (pd.to_numeric(frame[side], errors="coerce") for side in ("bid", "ask"))
         diagnostics.update(invalid_bid_ask_rows=int((~np.isfinite(bid) | ~np.isfinite(ask)).sum()),
                            nonpositive_bid_ask_rows=int((bid.le(0) | ask.le(0)).sum()),
                            crossed_quote_rows=int(bid.gt(ask).sum()))
     report_date = REPORT_DATE_COLUMNS.get(request.dataset)
+    # A report date tells us which day the record concerns, not the precise
+    # time researchers could first have known it. Do not invent that timestamp.
     if report_date and report_date in frame:
         dates = pd.to_datetime(frame[report_date].astype("string").str.strip(), format="mixed", errors="coerce")
         diagnostics["report_dates"] = {
@@ -395,6 +491,8 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
             "unique_count": int(dates.nunique()), "publication_time_verified": False,
         }
     if request.dataset == "corporate_dividend" and "amount" in frame:
+        # A blank payment amount remains unknown; treating it as zero would
+        # silently create a dividend assumption for later pricing work.
         diagnostics["unknown_dividend_amount_rows"] = int(frame["amount"].astype("string").str.strip().eq("").sum())
     if request.endpoint.endswith("/quote") and "collector_timestamp_utc" in result:
         interval = request.params.get("interval", "tick")
@@ -417,6 +515,8 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
     if "symbol" in frame and frame["symbol"].ne(request.params["symbol"]).any():
         issues.append("unexpected_symbol")
     if request.endpoint.startswith("/option/") and set(CONTRACT_FIELDS).issubset(frame):
+        # First check whether each row describes a valid option at all. When
+        # requesting one contract, also require every row to match that contract.
         expiry = pd.to_datetime(frame["expiration"], format="mixed", errors="coerce")
         strike = pd.to_numeric(frame["strike"], errors="coerce")
         right = frame["right"].str.lower().replace({"c": "call", "p": "put"})
@@ -429,6 +529,8 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
                 or right.ne(request.params["right"]).any()):
             issues.append("unexpected_contract_identity")
     start = request.params.get("date", request.params.get("start_date"))
+    # Compare market records on their exchange-local calendar date. A UTC date
+    # can differ from the local date, so it is not used directly for this check.
     end = request.params.get("date", request.params.get("end_date"))
     report_date = REPORT_DATE_COLUMNS.get(request.dataset)
     if "/list/dates" in request.endpoint:
@@ -457,12 +559,16 @@ def interval_seconds(interval: str) -> float:
 
 
 def format_strike(value) -> str:
+    # Use decimal arithmetic for the URL and contract key: binary floats can
+    # create spurious digits. Reject values beyond the supported 0.001 precision.
     strike = Decimal(str(value))
     if not strike.is_finite() or strike <= 0 or strike != strike.quantize(Decimal("0.001")):
         raise ValueError(f"Invalid option strike: {value!r}")
     return format(strike, ".3f").rstrip("0").rstrip(".")
 
 
+# 5. Talk to Theta Terminal: connections, shared request limits, and retries.
+# This layer returns bytes plus HTTP details. Parsing and saving happen below.
 class ThetaClient:
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
@@ -473,6 +579,8 @@ class ThetaClient:
 
     def ensure_available(self) -> None:
         # Fail once before scheduling years of requests against an offline terminal.
+        # A reachable port is only a connection check; it does not verify account
+        # permissions, endpoint support, or the requested historical coverage.
         address = urlsplit(self.cfg.base_url)
         try:
             with socket.create_connection((address.hostname, address.port or (443 if address.scheme == "https" else 80)), timeout=2):
@@ -481,6 +589,8 @@ class ThetaClient:
             raise RuntimeError(f"Theta Terminal is unreachable at {self.cfg.base_url}. Start it and rerun.") from exc
 
     def session(self) -> requests.Session:
+        # Each worker thread reuses its own HTTP connection pool. Avoid sharing
+        # mutable session state between threads while still reusing connections.
         if not hasattr(self.local, "session"):
             self.local.session = requests.Session()
             # Retries are explicit so every attempt obeys the same request budget.
@@ -491,6 +601,8 @@ class ThetaClient:
 
     @contextmanager
     def request_slot(self):
+        # Two separate limits: the semaphore caps unfinished requests, while
+        # next_allowed spaces out starts across all workers, including retries.
         with self.semaphore:
             with self.pace_lock:
                 wait = max(0.0, self.next_allowed - time.monotonic())
@@ -500,6 +612,8 @@ class ThetaClient:
             yield
 
     def download(self, request: Request) -> tuple[bytes | None, dict]:
+        # At most six attempts. Retry temporary failures such as rate limits
+        # and server errors; return other failures so they can be recorded.
         meta = {}
         for attempt in range(6):
             started = time.perf_counter()
@@ -510,11 +624,15 @@ class ThetaClient:
                         self.cfg.base_url.rstrip("/") + request.endpoint,
                         params=request.params, timeout=(10, 120))
                 payload = response.content
+                # Keep the response's identity and timing even if it failed.
+                # These details help explain missing data later.
                 meta = {"request_url": response.url, "status_code": response.status_code,
                         "response_headers": dict(response.headers), "attempts": attempt + 1,
                         "elapsed_ms": (time.perf_counter() - started) * 1000,
                         "payload_sha256": hashlib.sha256(payload).hexdigest(), "payload_bytes": len(payload)}
                 if response.status_code in {200, 472}:
+                    # 200 is an ordinary response; Theta uses 472 for no data.
+                    # The storage layer records an empty result separately.
                     return payload, meta
                 meta["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
                 if response.status_code not in {429, 474, 500, 502, 503, 504, 571} or attempt == 5:
@@ -528,19 +646,26 @@ class ThetaClient:
                 meta = {"error": repr(exc), "attempts": attempt + 1, "status_code": None}
                 if attempt == 5:
                     return payload, meta
+            # Increase the delay between attempts, considering Theta's requested
+            # Retry-After delay too. Both delays are bounded by the limits below.
             time.sleep(max(min(30.0, 2 ** attempt), min(max(retry_after, 0), 120.0)))
         return None, meta
 
 
-# Raw storage and request provenance are independent of contract selection.
+# 6. Save and reuse individual responses independently of contract selection.
+# RequestStore is the common route for stocks, options, and reference data.
 class RequestStore:
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         self.root = cfg.output_dir
         self.client = ThetaClient(cfg)
+        # Requests with the same key share a lock, so workers cannot write the
+        # same cache entry at once. Unrelated requests can usually proceed together.
         self.locks = tuple(threading.Lock() for _ in range(128))
 
     def directory(self, request: Request) -> Path:
+        # Readable dataset/symbol/date folders help browsing. The request ID
+        # distinguishes different contracts and parameters within those folders.
         date = request.params.get("date", request.params.get("start_date", "reference"))
         date = str(date).replace("-", "")
         symbol = request.params["symbol"]
@@ -548,6 +673,8 @@ class RequestStore:
                 f"date={date}" / f"request={request.request_id}")
 
     def cached(self, request: Request) -> dict | None:
+        # Return a reusable receipt, or None to trigger collection. Merely finding
+        # a file is insufficient: settings, status, and saved artifacts must agree.
         path = self.directory(request) / "meta.json"
         try:
             meta = read_json(path)
@@ -568,12 +695,16 @@ class RequestStore:
             return None
 
     def record(self, request: Request, meta: dict, meta_path: Path) -> dict:
+        # A compact receipt for session/reference manifests. Detailed diagnostics
+        # remain in the request's meta.json instead of being copied everywhere.
         return {"request_id": request.request_id, "dataset": request.dataset,
                 "status": meta["status"], "row_count": meta.get("row_count", 0),
                 "error": meta.get("error", ""), "data": meta.get("data"),
                 "payload": meta.get("payload"), "metadata": file_receipt(meta_path, self.root)}
 
     def collect(self, request: Request, *, refresh: bool = False) -> dict:
+        # Order: reuse current cache -> import a compatible older cache -> download.
+        # Date-catalogue refreshes skip current cache reuse to see newly added dates.
         with self.locks[hash(request.request_id) % len(self.locks)]:
             cached = None if refresh else self.cached(request)
             if cached:
@@ -592,6 +723,8 @@ class RequestStore:
                     content_type = response_meta.get("response_headers", {}).get("Content-Type", "").lower()
                     if content_type and not any(t in content_type for t in ("csv", "text/plain", "octet-stream")):
                         raise ValueError(f"Unexpected response content type: {content_type}")
+                    # Read every vendor field as text. This preserves long sequence
+                    # numbers, decimal spelling, and blanks before any interpretation.
                     frame = pd.read_csv(BytesIO(payload), dtype="string", keep_default_na=False)
                 except pd.errors.EmptyDataError:
                     # A successful empty body and 472 are distinct in HTTP metadata.
@@ -603,8 +736,12 @@ class RequestStore:
 
     def save(self, request: Request, frame: pd.DataFrame, response_meta: dict,
              payload: bytes | None = None, status: str | None = None) -> dict:
+        # Save the table even when it is empty or invalid, with an explicit status.
+        # Retained evidence lets us distinguish absent data from a broken request.
         directory = self.directory(request)
         missing = set(request.required_columns) - set(frame.columns)
+        # collector_ is reserved for our added fields, so a vendor field cannot
+        # silently masquerade as one of our parsed timestamps.
         if missing or any(str(column).startswith("collector_") for column in frame.columns):
             status = status or "invalid_response"
             response_meta["error"] = f"Missing required columns {sorted(missing)} or reserved collector_ column"
@@ -638,11 +775,15 @@ class RequestStore:
             with atomic_output(payload_path) as temp:
                 temp.write_bytes(payload)
             meta["payload"] = file_receipt(payload_path, self.root)
+        # Publish metadata after its files exist: it acts as the receipt linking
+        # this request to the saved table, quality counts, and optional response.
         write_json(directory / "meta.json", meta)
         return self.record(request, meta, directory / "meta.json")
 
     def legacy_response(self, request: Request):
         """Reuse valid pre-refactor raw quotes/OI/chains without changing old files."""
+        # Compatibility with the original collector's folder layout. Import only
+        # exact matching requests whose saved fingerprint still checks out.
         if request.dataset not in {"quoted_contracts", "option_open_interest",
                                     "stock_quotes_" + self.cfg.quote_interval, "option_quotes_" + self.cfg.quote_interval}:
             return None
@@ -668,6 +809,8 @@ class RequestStore:
             if self.cfg.store_raw_payloads and payload is None:
                 return None
             if payload and old.get("status_code") == 200:
+                # Original CSV bytes preserve more detail than an older table
+                # whose numbers/timestamps may already have been converted.
                 frame = pd.read_csv(BytesIO(payload), dtype="string", keep_default_na=False)
             else:
                 frame = pd.read_parquet(path)
@@ -685,17 +828,23 @@ class RequestStore:
             return None
 
     def read(self, record: dict) -> pd.DataFrame:
+        # Selection code only consumes successful responses. Failed responses
+        # remain on disk for inspection but are not used to select contracts.
         if record["status"] not in GOOD_REQUEST_STATUSES or not record.get("data"):
             return pd.DataFrame()
         return pd.read_parquet(self.root / record["data"]["path"])
 
 
+# 7. Build requests using the exchange calendar and each endpoint's arguments.
+# Cache the calendar object so every request does not reconstruct it.
 @lru_cache(maxsize=1)
 def exchange_calendar():
     return xcals.get_calendar("XNYS", start="2017-01-01", end="2026-12-31")
 
 
 def session_bounds(day: pd.Timestamp, cfg: CollectorConfig) -> tuple[pd.Timestamp, pd.Timestamp]:
+    # Read the day's actual open/close, including early closes, instead of
+    # assuming every weekday has a full 09:30-16:00 session.
     calendar = exchange_calendar()
     return (calendar.session_open(day).tz_convert(cfg.exchange_tz),
             calendar.session_close(day).tz_convert(cfg.exchange_tz))
@@ -703,6 +852,8 @@ def session_bounds(day: pd.Timestamp, cfg: CollectorConfig) -> tuple[pd.Timestam
 
 def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
                     day: pd.Timestamp, contract: dict | None = None) -> Request:
+    # Construct a request only; this function does not call the network.
+    # asset selects stock/option/index; kind selects quote/trade_quote/OI/etc.
     params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
     if asset == "option":
         if contract is None:
@@ -718,9 +869,12 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
     else:
         dataset = f"{asset}_{kind}"
     if kind == "eod":
+        # EOD (end of day) uses a date range, even for a single-day pull.
         params.pop("date")
         params.update(start_date=day.strftime("%Y%m%d"), end_date=day.strftime("%Y%m%d"))
     elif kind != "open_interest":
+        # OI (open interest) is a report of outstanding contracts, not a stream
+        # of trades. Intraday start/end-time arguments apply to the other pulls.
         opened, closed = session_bounds(day, cfg)
         params.update(start_time=opened.strftime("%H:%M:%S"), end_time=closed.strftime("%H:%M:%S"))
         if asset == "stock":
@@ -731,6 +885,8 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
 def reference_requests(cfg: CollectorConfig, symbols: list[SymbolConfig], start: str, end: str,
                        rate_symbols: list[str]):
     """One Theta-only bundle. Rates/actions are date reports; VIX prices are intraday."""
+    # yield produces requests one at a time. Actions belong to each underlying;
+    # interest-rate and VIX requests are shared across the selected underlyings.
     window = {"start_date": start, "end_date": end, "format": "csv"}
     for symbol in symbols:
         for kind in ("dividend", "split"):
@@ -743,7 +899,11 @@ def reference_requests(cfg: CollectorConfig, symbols: list[SymbolConfig], start:
         yield history_request(cfg, "index", "price", "VIX", day)
 
 
+# 8. Choose actual listed contracts to download using the study's sampling grid.
+# These functions use working copies; the vendor's raw tables stay unchanged.
 def normalize_chain(frame: pd.DataFrame, symbol: str, cfg: CollectorConfig) -> pd.DataFrame:
+    # The "chain" is the dated list of quoted option contracts. Convert its
+    # identities to comparable types and remove duplicate identities for selection.
     if frame.empty:
         return pd.DataFrame(columns=CONTRACT_FIELDS)
     chain = frame.loc[:, CONTRACT_FIELDS].copy()
@@ -761,6 +921,8 @@ def normalize_chain(frame: pd.DataFrame, symbol: str, cfg: CollectorConfig) -> p
 
 
 def stock_selection_references(frame: pd.DataFrame, day: pd.Timestamp, cfg: CollectorConfig) -> list[dict]:
+    # Produce up to three stock midpoints, each with its source quote and age.
+    # The midpoint is (bid + ask) / 2 and is used only to target option strikes.
     if frame.empty:
         return []
     # Only the stock spot used to choose strikes needs a usable quote. Raw storage
@@ -768,6 +930,8 @@ def stock_selection_references(frame: pd.DataFrame, day: pd.Timestamp, cfg: Coll
     quotes = frame.copy()
     quotes["_clock"] = parse_vendor_clock(quotes["timestamp"], cfg.exchange_tz)
     allowed = pd.Series(True, index=quotes.index)
+    # Apply the existing allowed-condition policy only to this stock lookup.
+    # Blank conditions are accepted; unlisted/non-numeric codes are excluded here.
     for column in ("bid_condition", "ask_condition"):
         text = quotes[column].astype("string").str.strip()
         allowed &= text.eq("") | pd.to_numeric(text, errors="coerce").isin([0, 1, 50])
@@ -777,8 +941,11 @@ def stock_selection_references(frame: pd.DataFrame, day: pd.Timestamp, cfg: Coll
     for selection_time in cfg.selection_times:
         at = pd.Timestamp(f"{day.date()} {selection_time}", tz=cfg.exchange_tz)
         if not opened <= at < closed:
+            # For example, a 15:00 reference is skipped on a 13:00 early close.
             continue
         prior = quotes.loc[quotes["_clock"].between(opened, at)]
+        # Never look forward for the stock price at a selection time. Use the
+        # latest allowed quote at or before it, then check its prices and age.
         if prior.empty:
             continue
         row = prior.iloc[-1]
@@ -794,6 +961,9 @@ def stock_selection_references(frame: pd.DataFrame, day: pd.Timestamp, cfg: Coll
 
 
 def eligible_expirations(day: pd.Timestamp, expirations, cfg: CollectorConfig) -> list[pd.Timestamp]:
+    # Restrict to the DTE window, then choose the nearest unused expiration for
+    # each target in order. Ties prefer shorter DTE. Removing each choice prevents
+    # two targets from selecting the same expiration twice.
     remaining = sorted(exp for exp in expirations if cfg.min_dte <= (exp - day).days <= cfg.max_dte)
     selected = []
     for target in cfg.target_dtes:
@@ -803,11 +973,14 @@ def eligible_expirations(day: pd.Timestamp, expirations, cfg: CollectorConfig) -
         selected.append(best)
         remaining.remove(best)
     remaining.sort(key=lambda exp: (min(abs((exp - day).days - target) for target in cfg.target_dtes), exp))
+    # If the cap leaves room, add other expirations nearest any target.
     return sorted(selected + remaining[:max(cfg.max_expirations_per_day - len(selected), 0)])
 
 
 def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[dict],
                      cfg: CollectorConfig) -> pd.DataFrame:
+    # For each chosen expiration, find listed strikes near each S/K target at
+    # each stock reference time. The output records both identity and why chosen.
     rows = []
     for expiration in eligible_expirations(day, chain["expiration"].unique(), cfg):
         family = chain.loc[chain["expiration"].eq(expiration)]
@@ -817,10 +990,14 @@ def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[di
             chosen = set()
             for target in cfg.moneyness_targets:
                 target_strike = reference["stock_mid"] / target
+                # Rearrange target = S/K to K = S/target. Rank listed strikes by
+                # dollar distance from K; equal distances prefer the lower strike.
                 ranked = sorted(strikes, key=lambda strike: (abs(strike - target_strike), strike))
                 chosen.update(ranked[:cfg.strikes_per_moneyness_target])
             chosen_by_time[reference["selection_time"]] = chosen
         selected = set().union(*chosen_by_time.values()) if chosen_by_time else set()
+        # Download the union across selection times once. Keep only call/put
+        # identities actually present in the dated chain; do not invent pairs.
         for contract in family.loc[family["strike"].isin(selected)].itertuples(index=False):
             expiry, strike = expiration.strftime("%Y-%m-%d"), format_strike(contract.strike)
             rows.append({"symbol": contract.symbol, "expiration": expiry, "strike": strike,
@@ -830,7 +1007,9 @@ def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[di
     return pd.DataFrame(rows, columns=SELECTION_COLUMNS)
 
 
-# Session manifests describe collection coverage; they contain no research features.
+# 9. Coordinate symbol-days, shared references, and coverage reports.
+# A session manifest is the small record connecting selected contracts to their
+# request receipts. It can be read without opening the much larger market tables.
 class Collector:
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
@@ -841,6 +1020,8 @@ class Collector:
         return self.directory / "sessions" / f"symbol={symbol}__date={day.date()}.json"
 
     def manifest_valid(self, manifest: dict) -> bool:
+        # A saved "complete" label alone is not enough to skip work. Check that
+        # the policy matches and every expected request/artifact is accounted for.
         try:
             if (manifest["output_schema_version"] != OUTPUT_SCHEMA_VERSION
                     or manifest["policy_id"] != self.cfg.policy_id
@@ -848,6 +1029,8 @@ class Collector:
                 return False
             records = manifest["requests"]
             selected_count = manifest["selected_contract_count"]
+            # Four base requests: stock quotes, dated chain, stock trades, stock EOD.
+            # Each selected option adds three: quotes, trades, and open interest.
             if (len(records) != 4 + 3 * selected_count
                     or len({r["request_id"] for r in records}) != len(records)
                     or manifest["contracts"]["rows"] != selected_count):
@@ -870,6 +1053,8 @@ class Collector:
             return False
 
     def resumable(self, symbol: str, day: pd.Timestamp) -> bool:
+        # True means this symbol-day can be skipped. False lets collect_day run
+        # again, while RequestStore still reuses its individually valid downloads.
         try:
             manifest = read_json(self.session_path(symbol, day))
             return (manifest.get("symbol") == symbol and manifest.get("trade_day") == str(day.date())
@@ -878,11 +1063,16 @@ class Collector:
             return False
 
     def collect_day(self, symbol_cfg: SymbolConfig, day: pd.Timestamp) -> dict:
+        # This is the main unit of collection: one underlying on one trading day.
+        # Its result is a manifest, while the large raw tables are saved separately.
         symbol = symbol_cfg.symbol
         records, references = [], []
         selected = pd.DataFrame(columns=SELECTION_COLUMNS)
         reason, error, discovered = "", "", 0
         try:
+            # Step 1: save the stock quotes needed for selection, plus the dated
+            # option universe. This universe describes quotes observed that day;
+            # it does not establish when each contract first became available.
             stock = self.store.collect(history_request(self.cfg, "stock", "quote", symbol, day))
             records.append(stock)
             # Discovery is independent of stock availability. Keep the dated
@@ -890,10 +1080,15 @@ class Collector:
             chain_record = self.store.collect(Request("quoted_contracts", "/option/list/contracts/quote",
                                               {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}))
             records.append(chain_record)
+            # Step 2: also save individual stock trades and the day's EOD record.
+            # Stock trades are retained independently of the quote sampling rate.
             for kind in ("trade_quote", "eod"):
                 records.append(self.store.collect(history_request(self.cfg, "stock", kind, symbol, day)))
             chain = normalize_chain(self.store.read(chain_record), symbol, self.cfg)
             discovered = len(chain)
+            # Step 3: obtain the stock references, then choose the option contracts.
+            # A chosen contract gets its requested whole-session history, even if
+            # a later selection time caused us to choose it.
             references = stock_selection_references(self.store.read(stock), day, self.cfg)
             selected = select_contracts(chain, day, references, self.cfg)
             if chain.empty:
@@ -902,6 +1097,8 @@ class Collector:
                 reason = "stock_selection_reference_unavailable"
             elif selected.empty:
                 reason = "no_contracts_in_sampling_window"
+            # Step 4: collect three data types per selected option concurrently.
+            # No trade-count, spread, or OI threshold removes a chosen contract.
             with ThreadPoolExecutor(max_workers=self.cfg.max_contract_workers) as pool:
                 futures = []
                 for contract in selected.to_dict("records"):
@@ -914,9 +1111,14 @@ class Collector:
             # Completed raw pulls survive; a failed day never satisfies resume.
             error = repr(exc)
         failures = sum(record["status"] not in GOOD_REQUEST_STATUSES for record in records)
+        # "unavailable" means selection yielded no contracts without a request
+        # error; reason explains why. "complete" means the requests finished,
+        # including any valid empty responses, not full observed market coverage.
         status = "request_error" if error or failures else ("unavailable" if selected.empty else "complete")
         contract_path = self.directory / "contracts" / f"symbol={symbol}__date={day.date()}.parquet"
         write_parquet(contract_path, selected)
+        # Step 5: record selection coverage and receipts. Times outside this
+        # day's session are not counted as missing selection references.
         opened, closed = session_bounds(day, self.cfg)
         scheduled = [at for at in self.cfg.selection_times
                      if opened <= pd.Timestamp(f"{day.date()} {at}", tz=self.cfg.exchange_tz) < closed]
@@ -937,7 +1139,11 @@ class Collector:
 
     def collect_references(self, symbols: list[SymbolConfig], start: str, end: str,
                            rate_symbols: list[str], run_id: str) -> list[dict]:
+        # Reference data has its own ledger because it serves many symbol-days.
+        # Keeping it separate avoids copying rates/VIX into each option table.
         records = []
+        # These notes travel with the data so later research can interpret units,
+        # missing values, and unverified coverage without relying on this script.
         ledger = {"vendor": "ThetaData", "start": start, "end": end,
                   "requested_rates": sorted(set(rate_symbols)), "rate_units": "percent",
                   "required_datasets": ["corporate_dividend", "corporate_split", "interest_rate_eod",
@@ -957,6 +1163,8 @@ class Collector:
                 try:
                     record = self.store.collect(request)
                 except Exception as exc:
+                    # Record the failed reference and continue the remaining pulls.
+                    # main() still reports a failed run; completed data is retained.
                     record = {"request_id": request.request_id, "dataset": request.dataset,
                               "status": "request_error", "error": repr(exc)}
                 records.append({**record, "params": request.params})
@@ -970,6 +1178,8 @@ class Collector:
         return records
 
     def collect_coverage(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex, run_id: str) -> dict:
+        # Ask "which dates does Theta list?" before requesting detailed history.
+        # anchors are the exchange sessions within the user's requested window.
         requests_to_make = [
             Request(f"stock_{kind}_dates", f"/stock/list/dates/{kind}", {"symbol": symbol.symbol, "format": "csv"})
             for symbol in symbols for kind in ("quote", "trade")
@@ -992,6 +1202,9 @@ class Collector:
                      .dropna() if "date" in frame else pd.Series(dtype="datetime64[ns]"))
             known = record["status"] in GOOD_REQUEST_STATUSES
             available = set(dates.dt.strftime("%Y-%m-%d"))
+            # None means the catalogue request failed, so we cannot know the gaps.
+            # [] means it succeeded and lists every requested session. A populated
+            # list names sessions that the vendor's catalogue does not include.
             missing = sorted(expected - available) if known else None
             row = {"symbol": request.params["symbol"], "dataset": request.dataset,
                    "status": ("listed" if not missing else "coverage_gap") if known else "request_error",
@@ -1017,6 +1230,9 @@ class Collector:
         return report
 
     def write_availability(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex) -> dict:
+        # Build a small CSV with one row per requested symbol-day. It summarizes
+        # manifests, including days never attempted, without loading raw tables.
+        # Counts/bytes describe saved artifacts, not unique economic events.
         path = self.directory / "availability.csv"
         columns = ("symbol", "trade_day", "status", "reason", "quoted_contract_count", "selected_contract_count",
                    "selection_reference_count", "missing_selection_times", "request_count", "request_error_count",
@@ -1049,7 +1265,10 @@ class Collector:
         return counts
 
 
+# 10. Command-line options and the overall run sequence.
 def package_versions() -> dict:
+    # Save library versions with each run so later differences can be traced to
+    # the code/environment as well as to the requested data.
     result = {}
     for package in ("pandas", "numpy", "pyarrow", "requests", "exchange-calendars"):
         try:
@@ -1060,6 +1279,8 @@ def package_versions() -> dict:
 
 
 def parse_run_scope(argv: list[str] | None = None):
+    # Translate command-line arguments into settings, symbols, and trading days.
+    # This performs no downloads or output writes, so --plan can stop here safely.
     defaults = CollectorConfig()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--symbols", nargs="+", type=str.upper, choices=[cfg.symbol for cfg in UNIVERSE])
@@ -1075,6 +1296,8 @@ def parse_run_scope(argv: list[str] | None = None):
     parser.add_argument("--rate-symbols", nargs="+", default=list(RATE_SYMBOLS), type=str.upper, choices=RATE_SYMBOLS,
                         help="Theta rate series to collect; defaults to SOFR and all documented Treasury tenors")
     modes = parser.add_mutually_exclusive_group()
+    # With neither special mode, collect date coverage, references, and panels.
+    # The special modes limit the work to one of those supporting collections.
     modes.add_argument("--references-only", action="store_true", help="Collect dividends, splits, rates, and VIX without stock/option panels")
     modes.add_argument("--coverage-only", action="store_true", help="Refresh stock/VIX available-date lists and report missing sessions")
     parser.add_argument("--plan", action="store_true", help="Show scope without network requests or output writes")
@@ -1092,11 +1315,15 @@ def parse_run_scope(argv: list[str] | None = None):
     except ValueError as exc:
         parser.error(str(exc))
     anchors = exchange_calendar().sessions_in_range(start, end).tz_localize(None)
+    # These are trading dates used as loop labels, not midnight market events.
+    # Weekends/holidays disappear here; actual intraday clocks stay timezone-aware.
     symbols = [cfg for cfg in UNIVERSE if args.symbols is None or cfg.symbol in args.symbols]
     return args, cfg, symbols, anchors
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Start reading here for execution order. "panels" means the stock/option
+    # observations organized by underlying and trading day, not fitted models.
     args, cfg, symbols, anchors = parse_run_scope(argv)
     panels = not (args.references_only or args.coverage_only)
     total = len(symbols) * len(anchors) if panels else 0
@@ -1108,9 +1335,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"Required references: dividends/splits, {len(set(args.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices")
     if args.plan:
+        # Preview ends before opening a network connection or creating output.
         return 0
     collector = Collector(cfg)
     run_id = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex[:8]
+    # A run ID identifies this invocation. A policy ID identifies selection rules;
+    # a request ID identifies one data pull. Reruns get new run records while
+    # sharing compatible saved requests and session manifests.
     run_path = collector.directory / "runs" / f"{run_id}.json"
     run = {"run_id": run_id, "started_at_utc": utc_now(), "status": "running", "data_vendor": "ThetaData",
            "policy_id": cfg.policy_id, "policy": cfg.policy(), "config": {**asdict(cfg), "output_dir": str(cfg.output_dir)},
@@ -1123,14 +1354,19 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     try:
         collector.store.client.ensure_available()
+        # Hold the output lock for the run, including shared reference writes.
         with output_lock(cfg.output_dir):
             write_json(run_path, run)
             try:
                 if not args.references_only:
+                    # First record vendor date availability. Observed gaps are
+                    # reported; they do not silently shorten the user's date range.
                     catalogue = collector.collect_coverage(symbols, anchors, run_id)
                     catalogue_errors, catalogue_gaps = catalogue["request_errors"], catalogue["series_with_gaps"]
                     run["date_catalogue"] = f"coverage/{run_id}.json"
                 if not args.coverage_only:
+                    # Fetch the common reference bundle before symbol-day work.
+                    # Successful reference pulls also reuse the ordinary raw cache.
                     references = collector.collect_references(symbols, args.start, args.end, args.rate_symbols, run_id)
                     reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES for r in references)
                     # A dividend/split endpoint can correctly return no events.
@@ -1139,6 +1375,8 @@ def main(argv: list[str] | None = None) -> int:
                                          for r in references)
                     run["reference_ledger"] = f"references/{run_id}.json"
                 if panels:
+                    # Advance one trading day at a time, overlapping its symbols.
+                    # Within each symbol, collect_day overlaps the option requests.
                     for day in anchors:
                         pending = []
                         for symbol in symbols:
@@ -1147,6 +1385,8 @@ def main(argv: list[str] | None = None) -> int:
                             else:
                                 pending.append(symbol)
                         with ThreadPoolExecutor(max_workers=cfg.max_symbol_day_workers) as pool:
+                            # Finished sessions were omitted from pending; an
+                            # incomplete session still reuses its valid raw downloads.
                             futures = {pool.submit(collector.collect_day, symbol, day): symbol for symbol in pending}
                             for future in as_completed(futures):
                                 symbol = futures[future]
@@ -1162,6 +1402,9 @@ def main(argv: list[str] | None = None) -> int:
                                     print(f"FAILED {symbol.symbol} {day.date()}: {exc!r}")
                 coverage = collector.write_availability(symbols, anchors) if panels else {}
                 run["coverage"] = coverage
+                # Failure takes priority over a known gap. Exit 0 only says our
+                # requests finished without detected gaps/errors; the reports do
+                # not establish completeness of all vendor history or reference data.
                 if failed or reference_failures or catalogue_errors:
                     exit_code = 1
                 elif reference_gaps or catalogue_gaps or coverage.get("unavailable", 0):
@@ -1171,6 +1414,8 @@ def main(argv: list[str] | None = None) -> int:
                 run["status"] = "interrupted"
                 raise
             finally:
+                # Also publish the run record on interruption so its status does
+                # not remain "running" after we have stopped handling this run.
                 run.update(finished_at_utc=utc_now(), failed_days=int(failed),
                            reference_failures=reference_failures, reference_gaps=reference_gaps,
                            catalogue_errors=catalogue_errors, catalogue_series_with_gaps=catalogue_gaps)
@@ -1192,4 +1437,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Run only when launched as a script. Importing this file exposes its helpers
+    # without starting collection; the returned integer becomes the process exit code.
     sys.exit(main())
