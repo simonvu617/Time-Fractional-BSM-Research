@@ -1,13 +1,14 @@
 """Historical stock/option collection, kept in one file for review.
 
 Python 3.11+; dependencies: exchange-calendars, numpy, pandas>=2, pyarrow, requests.
-Yahoo is optional: install yfinance only when using --yahoo-actions.
+ThetaData is the sole market/reference data vendor; there are no provider fallbacks.
 
 Examples (Theta Terminal v3 must be running for collection):
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval tick
-  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --references-only --rate-symbols SOFR
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --references-only
+  python collector.py --symbols SPY AAPL --start 2018-01-01 --end 2025-12-31 --coverage-only
 
 The default universe and DTE/S/K sampling grid are retained. Discovery uses the
 contracts quoted on each historical date, not today's chain. The three stock
@@ -27,7 +28,8 @@ Output (under --output-dir):
   collection/<policy-id>/contracts/<symbol-day>.parquet
   collection/<policy-id>/availability.csv
   collection/<policy-id>/runs/<run-id>.json
-  references/<run-id>.json (only when reference collection is requested)
+  references/<run-id>.json (dividends, splits, rates, VIX; standard collection)
+  coverage/<run-id>.json (vendor date lists and missing sessions; also --coverage-only)
 Successful raw requests are reused across policy changes. A day is resumable
 only after its selected-contract file and every referenced request are verified.
 "complete" means the requests finished, not that the vendor supplied full coverage.
@@ -38,15 +40,29 @@ Relevant pages under https://docs.thetadata.us/operations/:
   {stock,option}_history_{quote,trade_quote}.html
   option_list_contracts.html; option_history_open_interest.html
   stock_history_eod.html; interest_rate_history_eod.html
+Corporate-action schemas: /corporate_action/{dividend,split} in the OpenAPI spec.
 
 Limits: the quote universe is a date-wide observation, not an intraday listing
 snapshot. 1s quotes are samples; use --quote-interval tick for quote events when
 your subscription supports them. Requests cover the exchange's regular session.
 OI is requested on the report date and describes the previous session's close.
-Theta stock EOD is generated around 17:15 ET, not a 16:00 quote. Optional rate
-series retain vendor percentage units and report dates; no curve is inferred.
-Yahoo actions are an optional, unverified reference snapshot. Authoritative
-historical dividends and adjusted-contract deliverables remain unresolved.
+Theta EOD is generated around 17:15 ET, not a 16:00 quote. The reference bundle
+includes SOFR and every documented Treasury tenor, plus VIX EOD and intraday
+prices at the requested quote interval. Rates keep vendor percentage units and
+report dates; no discount curve is inferred. Corporate actions retain dates,
+missing amounts, distribution components, and split ratios (before / after).
+Action range filters use ex-dividend / effective dates, not announcement dates.
+Date-only reports never become fabricated publication timestamps or vintages.
+Index updates with unchanged prices can be omitted by Theta; absence of an index
+update is not a measurement of underlying trade inactivity.
+
+Coverage limits: Theta documents missing pre-2020 underlying history for SPY and
+other CTA-only symbols. --coverage-only queries current vendor date lists for
+each stock and VIX; it does not prove intraday completeness or plan entitlements.
+Adjusted option deliverables, historical symbol mappings, and reference-data
+vintages remain unverified. Missing records are never filled from another source.
+Exit status: 0 completed requests; 1 request/processing errors; 2 observed
+coverage gaps (including unavailable symbol-days or missing rate/index pulls).
 """
 
 import argparse
@@ -55,13 +71,14 @@ import hashlib
 import json
 import os
 import platform
+import socket
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
@@ -69,6 +86,7 @@ from io import BytesIO
 from pathlib import Path
 import re
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 import exchange_calendars as xcals
 import numpy as np
@@ -97,6 +115,17 @@ TRADE_FIELDS = ("trade_timestamp", "quote_timestamp", "sequence", "condition", "
                 "exchange", "price", *QUOTE_FIELDS)
 CONTRACT_FIELDS = ("symbol", "expiration", "strike", "right")
 SELECTION_COLUMNS = (*CONTRACT_FIELDS, "contract_key", "dte_days", "selection_times")
+RATE_SYMBOLS = ("SOFR", "TREASURY_M1", "TREASURY_M3", "TREASURY_M6", "TREASURY_Y1",
+                "TREASURY_Y2", "TREASURY_Y3", "TREASURY_Y5", "TREASURY_Y7",
+                "TREASURY_Y10", "TREASURY_Y20", "TREASURY_Y30")
+REFERENCE_COLUMNS = {
+    "interest_rate_eod": ("created", "rate"),
+    "corporate_dividend": ("announcement_date", "ex_dividend_date", "record_date", "payment_date",
+                           "amount", "event_code", "is_component", "distribution_type"),
+    "corporate_split": ("effective_date", "before_shares", "after_shares", "split_ratio", "event_code"),
+}
+REPORT_DATE_COLUMNS = {"interest_rate_eod": "created", "corporate_dividend": "ex_dividend_date",
+                       "corporate_split": "effective_date"}
 
 
 @dataclass(frozen=True)
@@ -181,7 +210,7 @@ class CollectorConfig:
             raise ValueError("Unsupported quote interval or stock venue")
 
     def policy(self) -> dict:
-        # Worker counts, scope, and optional reference providers do not change
+        # Worker counts, scope, and the separate reference bundle do not change
         # which contracts are selected or invalidate already collected sessions.
         names = ("option_rights", "target_dtes", "max_expirations_per_day", "moneyness_targets",
                  "strikes_per_moneyness_target", "min_dte", "max_dte", "exchange_tz",
@@ -200,7 +229,7 @@ class Request:
     dataset: str
     endpoint: str
     params: dict
-    vendor: str = "ThetaData"
+    vendor: str = field(default="ThetaData", init=False)
 
     def identity(self) -> dict:
         return asdict(self)
@@ -214,11 +243,12 @@ class Request:
         kind = self.endpoint.rsplit("/", 1)[-1]
         if self.dataset == "quoted_contracts":
             return CONTRACT_FIELDS
-        if self.vendor == "Yahoo":
-            return ("Date", "Dividends", "Stock Splits")
-        if self.dataset == "interest_rate_eod":
-            return ("created", "rate")
+        if self.dataset in REFERENCE_COLUMNS:
+            return REFERENCE_COLUMNS[self.dataset]
+        if "/list/dates" in self.endpoint:
+            return ("date",)
         fields = {"quote": ("timestamp", *QUOTE_FIELDS), "trade_quote": TRADE_FIELDS,
+                  "price": ("timestamp", "price"),
                   "open_interest": ("timestamp", "open_interest"),
                   "eod": ("created", "last_trade", "open", "high", "low", "close", "volume", "count")}
         return ((*CONTRACT_FIELDS,) if self.endpoint.startswith("/option/") else ()) + fields[kind]
@@ -355,6 +385,17 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
         diagnostics.update(invalid_bid_ask_rows=int((~np.isfinite(bid) | ~np.isfinite(ask)).sum()),
                            nonpositive_bid_ask_rows=int((bid.le(0) | ask.le(0)).sum()),
                            crossed_quote_rows=int(bid.gt(ask).sum()))
+    report_date = REPORT_DATE_COLUMNS.get(request.dataset)
+    if report_date and report_date in frame:
+        dates = pd.to_datetime(frame[report_date].astype("string").str.strip(), format="mixed", errors="coerce")
+        diagnostics["report_dates"] = {
+            "column": report_date, "unparseable_or_missing": int(dates.isna().sum()),
+            "first": str(dates.min().date()) if dates.notna().any() else None,
+            "last": str(dates.max().date()) if dates.notna().any() else None,
+            "unique_count": int(dates.nunique()), "publication_time_verified": False,
+        }
+    if request.dataset == "corporate_dividend" and "amount" in frame:
+        diagnostics["unknown_dividend_amount_rows"] = int(frame["amount"].astype("string").str.strip().eq("").sum())
     if request.endpoint.endswith("/quote") and "collector_timestamp_utc" in result:
         interval = request.params.get("interval", "tick")
         if interval != "tick":
@@ -389,17 +430,22 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
             issues.append("unexpected_contract_identity")
     start = request.params.get("date", request.params.get("start_date"))
     end = request.params.get("date", request.params.get("end_date"))
-    primary = next((name for name in ("timestamp", "trade_timestamp", "created") if name in frame), None)
-    if start and end and primary:
-        if request.dataset == "interest_rate_eod":
+    report_date = REPORT_DATE_COLUMNS.get(request.dataset)
+    if "/list/dates" in request.endpoint:
+        report_date = "date"
+    primary = report_date or next((name for name in ("timestamp", "trade_timestamp", "created") if name in frame), None)
+    if primary and primary in frame:
+        if report_date:
             dates = pd.to_datetime(frame[primary].str.strip(), format="mixed", errors="coerce")
         else:
             dates = parse_vendor_clock(frame[primary], cfg.exchange_tz).dt.tz_convert(
                 cfg.exchange_tz).dt.tz_localize(None).dt.normalize()
-        if (dates.notna() & ~dates.between(pd.Timestamp(start), pd.Timestamp(end))).any():
+        if start and end and (dates.notna() & ~dates.between(pd.Timestamp(start), pd.Timestamp(end))).any():
             issues.append("timestamps_outside_requested_dates")
         if dates.isna().all():
             issues.append("no_parseable_report_dates")
+        elif report_date and dates.isna().any():
+            issues.append("invalid_report_dates")
     return issues
 
 
@@ -424,6 +470,15 @@ class ThetaClient:
         self.semaphore = threading.BoundedSemaphore(cfg.max_inflight_requests)
         self.pace_lock = threading.Lock()
         self.next_allowed = 0.0
+
+    def ensure_available(self) -> None:
+        # Fail once before scheduling years of requests against an offline terminal.
+        address = urlsplit(self.cfg.base_url)
+        try:
+            with socket.create_connection((address.hostname, address.port or (443 if address.scheme == "https" else 80)), timeout=2):
+                pass
+        except OSError as exc:
+            raise RuntimeError(f"Theta Terminal is unreachable at {self.cfg.base_url}. Start it and rerun.") from exc
 
     def session(self) -> requests.Session:
         if not hasattr(self.local, "session"):
@@ -506,7 +561,7 @@ class RequestStore:
                 return None
             if meta.get("payload") and not artifact_valid(meta["payload"], self.root):
                 return None
-            if self.cfg.store_raw_payloads and request.vendor == "ThetaData" and not meta.get("payload"):
+            if self.cfg.store_raw_payloads and not meta.get("payload"):
                 return None
             return self.record(request, meta, path)
         except (OSError, ValueError, KeyError, TypeError):
@@ -518,13 +573,11 @@ class RequestStore:
                 "error": meta.get("error", ""), "data": meta.get("data"),
                 "payload": meta.get("payload"), "metadata": file_receipt(meta_path, self.root)}
 
-    def collect(self, request: Request) -> dict:
+    def collect(self, request: Request, *, refresh: bool = False) -> dict:
         with self.locks[hash(request.request_id) % len(self.locks)]:
-            cached = self.cached(request)
+            cached = None if refresh else self.cached(request)
             if cached:
                 return cached
-            if request.vendor == "Yahoo":
-                return self.collect_yahoo(request)
             legacy = self.legacy_response(request)
             if legacy is not None:
                 frame, response_meta, payload = legacy
@@ -631,25 +684,6 @@ class RequestStore:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def collect_yahoo(self, request: Request) -> dict:
-        # Separate, explicitly requested reference snapshot. Yahoo never supplies
-        # a required field to the Theta collection or an inferred zero dividend.
-        try:
-            import yfinance as yf
-            history = yf.Ticker(request.params["symbol"]).history(
-                start=request.params["start_date"],
-                end=(pd.Timestamp(request.params["end_date"]) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                auto_adjust=False, back_adjust=False, actions=True, repair=False,
-                keepna=True, rounding=False, raise_errors=True)
-            frame = history.reset_index()
-            meta = {"fetched_at_utc": utc_now(), "package_version": version("yfinance"),
-                    "reference_only": True, "historical_vintages_verified": False,
-                    "empty_does_not_prove_no_actions": True}
-            return self.save(request, frame, meta)
-        except Exception as exc:
-            return self.save(request, pd.DataFrame(columns=request.required_columns),
-                             {"error": repr(exc), "reference_only": True}, status="request_error")
-
     def read(self, record: dict) -> pd.DataFrame:
         if record["status"] not in GOOD_REQUEST_STATUSES or not record.get("data"):
             return pd.DataFrame()
@@ -675,9 +709,9 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
             raise ValueError("Option history requires an observed contract")
         params.update(expiration=contract["expiration"], strike=format_strike(contract["strike"]),
                       right=contract["right"])
-    if kind == "quote":
+    if kind in {"quote", "price"}:
         params["interval"] = cfg.quote_interval
-        dataset = f"{asset}_quotes_{cfg.quote_interval}"
+        dataset = f"{asset}_{kind}s_{cfg.quote_interval}"
     elif kind == "trade_quote":
         params["exclusive"] = str(cfg.trade_quote_exclusive).lower()
         dataset = f"{asset}_trade_quotes_tick"
@@ -692,6 +726,21 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
         if asset == "stock":
             params["venue"] = cfg.stock_venue
     return Request(dataset, f"/{asset}/history/{kind}", params)
+
+
+def reference_requests(cfg: CollectorConfig, symbols: list[SymbolConfig], start: str, end: str,
+                       rate_symbols: list[str]):
+    """One Theta-only bundle. Rates/actions are date reports; VIX prices are intraday."""
+    window = {"start_date": start, "end_date": end, "format": "csv"}
+    for symbol in symbols:
+        for kind in ("dividend", "split"):
+            yield Request(f"corporate_{kind}", f"/corporate_action/{kind}", {"symbol": symbol.symbol, **window})
+    for symbol in sorted(set(rate_symbols)):
+        yield Request("interest_rate_eod", "/interest_rate/history/eod", {"symbol": symbol, **window})
+    yield Request("index_eod", "/index/history/eod", {"symbol": "VIX", **window})
+    for day in exchange_calendar().sessions_in_range(start, end).tz_localize(None):
+        # Sub-minute index history must be requested one day at a time.
+        yield history_request(cfg, "index", "price", "VIX", day)
 
 
 def normalize_chain(frame: pd.DataFrame, symbol: str, cfg: CollectorConfig) -> pd.DataFrame:
@@ -887,34 +936,85 @@ class Collector:
         return manifest
 
     def collect_references(self, symbols: list[SymbolConfig], start: str, end: str,
-                           rate_symbols: list[str], yahoo_actions: bool, run_id: str) -> list[dict]:
-        requests_to_make = [
-            Request("interest_rate_eod", "/interest_rate/history/eod",
-                    {"symbol": symbol, "start_date": start, "end_date": end, "format": "csv"})
-            for symbol in sorted(set(rate_symbols))
-        ]
-        if yahoo_actions:
-            requests_to_make.extend(
-                Request("yahoo_actions_reference", "Ticker.history",
-                        {"symbol": symbol.symbol, "start_date": start, "end_date": end}, vendor="Yahoo")
-                for symbol in symbols)
+                           rate_symbols: list[str], run_id: str) -> list[dict]:
         records = []
+        ledger = {"vendor": "ThetaData", "start": start, "end": end,
+                  "requested_rates": sorted(set(rate_symbols)), "rate_units": "percent",
+                  "required_datasets": ["corporate_dividend", "corporate_split", "interest_rate_eod",
+                                        "index_eod", f"index_prices_{self.cfg.quote_interval}"],
+                  "rate_publication_timestamps_verified": False,
+                  "corporate_action_range_filters": {"dividend": "ex_dividend_date", "split": "effective_date"},
+                  "missing_dividend_amounts": "unknown; not zero", "split_ratio": "before_shares / after_shares",
+                  "empty_actions_prove_complete_event_coverage": False,
+                  "index_unchanged_updates_may_be_omitted": True,
+                  "adjusted_contract_deliverables": "not_documented_by_Theta; not_inferred",
+                  "historical_symbol_mappings": "not_verified"}
+        path = self.cfg.output_dir / "references" / f"{run_id}.json"
+        def publish():
+            write_json(path, {**ledger, "updated_at_utc": utc_now(), "requests": records})
+        try:
+            for request in reference_requests(self.cfg, symbols, start, end, rate_symbols):
+                try:
+                    record = self.store.collect(request)
+                except Exception as exc:
+                    record = {"request_id": request.request_id, "dataset": request.dataset,
+                              "status": "request_error", "error": repr(exc)}
+                records.append({**record, "params": request.params})
+                # Raw receipts are committed per request. Batch this progress file
+                # so a multi-year VIX run does not rewrite it thousands of times.
+                if len(records) % 25 == 0 or record["status"] not in GOOD_REQUEST_STATUSES:
+                    publish()
+                print(f"Reference {request.params['symbol']} {request.dataset}: {record['status']}")
+        finally:
+            publish()
+        return records
+
+    def collect_coverage(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex, run_id: str) -> dict:
+        requests_to_make = [
+            Request(f"stock_{kind}_dates", f"/stock/list/dates/{kind}", {"symbol": symbol.symbol, "format": "csv"})
+            for symbol in symbols for kind in ("quote", "trade")
+        ]
+        requests_to_make.append(Request("index_price_dates", "/index/list/dates", {"symbol": "VIX", "format": "csv"}))
+        expected = set(anchors.strftime("%Y-%m-%d"))
+        rows, records = [], []
         for request in requests_to_make:
             try:
-                record = self.store.collect(request)
+                # Catalogues may expand as Theta backfills older history. Refresh
+                # just these small lists; history requests remain independently cached.
+                record = self.store.collect(request, refresh=True)
+                frame = self.store.read(record)
             except Exception as exc:
+                frame = pd.DataFrame()
                 record = {"request_id": request.request_id, "dataset": request.dataset,
                           "status": "request_error", "error": repr(exc)}
-            records.append(record)
-            # The ledger is separate: reference failures do not invalidate Theta days.
-            write_json(self.cfg.output_dir / "references" / f"{run_id}.json",
-                       {"updated_at_utc": utc_now(), "requests": records,
-                        "requested_rates": sorted(set(rate_symbols)), "rate_units": "percent",
-                        "rate_publication_timestamps_verified": False,
-                        "yahoo_actions_requested": yahoo_actions,
-                        "authoritative_adjusted_contract_deliverables": "not_collected"})
-            print(f"Reference {request.params['symbol']} {request.dataset}: {record['status']}")
-        return records
+            records.append({**record, "params": request.params})
+            dates = (pd.to_datetime(frame["date"].astype("string").str.strip(), format="mixed", errors="coerce")
+                     .dropna() if "date" in frame else pd.Series(dtype="datetime64[ns]"))
+            known = record["status"] in GOOD_REQUEST_STATUSES
+            available = set(dates.dt.strftime("%Y-%m-%d"))
+            missing = sorted(expected - available) if known else None
+            row = {"symbol": request.params["symbol"], "dataset": request.dataset,
+                   "status": ("listed" if not missing else "coverage_gap") if known else "request_error",
+                   "first_available": str(dates.min().date()) if len(dates) else None,
+                   "last_available": str(dates.max().date()) if len(dates) else None,
+                   "requested_sessions": len(expected),
+                   "listed_requested_sessions": len(expected & available) if known else None,
+                   "missing_requested_dates": missing, "error": record.get("error", "")}
+            rows.append(row)
+            print(f"Coverage {row['symbol']} {row['dataset']}: {row['status']}")
+        report = {"vendor": "ThetaData", "checked_at_utc": utc_now(), "rows": rows, "requests": records,
+                  "request_errors": sum(row["status"] == "request_error" for row in rows),
+                  "series_with_gaps": sum(row["status"] == "coverage_gap" for row in rows),
+                  "proves_interval_or_subscription_access": False,
+                  "proves_complete_intraday_records": False,
+                  "scope": "stock quote/trade and VIX date catalogues; option coverage is recorded during collection",
+                  "documented_limits": {
+                      "SPY_underlying_history_before_2020": "unavailable per Theta documentation",
+                      "other_CTA_only_symbols": "pre-2020 underlying history may be unavailable",
+                      "reference_and_adjusted_contract_completeness": "not established by date catalogues"},
+                  "documentation": "https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html"}
+        write_json(self.cfg.output_dir / "coverage" / f"{run_id}.json", report)
+        return report
 
     def write_availability(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex) -> dict:
         path = self.directory / "availability.csv"
@@ -951,7 +1051,7 @@ class Collector:
 
 def package_versions() -> dict:
     result = {}
-    for package in ("pandas", "numpy", "pyarrow", "requests", "exchange-calendars", "yfinance"):
+    for package in ("pandas", "numpy", "pyarrow", "requests", "exchange-calendars"):
         try:
             result[package] = version(package)
         except PackageNotFoundError:
@@ -972,10 +1072,11 @@ def parse_run_scope(argv: list[str] | None = None):
     parser.add_argument("--max-inflight-requests", type=int, default=defaults.max_inflight_requests,
                         help="Set within your Theta subscription's concurrency allowance")
     parser.add_argument("--max-requests-per-second", type=float, default=defaults.max_requests_per_second)
-    parser.add_argument("--rate-symbols", nargs="+", default=[], type=str.upper,
-                        help="Optional Theta rate series, e.g. SOFR; no default rate is assumed")
-    parser.add_argument("--yahoo-actions", action="store_true", help="Optional Yahoo daily history/actions reference")
-    parser.add_argument("--references-only", action="store_true", help="Fetch only the explicitly requested references")
+    parser.add_argument("--rate-symbols", nargs="+", default=list(RATE_SYMBOLS), type=str.upper, choices=RATE_SYMBOLS,
+                        help="Theta rate series to collect; defaults to SOFR and all documented Treasury tenors")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--references-only", action="store_true", help="Collect dividends, splits, rates, and VIX without stock/option panels")
+    modes.add_argument("--coverage-only", action="store_true", help="Refresh stock/VIX available-date lists and report missing sessions")
     parser.add_argument("--plan", action="store_true", help="Show scope without network requests or output writes")
     args = parser.parse_args(argv)
     try:
@@ -984,10 +1085,6 @@ def parse_run_scope(argv: list[str] | None = None):
         start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
         if not pd.Timestamp(defaults.start_date) <= start <= end <= pd.Timestamp(defaults.end_date):
             raise ValueError(f"Dates must be ordered and within {defaults.start_date} through {defaults.end_date}")
-        if any(not re.fullmatch(r"[A-Z][A-Z0-9_.-]{0,31}", symbol) for symbol in args.rate_symbols):
-            raise ValueError("Rate symbols must be explicit series names")
-        if args.references_only and not (args.rate_symbols or args.yahoo_actions):
-            raise ValueError("--references-only requires --rate-symbols or --yahoo-actions")
         cfg = replace(defaults, quote_interval=args.quote_interval, output_dir=args.output_dir.expanduser().resolve(),
                       store_raw_payloads=args.store_raw_payloads, refresh_no_data=args.refresh_no_data,
                       max_inflight_requests=args.max_inflight_requests,
@@ -1001,29 +1098,47 @@ def parse_run_scope(argv: list[str] | None = None):
 
 def main(argv: list[str] | None = None) -> int:
     args, cfg, symbols, anchors = parse_run_scope(argv)
-    total = 0 if args.references_only else len(symbols) * len(anchors)
+    panels = not (args.references_only or args.coverage_only)
+    total = len(symbols) * len(anchors) if panels else 0
     print(f"Scope: {', '.join(s.symbol for s in symbols)}; {args.start} to {args.end}; {total} symbol-days")
-    print(f"Quotes: {cfg.quote_interval}; trades: events with matched quotes; stock venue: {cfg.stock_venue}")
+    print(f"Vendor: ThetaData; quotes: {cfg.quote_interval}; trades: events with matched quotes; stock venue: {cfg.stock_venue}")
     print(f"Output: {cfg.output_dir}")
-    print(f"Optional references: rates={','.join(args.rate_symbols) or 'none'}, Yahoo actions={args.yahoo_actions}")
+    if args.coverage_only:
+        print("Coverage mode: available dates for stock quotes/trades and VIX; no history downloads")
+    else:
+        print(f"Required references: dividends/splits, {len(set(args.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices")
     if args.plan:
         return 0
     collector = Collector(cfg)
     run_id = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex[:8]
     run_path = collector.directory / "runs" / f"{run_id}.json"
-    run = {"run_id": run_id, "started_at_utc": utc_now(), "status": "running",
+    run = {"run_id": run_id, "started_at_utc": utc_now(), "status": "running", "data_vendor": "ThetaData",
            "policy_id": cfg.policy_id, "policy": cfg.policy(), "config": {**asdict(cfg), "output_dir": str(cfg.output_dir)},
            "scope": {"symbols": [s.symbol for s in symbols], "start": args.start, "end": args.end,
-                     "references_only": args.references_only, "rate_symbols": args.rate_symbols,
-                     "yahoo_actions": args.yahoo_actions},
+                     "references_only": args.references_only, "coverage_only": args.coverage_only,
+                     "rate_symbols": args.rate_symbols},
            "code_sha256": file_hash(Path(__file__)), "python": sys.version, "platform": platform.platform(),
            "packages": package_versions(), "resumed_days": 0, "processed_days": 0}
-    failed = reference_failures = 0
+    failed = reference_failures = reference_gaps = catalogue_errors = catalogue_gaps = 0
+    exit_code = 0
     try:
+        collector.store.client.ensure_available()
         with output_lock(cfg.output_dir):
             write_json(run_path, run)
             try:
                 if not args.references_only:
+                    catalogue = collector.collect_coverage(symbols, anchors, run_id)
+                    catalogue_errors, catalogue_gaps = catalogue["request_errors"], catalogue["series_with_gaps"]
+                    run["date_catalogue"] = f"coverage/{run_id}.json"
+                if not args.coverage_only:
+                    references = collector.collect_references(symbols, args.start, args.end, args.rate_symbols, run_id)
+                    reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES for r in references)
+                    # A dividend/split endpoint can correctly return no events.
+                    # Missing price/rate history is a coverage gap, not a zero.
+                    reference_gaps = sum(r["status"] == "no_data" and not r["dataset"].startswith("corporate_")
+                                         for r in references)
+                    run["reference_ledger"] = f"references/{run_id}.json"
+                if panels:
                     for day in anchors:
                         pending = []
                         for symbol in symbols:
@@ -1045,27 +1160,35 @@ def main(argv: list[str] | None = None) -> int:
                                 except Exception as exc:
                                     failed += 1
                                     print(f"FAILED {symbol.symbol} {day.date()}: {exc!r}")
-                references = collector.collect_references(
-                    symbols, args.start, args.end, args.rate_symbols, args.yahoo_actions, run_id)
-                reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES for r in references)
-                run["status"] = "partial_failure" if failed or reference_failures else "complete"
+                coverage = collector.write_availability(symbols, anchors) if panels else {}
+                run["coverage"] = coverage
+                if failed or reference_failures or catalogue_errors:
+                    exit_code = 1
+                elif reference_gaps or catalogue_gaps or coverage.get("unavailable", 0):
+                    exit_code = 2
+                run["status"] = {0: "complete", 1: "partial_failure", 2: "coverage_gaps"}[exit_code]
             except BaseException:
                 run["status"] = "interrupted"
                 raise
             finally:
-                run.update(finished_at_utc=utc_now(), failed_days=int(failed), reference_failures=reference_failures)
-                if not args.references_only:
-                    run["coverage"] = collector.write_availability(symbols, anchors)
+                run.update(finished_at_utc=utc_now(), failed_days=int(failed),
+                           reference_failures=reference_failures, reference_gaps=reference_gaps,
+                           catalogue_errors=catalogue_errors, catalogue_series_with_gaps=catalogue_gaps)
                 write_json(run_path, run)
     except (RuntimeError, OSError, KeyboardInterrupt) as exc:
         print(f"Collector stopped: {exc}", file=sys.stderr)
         return 1
     print(f"Finished: {run['processed_days']} processed, {run['resumed_days']} resumed, "
-          f"{failed} failed days, {reference_failures} failed references")
+          f"{failed} failed days, {reference_failures} failed reference requests, "
+          f"{reference_gaps + catalogue_gaps} reference/catalogue gaps")
     print(f"Run record: {run_path}")
-    if not args.references_only:
-        print(f"Coverage: {collector.directory / 'availability.csv'}")
-    return 1 if failed or reference_failures else 0
+    if run.get("date_catalogue"):
+        print(f"Date coverage: {cfg.output_dir / run['date_catalogue']}")
+    if run.get("reference_ledger"):
+        print(f"Theta references: {cfg.output_dir / run['reference_ledger']}")
+    if panels:
+        print(f"Panel coverage: {collector.directory / 'availability.csv'}")
+    return exit_code
 
 
 if __name__ == "__main__":
