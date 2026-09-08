@@ -50,7 +50,8 @@ Each request has metadata, a checksum, retrieval time, and coverage diagnostics.
 No pricing, waiting-time features, regimes, sample filters, or yield proxies run.
 
 Output (under --output-dir):
-  raw_cache/<dataset>/.../request=<id>/{data.parquet,meta.json}
+  raw_cache/<dataset>/.../request=<id>/latest.json (last successful response)
+  raw_cache/<dataset>/.../request=<id>/responses/<id>/{data.parquet,meta.json}
   collection/<policy-id>/sessions/<symbol-day>.json
   collection/<policy-id>/contracts/<symbol-day>.parquet
   collection/<policy-id>/availability.csv
@@ -59,8 +60,13 @@ Output (under --output-dir):
   coverage/<run-id>.json (vendor date lists and missing sessions; also --coverage-only)
 Successful raw requests are reused across policy changes. A day is resumable
 only after its selected-contract file and every referenced request are verified.
+Refreshes save a new response; earlier run receipts continue to identify the
+exact files they used. Failed refreshes never replace the last successful cache.
 "complete" means the requests finished, not that the vendor supplied full coverage.
 "no_data" is retained separately from request errors. --refresh-no-data retries it.
+Permission/configuration failures stop new requests; temporary connection errors
+get bounded retries. Ctrl+C cancels queued work while active requests finish or
+time out. Handled interruptions still publish coverage and run records.
 
 Official API specification: https://docs.thetadata.us/openapiv3.yaml
 Relevant pages under https://docs.thetadata.us/operations/:
@@ -68,6 +74,7 @@ Relevant pages under https://docs.thetadata.us/operations/:
   option_list_contracts.html; option_history_open_interest.html
   stock_history_eod.html; interest_rate_history_eod.html
 Corporate-action schemas: /corporate_action/{dividend,split} in the OpenAPI spec.
+Error codes: https://docs.thetadata.us/Articles/Errors-Exchanges-Conditions/Error-Codes.html
 
 Limits: the quote universe is a date-wide observation, not an intraday listing
 snapshot. 1s quotes are samples; use --quote-interval tick for quote events when
@@ -569,6 +576,10 @@ def format_strike(value) -> str:
 
 # 5. Talk to Theta Terminal: connections, shared request limits, and retries.
 # This layer returns bytes plus HTTP details. Parsing and saving happen below.
+class CollectionStopped(RuntimeError):
+    """Stop scheduling work while retaining requests that already finished."""
+
+
 class ThetaClient:
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
@@ -576,6 +587,19 @@ class ThetaClient:
         self.semaphore = threading.BoundedSemaphore(cfg.max_inflight_requests)
         self.pace_lock = threading.Lock()
         self.next_allowed = 0.0
+        self.stop_event = threading.Event()
+        self.stop_reason = ""
+
+    def stop(self, reason: str) -> None:
+        # The first cause explains the stop; other workers should not overwrite it.
+        with self.pace_lock:
+            if not self.stop_event.is_set():
+                self.stop_reason = reason
+                self.stop_event.set()
+
+    def check_running(self) -> None:
+        if self.stop_event.is_set():
+            raise CollectionStopped(self.stop_reason)
 
     def ensure_available(self) -> None:
         # Fail once before scheduling years of requests against an offline terminal.
@@ -603,12 +627,16 @@ class ThetaClient:
     def request_slot(self):
         # Two separate limits: the semaphore caps unfinished requests, while
         # next_allowed spaces out starts across all workers, including retries.
+        self.check_running()
         with self.semaphore:
+            self.check_running()
             with self.pace_lock:
                 wait = max(0.0, self.next_allowed - time.monotonic())
                 self.next_allowed = max(time.monotonic(), self.next_allowed) + 1 / self.cfg.max_requests_per_second
-            if wait:
-                time.sleep(wait)
+            # Waiting workers wake promptly on cancellation, instead of starting
+            # another HTTP request after the user or another worker stopped the run.
+            self.stop_event.wait(wait)
+            self.check_running()
             yield
 
     def download(self, request: Request) -> tuple[bytes | None, dict]:
@@ -636,6 +664,12 @@ class ThetaClient:
                     return payload, meta
                 meta["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
                 if response.status_code not in {429, 474, 500, 502, 503, 504, 571} or attempt == 5:
+                    # Permissions, invalid parameters, and terminal configuration
+                    # need action, not thousands more requests. Sustained terminal
+                    # disconnections/rate-limit failures also stop new work.
+                    if response.status_code in {400, 401, 403, 404, 429, 471, 473, 474, 475, 476, 478, 571}:
+                        self.stop(f"Theta HTTP {response.status_code} for {request.endpoint}: "
+                                  "check Theta access, terminal state, and request settings, then rerun.")
                     return payload, meta
                 try:
                     retry_after = float(response.headers.get("Retry-After", 0))
@@ -645,10 +679,12 @@ class ThetaClient:
                 payload = None
                 meta = {"error": repr(exc), "attempts": attempt + 1, "status_code": None}
                 if attempt == 5:
+                    self.stop(f"Theta connection failed after six attempts for {request.endpoint}; rerun when it is available.")
                     return payload, meta
             # Increase the delay between attempts, considering Theta's requested
             # Retry-After delay too. Both delays are bounded by the limits below.
-            time.sleep(max(min(30.0, 2 ** attempt), min(max(retry_after, 0), 120.0)))
+            self.stop_event.wait(max(min(30.0, 2 ** attempt), min(max(retry_after, 0), 120.0)))
+            self.check_running()
         return None, meta
 
 
@@ -677,6 +713,14 @@ class RequestStore:
         # a file is insufficient: settings, status, and saved artifacts must agree.
         path = self.directory(request) / "meta.json"
         try:
+            # latest.json points to an immutable response. Older collector caches
+            # used meta.json directly; keep reading those without moving their files.
+            index = path.with_name("latest.json")
+            if index.exists():
+                receipt = read_json(index)["metadata"]
+                if not artifact_valid(receipt, self.root):
+                    return None
+                path = self.root / receipt["path"]
             meta = read_json(path)
             if (meta["request"] != request.identity() or meta["raw_schema_version"] != RAW_SCHEMA_VERSION
                     or meta["status"] not in GOOD_REQUEST_STATUSES
@@ -699,13 +743,16 @@ class RequestStore:
         # remain in the request's meta.json instead of being copied everywhere.
         return {"request_id": request.request_id, "dataset": request.dataset,
                 "status": meta["status"], "row_count": meta.get("row_count", 0),
+                "status_code": meta.get("status_code"),
                 "error": meta.get("error", ""), "data": meta.get("data"),
                 "payload": meta.get("payload"), "metadata": file_receipt(meta_path, self.root)}
 
     def collect(self, request: Request, *, refresh: bool = False) -> dict:
         # Order: reuse current cache -> import a compatible older cache -> download.
         # Date-catalogue refreshes skip current cache reuse to see newly added dates.
+        self.client.check_running()
         with self.locks[hash(request.request_id) % len(self.locks)]:
+            self.client.check_running()
             cached = None if refresh else self.cached(request)
             if cached:
                 return cached
@@ -738,7 +785,10 @@ class RequestStore:
              payload: bytes | None = None, status: str | None = None) -> dict:
         # Save the table even when it is empty or invalid, with an explicit status.
         # Retained evidence lets us distinguish absent data from a broken request.
-        directory = self.directory(request)
+        # Every actual attempt gets new files, including failures. Overwriting
+        # data.parquet in place would change data referenced by an earlier run.
+        cache_directory = self.directory(request)
+        directory = cache_directory / "responses" / uuid4().hex
         missing = set(request.required_columns) - set(frame.columns)
         # collector_ is reserved for our added fields, so a vendor field cannot
         # silently masquerade as one of our parsed timestamps.
@@ -775,10 +825,14 @@ class RequestStore:
             with atomic_output(payload_path) as temp:
                 temp.write_bytes(payload)
             meta["payload"] = file_receipt(payload_path, self.root)
-        # Publish metadata after its files exist: it acts as the receipt linking
-        # this request to the saved table, quality counts, and optional response.
+        # Publish this attempt's receipt after its files exist, then atomically
+        # advance the cache pointer only on success. A failed refresh remains
+        # visible to its caller without destroying the previous good response.
         write_json(directory / "meta.json", meta)
-        return self.record(request, meta, directory / "meta.json")
+        record = self.record(request, meta, directory / "meta.json")
+        if status in GOOD_REQUEST_STATUSES:
+            write_json(cache_directory / "latest.json", {"metadata": record["metadata"]})
+        return record
 
     def legacy_response(self, request: Request):
         """Reuse valid pre-refactor raw quotes/OI/chains without changing old files."""
@@ -1016,6 +1070,20 @@ class Collector:
         self.store = RequestStore(cfg)
         self.directory = cfg.output_dir / "collection" / cfg.policy_id
 
+    @contextmanager
+    def workers(self, count: int):
+        # ThreadPoolExecutor normally finishes its entire queue on interruption.
+        # Stop new HTTP work and cancel queued tasks instead; active requests can
+        # finish saving their responses before the output lock is released.
+        pool = ThreadPoolExecutor(max_workers=count)
+        try:
+            yield pool
+        except BaseException as exc:
+            self.store.client.stop(str(exc) or "Collection interrupted by the user.")
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
     def session_path(self, symbol: str, day: pd.Timestamp) -> Path:
         return self.directory / "sessions" / f"symbol={symbol}__date={day.date()}.json"
 
@@ -1099,14 +1167,23 @@ class Collector:
                 reason = "no_contracts_in_sampling_window"
             # Step 4: collect three data types per selected option concurrently.
             # No trade-count, spread, or OI threshold removes a chosen contract.
-            with ThreadPoolExecutor(max_workers=self.cfg.max_contract_workers) as pool:
+            with self.workers(self.cfg.max_contract_workers) as pool:
                 futures = []
                 for contract in selected.to_dict("records"):
                     for kind in ("quote", "trade_quote", "open_interest"):
                         request = history_request(self.cfg, "option", kind, symbol, day, contract)
                         futures.append(pool.submit(self.store.collect, request))
                 for future in as_completed(futures):
-                    records.append(future.result())
+                    try:
+                        records.append(future.result())
+                    except CollectionStopped as exc:
+                        # Another worker can notice the stop before the triggering
+                        # request finishes saving. Drain results so its receipt and
+                        # other completed downloads still enter the session manifest.
+                        error = repr(exc)
+                    except Exception as exc:
+                        error = repr(exc)
+                        self.store.client.stop(f"Unable to finish an option request: {exc}")
         except Exception as exc:
             # Completed raw pulls survive; a failed day never satisfies resume.
             error = repr(exc)
@@ -1135,6 +1212,7 @@ class Collector:
                     "request_error_count": failures, "expected_request_count": 4 + 3 * len(selected)}
         # Publish last. The manifest references exact artifacts, not a filename glob.
         write_json(self.session_path(symbol, day), manifest)
+        self.store.client.check_running()
         return manifest
 
     def collect_references(self, symbols: list[SymbolConfig], start: str, end: str,
@@ -1160,8 +1238,12 @@ class Collector:
             write_json(path, {**ledger, "updated_at_utc": utc_now(), "requests": records})
         try:
             for request in reference_requests(self.cfg, symbols, start, end, rate_symbols):
+                if self.store.client.stop_event.is_set():
+                    break
                 try:
                     record = self.store.collect(request)
+                except CollectionStopped:
+                    break
                 except Exception as exc:
                     # Record the failed reference and continue the remaining pulls.
                     # main() still reports a failed run; completed data is retained.
@@ -1187,46 +1269,55 @@ class Collector:
         requests_to_make.append(Request("index_price_dates", "/index/list/dates", {"symbol": "VIX", "format": "csv"}))
         expected = set(anchors.strftime("%Y-%m-%d"))
         rows, records = [], []
-        for request in requests_to_make:
-            try:
-                # Catalogues may expand as Theta backfills older history. Refresh
-                # just these small lists; history requests remain independently cached.
-                record = self.store.collect(request, refresh=True)
-                frame = self.store.read(record)
-            except Exception as exc:
-                frame = pd.DataFrame()
-                record = {"request_id": request.request_id, "dataset": request.dataset,
-                          "status": "request_error", "error": repr(exc)}
-            records.append({**record, "params": request.params})
-            dates = (pd.to_datetime(frame["date"].astype("string").str.strip(), format="mixed", errors="coerce")
-                     .dropna() if "date" in frame else pd.Series(dtype="datetime64[ns]"))
-            known = record["status"] in GOOD_REQUEST_STATUSES
-            available = set(dates.dt.strftime("%Y-%m-%d"))
-            # None means the catalogue request failed, so we cannot know the gaps.
-            # [] means it succeeded and lists every requested session. A populated
-            # list names sessions that the vendor's catalogue does not include.
-            missing = sorted(expected - available) if known else None
-            row = {"symbol": request.params["symbol"], "dataset": request.dataset,
-                   "status": ("listed" if not missing else "coverage_gap") if known else "request_error",
-                   "first_available": str(dates.min().date()) if len(dates) else None,
-                   "last_available": str(dates.max().date()) if len(dates) else None,
-                   "requested_sessions": len(expected),
-                   "listed_requested_sessions": len(expected & available) if known else None,
-                   "missing_requested_dates": missing, "error": record.get("error", "")}
-            rows.append(row)
-            print(f"Coverage {row['symbol']} {row['dataset']}: {row['status']}")
-        report = {"vendor": "ThetaData", "checked_at_utc": utc_now(), "rows": rows, "requests": records,
-                  "request_errors": sum(row["status"] == "request_error" for row in rows),
-                  "series_with_gaps": sum(row["status"] == "coverage_gap" for row in rows),
-                  "proves_interval_or_subscription_access": False,
-                  "proves_complete_intraday_records": False,
-                  "scope": "stock quote/trade and VIX date catalogues; option coverage is recorded during collection",
-                  "documented_limits": {
-                      "SPY_underlying_history_before_2020": "unavailable per Theta documentation",
-                      "other_CTA_only_symbols": "pre-2020 underlying history may be unavailable",
-                      "reference_and_adjusted_contract_completeness": "not established by date catalogues"},
-                  "documentation": "https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html"}
-        write_json(self.cfg.output_dir / "coverage" / f"{run_id}.json", report)
+        try:
+            for request in requests_to_make:
+                if self.store.client.stop_event.is_set():
+                    break
+                try:
+                    # Catalogues may expand as Theta backfills older history. Refresh
+                    # just these small lists; history requests remain independently cached.
+                    record = self.store.collect(request, refresh=True)
+                    frame = self.store.read(record)
+                except CollectionStopped:
+                    break
+                except Exception as exc:
+                    frame = pd.DataFrame()
+                    record = {"request_id": request.request_id, "dataset": request.dataset,
+                              "status": "request_error", "error": repr(exc)}
+                records.append({**record, "params": request.params})
+                dates = (pd.to_datetime(frame["date"].astype("string").str.strip(), format="mixed", errors="coerce")
+                         .dropna() if "date" in frame else pd.Series(dtype="datetime64[ns]"))
+                known = record["status"] in GOOD_REQUEST_STATUSES
+                available = set(dates.dt.strftime("%Y-%m-%d"))
+                # None means the catalogue request failed, so we cannot know the gaps.
+                # [] means it succeeded and lists every requested session. A populated
+                # list names sessions that the vendor's catalogue does not include.
+                missing = sorted(expected - available) if known else None
+                row = {"symbol": request.params["symbol"], "dataset": request.dataset,
+                       "status": ("listed" if not missing else "coverage_gap") if known else "request_error",
+                       "first_available": str(dates.min().date()) if len(dates) else None,
+                       "last_available": str(dates.max().date()) if len(dates) else None,
+                       "requested_sessions": len(expected),
+                       "listed_requested_sessions": len(expected & available) if known else None,
+                       "missing_requested_dates": missing, "error": record.get("error", "")}
+                rows.append(row)
+                print(f"Coverage {row['symbol']} {row['dataset']}: {row['status']}")
+        finally:
+            # Even an interrupted catalogue check leaves its known results and
+            # names the requests for which it did not finish a coverage result.
+            report = {"vendor": "ThetaData", "checked_at_utc": utc_now(), "rows": rows, "requests": records,
+                      "unfinished_requests": [r.identity() for r in requests_to_make[len(rows):]],
+                      "request_errors": sum(row["status"] == "request_error" for row in rows),
+                      "series_with_gaps": sum(row["status"] == "coverage_gap" for row in rows),
+                      "proves_interval_or_subscription_access": False,
+                      "proves_complete_intraday_records": False,
+                      "scope": "stock quote/trade and VIX date catalogues; option coverage is recorded during collection",
+                      "documented_limits": {
+                          "SPY_underlying_history_before_2020": "unavailable per Theta documentation",
+                          "other_CTA_only_symbols": "pre-2020 underlying history may be unavailable",
+                          "reference_and_adjusted_contract_completeness": "not established by date catalogues"},
+                      "documentation": "https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html"}
+            write_json(self.cfg.output_dir / "coverage" / f"{run_id}.json", report)
         return report
 
     def write_availability(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex) -> dict:
@@ -1247,11 +1338,9 @@ class Collector:
                         row = {"symbol": symbol.symbol, "trade_day": str(day.date()), "status": "not_attempted"}
                         try:
                             manifest = read_json(self.session_path(symbol.symbol, day))
-                        except FileNotFoundError:
-                            pass
-                        except (OSError, ValueError) as exc:
-                            row.update(status="request_error", error=repr(exc))
-                        else:
+                            if (manifest["symbol"] != symbol.symbol or manifest["trade_day"] != str(day.date())
+                                    or manifest["status"] not in {"complete", "unavailable", "request_error"}):
+                                raise ValueError("Session identity or status does not match the requested day")
                             row.update({key: manifest.get(key, "") for key in columns if key in manifest})
                             records = manifest["requests"]
                             row.update(selection_reference_count=len(manifest["stock_selection_references"]),
@@ -1260,6 +1349,12 @@ class Collector:
                                        no_data_request_count=sum(r["status"] == "no_data" for r in records),
                                        stored_rows=sum(r.get("row_count", 0) for r in records),
                                        stored_parquet_bytes=sum((r.get("data") or {}).get("size", 0) for r in records))
+                        except FileNotFoundError:
+                            pass
+                        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                            # One damaged manifest must not prevent a report for
+                            # all the other days. Its row explicitly records failure.
+                            row.update(status="request_error", error=repr(exc))
                         counts[row["status"]] += 1
                         writer.writerow(row)
         return counts
@@ -1361,19 +1456,21 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.references_only:
                     # First record vendor date availability. Observed gaps are
                     # reported; they do not silently shorten the user's date range.
+                    run["date_catalogue"] = f"coverage/{run_id}.json"
                     catalogue = collector.collect_coverage(symbols, anchors, run_id)
                     catalogue_errors, catalogue_gaps = catalogue["request_errors"], catalogue["series_with_gaps"]
-                    run["date_catalogue"] = f"coverage/{run_id}.json"
+                    collector.store.client.check_running()
                 if not args.coverage_only:
                     # Fetch the common reference bundle before symbol-day work.
                     # Successful reference pulls also reuse the ordinary raw cache.
+                    run["reference_ledger"] = f"references/{run_id}.json"
                     references = collector.collect_references(symbols, args.start, args.end, args.rate_symbols, run_id)
                     reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES for r in references)
                     # A dividend/split endpoint can correctly return no events.
                     # Missing price/rate history is a coverage gap, not a zero.
                     reference_gaps = sum(r["status"] == "no_data" and not r["dataset"].startswith("corporate_")
                                          for r in references)
-                    run["reference_ledger"] = f"references/{run_id}.json"
+                    collector.store.client.check_running()
                 if panels:
                     # Advance one trading day at a time, overlapping its symbols.
                     # Within each symbol, collect_day overlaps the option requests.
@@ -1384,7 +1481,7 @@ def main(argv: list[str] | None = None) -> int:
                                 run["resumed_days"] += 1
                             else:
                                 pending.append(symbol)
-                        with ThreadPoolExecutor(max_workers=cfg.max_symbol_day_workers) as pool:
+                        with collector.workers(cfg.max_symbol_day_workers) as pool:
                             # Finished sessions were omitted from pending; an
                             # incomplete session still reuses its valid raw downloads.
                             futures = {pool.submit(collector.collect_day, symbol, day): symbol for symbol in pending}
@@ -1397,31 +1494,42 @@ def main(argv: list[str] | None = None) -> int:
                                     print(f"{symbol.symbol} {day.date()}: {manifest['status']}; "
                                           f"{manifest['selected_contract_count']} contracts, "
                                           f"{manifest['request_error_count']} failed requests")
+                                except CollectionStopped:
+                                    raise
                                 except Exception as exc:
                                     failed += 1
                                     print(f"FAILED {symbol.symbol} {day.date()}: {exc!r}")
-                coverage = collector.write_availability(symbols, anchors) if panels else {}
-                run["coverage"] = coverage
-                # Failure takes priority over a known gap. Exit 0 only says our
-                # requests finished without detected gaps/errors; the reports do
-                # not establish completeness of all vendor history or reference data.
-                if failed or reference_failures or catalogue_errors:
-                    exit_code = 1
-                elif reference_gaps or catalogue_gaps or coverage.get("unavailable", 0):
-                    exit_code = 2
-                run["status"] = {0: "complete", 1: "partial_failure", 2: "coverage_gaps"}[exit_code]
-            except BaseException:
-                run["status"] = "interrupted"
+            except BaseException as exc:
+                collector.store.client.stop(str(exc) or "Collection interrupted by the user.")
+                run.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "partial_failure",
+                           error=repr(exc))
                 raise
             finally:
-                # Also publish the run record on interruption so its status does
-                # not remain "running" after we have stopped handling this run.
-                run.update(finished_at_utc=utc_now(), failed_days=int(failed),
+                # Publish coverage on success, failure, or Ctrl+C. Keep the original
+                # failure if generating this summary itself encounters a disk error.
+                try:
+                    run["coverage"] = collector.write_availability(symbols, anchors) if panels else {}
+                except Exception as exc:
+                    run["coverage_error"] = repr(exc)
+                    exit_code = 1
+                coverage = run.get("coverage", {})
+                # Failure takes priority over a known gap. Completed requests do
+                # not establish completeness of all vendor history/reference data.
+                if run["status"] == "running":
+                    if (exit_code or failed or reference_failures or catalogue_errors
+                            or coverage.get("request_error", 0) or coverage.get("not_attempted", 0)):
+                        exit_code = 1
+                    elif reference_gaps or catalogue_gaps or coverage.get("unavailable", 0):
+                        exit_code = 2
+                    run["status"] = {0: "complete", 1: "partial_failure", 2: "coverage_gaps"}[exit_code]
+                run.update(finished_at_utc=utc_now(), failed_days=max(int(failed), coverage.get("request_error", 0)),
                            reference_failures=reference_failures, reference_gaps=reference_gaps,
                            catalogue_errors=catalogue_errors, catalogue_series_with_gaps=catalogue_gaps)
                 write_json(run_path, run)
     except (RuntimeError, OSError, KeyboardInterrupt) as exc:
         print(f"Collector stopped: {exc}", file=sys.stderr)
+        if run_path.exists():
+            print(f"Run record: {run_path}", file=sys.stderr)
         return 1
     print(f"Finished: {run['processed_days']} processed, {run['resumed_days']} resumed, "
           f"{failed} failed days, {reference_failures} failed reference requests, "
