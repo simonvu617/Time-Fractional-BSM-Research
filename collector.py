@@ -7,7 +7,7 @@
 # functions supply the requests, contract selection, storage, and bookkeeping.
 #
 # Normal run:
-#   settings -> available-date check -> dividends/splits/rates/VIX
+#   settings -> available-date check -> reference data and earlier stock history
 #            -> each trading day and underlying -> coverage/run reports
 # One underlying on one day:
 #   stock quotes + dated quoted/traded option lists + bulk OI + stock trades/EOD
@@ -32,6 +32,8 @@
 #   4. stock_selection_references / select_contracts: why a contract is chosen.
 #   5. RequestStore.collect / save: what reaches disk and what a rerun reuses.
 #   6. write_availability: how to find the days that need attention.
+#   collection_windows explains how the study dates differ from the supporting
+#   history window and the corporate-action dates through possible expiration.
 # You can return to the networking and file-checking helpers after that first
 # pass; their job is to support the same collection sequence reliably.
 #
@@ -77,8 +79,8 @@ ThetaData is the sole market/reference data vendor; there are no provider fallba
 
 Examples (Theta Terminal v3 must be running for collection):
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
-  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03
-  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval 1s
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --lookback-sessions 0
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval 1s --lookback-sessions 0
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --references-only
   python collector.py --symbols SPY AAPL --start 2018-01-01 --end 2025-12-31 --coverage-only
 
@@ -89,6 +91,13 @@ The three stock reference times choose downloads, not evaluation samples.
 A contract does not need trades, positive OI, or narrow spreads to be collected.
 Quotes default to tick events so later frequency comparisons can sample the same
 source records. Explicit sampled intervals are available for exploratory pulls.
+Normal runs also collect stock quotes/trades/EOD for 60 earlier trading sessions
+by default. --lookback-sessions changes this buffer; 0 disables it. Rates and
+VIX EOD start at the same earlier date, while VIX intraday and option selection
+stay within the study dates. --references-only omits the earlier stock pulls.
+Corporate actions extend through study end + max_dte, covering possible option
+expiration dates. Later events retain their announcement dates and unknown
+amounts; collection never assumes those events were already known during study.
 
 Raw Parquet preserves vendor columns, values, row order, duplicates, conditions,
 and exchange/sequence codes. CSV values remain strings to avoid rounding or
@@ -96,6 +105,9 @@ silently coercing bad values. Added collector_*_utc columns are parsed clocks;
 the vendor clocks remain unchanged. Optional raw CSV saves the response bytes.
 Each request has metadata, a checksum, retrieval time, and coverage diagnostics.
 Downloads go to a temporary disk file, then convert to Parquet in bounded batches.
+Every CSV record must match a unique, nonempty header. Extra/missing fields and
+malformed quoted records are rejected even at batch boundaries. Valid quoted
+commas/newlines, empty cells, exact numeric text, and extra named columns survive.
 Stock-reference selection also scans batches. Duplicate counts are lower bounds
 when a response spans multiple batches; no raw rows are removed. Small discovery
 tables are loaded together, and legacy cache imports can still load whole tables.
@@ -109,13 +121,23 @@ Output (under --output-dir):
   collection/<policy-id>/contracts/<symbol-day>.parquet
   collection/<policy-id>/availability.csv
   collection/<policy-id>/runs/<run-id>.json
-  references/<run-id>.json (dividends, splits, rates, VIX; standard collection)
+  references/<run-id>.json (references, stock lookback, and per-request coverage)
   coverage/<run-id>.json (vendor date lists and missing sessions; also --coverage-only)
-Successful raw requests are reused across policy changes. A day is resumable
+Successful strictly parsed requests are reused across policy changes. Old parsed
+caches without strict CSV validation are fetched again; original files remain.
+Pre-refactor caches with verified CSV bytes can be revalidated locally.
+A day is resumable
 only after its universe, selected contracts, and referenced requests are verified.
 Refreshes save a new response; earlier run receipts continue to identify the
 exact files they used. Failed refreshes never replace the last successful cache.
 "complete" means the requests finished, not that the vendor supplied full coverage.
+Each session also reports observations_present, gaps_observed, or unknown
+coverage. Empty option quotes and missing stock references are visible gaps;
+empty trades or OI reports remain valid responses without invented zero activity.
+Daily rate/index coverage lists requested exchange sessions without a dated
+report. Rate publishers can observe holidays when NYSE is open; missing dates
+are observed absences, not automatic vendor errors or instructions to fill rates.
+These checks do not establish full intraday coverage or research-sample usability.
 "no_data" is retained separately from request errors. --refresh-no-data retries it.
 Permission/configuration failures stop new requests; temporary connection errors
 get bounded retries. Ctrl+C cancels queued work while active requests finish or
@@ -153,7 +175,7 @@ each stock and VIX; it does not prove intraday completeness or plan entitlements
 Adjusted option deliverables, historical symbol mappings, and reference-data
 vintages remain unverified. Missing records are never filled from another source.
 Exit status: 0 completed requests; 1 request/processing errors; 2 observed
-coverage gaps (including unavailable symbol-days or missing rate/index pulls).
+coverage gaps (including missing option quotes and partial rate/index histories).
 """
 
 import argparse
@@ -174,7 +196,7 @@ from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
-from io import BytesIO
+from io import BytesIO, TextIOWrapper
 from pathlib import Path
 import re
 from uuid import uuid4
@@ -198,8 +220,11 @@ else:
 # 1. Collection settings and the existing research universe.
 # Schema versions identify the layout/meaning of our saved files. They let the
 # resume checks distinguish compatible data from an older output format.
-OUTPUT_SCHEMA_VERSION = "2026-09-08-research-collection-v2"
-RAW_SCHEMA_VERSION = 1
+OUTPUT_SCHEMA_VERSION = "2026-09-08-coverage-v3"
+# Version 2 requires strict CSV record validation. Earlier parsed caches cannot
+# prove that no field was silently lost, so their original files stay preserved
+# but cannot satisfy new requests without reading verified CSV bytes again.
+RAW_SCHEMA_VERSION = 2
 # Keep the original default root so existing raw caches can be reused.
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "data" / "multi_year_bsm_backtest_output"
 QUOTE_INTERVALS = ("tick", "10ms", "100ms", "500ms", "1s", "5s", "10s", "15s",
@@ -285,6 +310,10 @@ class CollectorConfig:
     # Default study bounds. The CLI can request a smaller slice within them.
     start_date: str = "2018-01-01"
     end_date: str = "2025-12-31"
+    # Extra stock/rate history before the requested study start. This is a
+    # configurable download buffer, not the paper's chosen calibration window.
+    # Set --lookback-sessions 0 explicitly for a small pull without that buffer.
+    lookback_sessions: int = 60
     option_rights: tuple[str, ...] = ("call", "put")
     # DTE = calendar days to expiration. Choose actual listed expirations near
     # these targets, with an overall limit on the number chosen per day.
@@ -357,6 +386,8 @@ class CollectorConfig:
                 raise ValueError(f"{name} must be positive")
         if not isinstance(self.raw_chunk_rows, int) or self.raw_chunk_rows <= 0:
             raise ValueError("raw_chunk_rows must be a positive integer")
+        if not isinstance(self.lookback_sessions, int) or self.lookback_sessions < 0:
+            raise ValueError("lookback_sessions must be a nonnegative integer")
         if (not self.selection_times or tuple(sorted(set(self.selection_times))) != self.selection_times
                 or any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d", t) for t in self.selection_times)):
             raise ValueError("selection_times must be unique, ordered HH:MM:SS values")
@@ -570,6 +601,41 @@ def output_lock(output_dir: Path):
 
 
 # 4. Understand response clocks and identity without rewriting the vendor data.
+def csv_frames(payload: BinaryIO, chunk_rows: int) -> Iterable[pd.DataFrame]:
+    """Read complete CSV records in bounded batches without inferring an index."""
+    # pandas' chunked C parser can silently drop extra fields at a batch boundary.
+    # csv.reader recognizes quoted commas/newlines, while our width check rejects
+    # both extra and missing fields before a row enters the saved table.
+    # TextIOWrapper borrows the response file: detach it on every exit so the
+    # caller can still retain the exact bytes after a malformed CSV is rejected.
+    text = TextIOWrapper(payload, encoding="utf-8-sig", newline="")
+    reader = csv.reader(text, strict=True)
+    try:
+        header = next((row for row in reader if row), None)
+        if header is None:
+            return
+        if any(not name.strip() for name in header) or len(set(header)) != len(header):
+            raise ValueError("CSV header has empty or duplicate column names")
+        rows, emitted = [], False
+        for row in reader:
+            if not row:  # An empty physical line is not a market observation.
+                continue
+            if len(row) != len(header):
+                raise ValueError(f"CSV record ending on line {reader.line_num}: "
+                                 f"expected {len(header)} fields, got {len(row)}")
+            rows.append(row)
+            if len(rows) == chunk_rows:
+                yield pd.DataFrame(rows, columns=header, dtype="string")
+                rows, emitted = [], True
+        if rows or not emitted:
+            # A header-only response must still undergo required-column checks.
+            yield pd.DataFrame(rows, columns=header, dtype="string")
+    except csv.Error as exc:
+        raise ValueError(f"Malformed CSV near line {reader.line_num}: {exc}") from exc
+    finally:
+        text.detach()
+
+
 def parse_vendor_clock(values: pd.Series, exchange_tz: str) -> pd.Series:
     # Naive Theta clocks are exchange local. Aware clocks keep their stated
     # offset. Date-only interest-rate reports deliberately do not use this.
@@ -984,6 +1050,7 @@ class RequestStore:
         # A compact receipt for session/reference manifests. Detailed diagnostics
         # remain in the request's meta.json instead of being copied everywhere.
         return {"request_id": request.request_id, "dataset": request.dataset,
+                "params": request.params,
                 "status": meta["status"], "row_count": meta.get("row_count", 0),
                 "status_code": meta.get("status_code"),
                 "observation_semantics": request.observation_semantics(),
@@ -1011,7 +1078,7 @@ class RequestStore:
             # loading a full tick day into memory or making extra vendor requests.
             with tempfile.TemporaryFile(dir=self.root) as payload:
                 # There are two batch sizes: the network moves blocks of bytes;
-                # pandas later reads groups of CSV rows. Neither selects or
+                # the CSV reader later groups complete records. Neither selects or
                 # resamples observations. The temporary file needs disk space for
                 # one response even when exact successful CSV retention is disabled.
                 response_meta = self.client.download(request, payload)
@@ -1026,10 +1093,7 @@ class RequestStore:
                     if content_type and not any(t in content_type for t in ("csv", "text/plain", "octet-stream")):
                         raise ValueError(f"Unexpected response content type: {content_type}")
                     # Text fields preserve precision, condition codes, and blanks.
-                    frames = pd.read_csv(payload, dtype="string", keep_default_na=False,
-                                         chunksize=self.cfg.raw_chunk_rows)
-                except pd.errors.EmptyDataError:
-                    return self.save(request, empty, response_meta, payload)
+                    frames = csv_frames(payload, self.cfg.raw_chunk_rows)
                 except (ValueError, UnicodeError) as exc:
                     response_meta["error"] = f"Invalid CSV response: {exc}"
                     return self.save(request, empty, response_meta, payload, "invalid_response")
@@ -1126,8 +1190,8 @@ class RequestStore:
         """Reuse valid pre-refactor raw quotes/OI/chains without changing old files."""
         # Compatibility with the original collector's folder layout. Import only
         # exact matching requests whose saved fingerprint still checks out.
-        # If an older table already parsed numeric values, original formatting
-        # cannot be recovered without its CSV bytes. Metadata records that limit.
+        # Revalidate the original CSV bytes. An older parsed table alone cannot
+        # establish that its parser preserved every input field.
         if request.params.get("expiration") == "*" or request.dataset not in {"quoted_contracts", "option_open_interest",
                                     "stock_quotes_" + self.cfg.quote_interval, "option_quotes_" + self.cfg.quote_interval}:
             return None
@@ -1148,25 +1212,21 @@ class RequestStore:
                 return None
             payload_path = directory / "raw_response.csv"
             payload = payload_path.read_bytes() if payload_path.exists() else None
-            if payload is not None and hashlib.sha256(payload).hexdigest() != old.get("payload_sha256"):
+            if payload is None or hashlib.sha256(payload).hexdigest() != old.get("payload_sha256"):
                 return None
-            if self.cfg.store_raw_payloads and payload is None:
-                return None
-            if payload and old.get("status_code") == 200:
-                # Original CSV bytes preserve more detail than an older table
-                # whose numbers/timestamps may already have been converted.
-                frame = pd.read_csv(BytesIO(payload), dtype="string", keep_default_na=False)
+            if old.get("status_code") == 200:
+                frames = list(csv_frames(BytesIO(payload), self.cfg.raw_chunk_rows))
+                frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=request.required_columns)
+            elif old.get("status_code") == 472:
+                frame = pd.DataFrame(columns=request.required_columns)
             else:
-                frame = pd.read_parquet(path)
-                if "timestamp_raw" in frame:
-                    frame["timestamp"] = frame["timestamp_raw"]
-                frame = frame.loc[:, old["columns"]]
+                return None
             if set(request.required_columns) - set(frame.columns):
                 return None
             meta = {name: old[name] for name in ("request_url", "status_code", "response_headers",
                     "payload_sha256", "payload_bytes", "fetched_at_utc") if name in old}
             meta.update(legacy_source=path.relative_to(self.root).as_posix(),
-                        legacy_values_previously_parsed=payload is None)
+                        legacy_csv_revalidated=True)
             return frame, meta, payload
         except (OSError, ValueError, KeyError, TypeError):
             return None
@@ -1191,7 +1251,7 @@ class RequestStore:
 # Cache the calendar object so every request does not reconstruct it.
 @lru_cache(maxsize=1)
 def exchange_calendar():
-    return xcals.get_calendar("XNYS", start="2017-01-01", end="2026-12-31")
+    return xcals.get_calendar("XNYS", start="2012-01-01", end="2026-12-31")
 
 
 def session_bounds(day: pd.Timestamp, cfg: CollectorConfig) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -1241,21 +1301,49 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
     return Request(dataset, f"/{asset}/history/{kind}", params)
 
 
+def collection_windows(cfg: CollectorConfig, start: str, end: str) -> dict:
+    # The study dates still control option selection. Earlier history supports
+    # later calibration choices; later corporate events cover the possible life
+    # of every selected option (selection already enforces max_dte).
+    sessions = exchange_calendar().sessions.tz_localize(None)
+    before = sessions[sessions < pd.Timestamp(start)]
+    if cfg.lookback_sessions > len(before):
+        raise ValueError("lookback_sessions exceeds the available exchange-calendar history")
+    lookback = before[-cfg.lookback_sessions:] if cfg.lookback_sessions else before[:0]
+    return {"study_start": start, "study_end": end,
+            "history_start": str(lookback[0].date()) if len(lookback) else start,
+            "corporate_action_end": str((pd.Timestamp(end) + pd.Timedelta(days=cfg.max_dte)).date()),
+            "lookback_dates": list(lookback.strftime("%Y-%m-%d"))}
+
+
 def reference_requests(cfg: CollectorConfig, symbols: list[SymbolConfig], start: str, end: str,
-                       rate_symbols: list[str]):
+                       rate_symbols: list[str], *, include_stock_lookback: bool = False):
     """One Theta-only bundle. Rates/actions are date reports; VIX prices are intraday."""
     # yield produces requests one at a time. Actions belong to each underlying;
     # interest-rate and VIX requests are shared across the selected underlyings.
-    window = {"start_date": start, "end_date": end, "format": "csv"}
+    windows = collection_windows(cfg, start, end)
+    window = {"start_date": windows["history_start"], "end_date": end, "format": "csv"}
     for symbol in symbols:
         for kind in ("dividend", "split"):
-            yield Request(f"corporate_{kind}", f"/corporate_action/{kind}", {"symbol": symbol.symbol, **window})
+            # A December observation can involve an option exposed to a January
+            # dividend. Keep the later event and its announcement date; collection
+            # does not assert that the event/amount was known on the observation day.
+            yield Request(f"corporate_{kind}", f"/corporate_action/{kind}",
+                          {"symbol": symbol.symbol, **window, "end_date": windows["corporate_action_end"]})
     for symbol in sorted(set(rate_symbols)):
         yield Request("interest_rate_eod", "/interest_rate/history/eod", {"symbol": symbol, **window})
     yield Request("index_eod", "/index/history/eod", {"symbol": "VIX", **window})
     for day in exchange_calendar().sessions_in_range(start, end).tz_localize(None):
         # Sub-minute index history must be requested one day at a time.
         yield history_request(cfg, "index", "price", "VIX", day)
+    if include_stock_lookback:
+        # Only normal panel runs request earlier stock quotes/trades/EOD. These
+        # raw pulls have ordinary cache receipts and coverage in the reference
+        # ledger; no option sample or calibration is performed in the lookback.
+        for date in windows["lookback_dates"]:
+            for symbol in symbols:
+                for kind in ("quote", "trade_quote", "eod"):
+                    yield history_request(cfg, "stock", kind, symbol.symbol, pd.Timestamp(date))
 
 
 # 8. Choose actual listed contracts to download using the study's sampling grid.
@@ -1444,7 +1532,8 @@ class Collector:
         try:
             if (manifest["output_schema_version"] != OUTPUT_SCHEMA_VERSION
                     or manifest["policy_id"] != self.cfg.policy_id
-                    or manifest["status"] not in {"complete", "unavailable"}):
+                    or manifest["status"] not in {"complete", "unavailable"}
+                    or manifest["coverage"]["status"] not in {"observations_present", "gaps_observed"}):
                 return False
             records = manifest["requests"]
             selected_count = manifest["selected_contract_count"]
@@ -1483,6 +1572,61 @@ class Collector:
                     and self.manifest_valid(manifest))
         except (OSError, ValueError):
             return False
+
+    def request_coverage(self, request: Request, record: dict | None) -> dict:
+        """Describe observed presence separately from successful HTTP/file handling."""
+        if record is None or record["status"] not in GOOD_REQUEST_STATUSES:
+            return {"status": "unknown", "reason": "request_not_completed_successfully"}
+        # Trades, OI, and corporate actions are event/report driven. A successful
+        # empty response does not by itself establish a missing required price.
+        # In particular, do not label quiet contracts as failed collections.
+        if request.dataset.startswith("corporate_") or request.endpoint.endswith(("/trade_quote", "/open_interest")):
+            return {"status": "not_assessed", "reason": "empty_event_reports_can_be_valid"}
+        if request.endpoint.endswith("/eod"):
+            try:
+                frame = self.store.read(record)
+                column = request.report_date_column or "created"
+                dates = (pd.to_datetime(frame[column], format="mixed", errors="coerce")
+                         if request.report_date_column else
+                         parse_vendor_clock(frame[column], self.cfg.exchange_tz).dt.tz_convert(self.cfg.exchange_tz))
+                observed = set(dates.dropna().dt.strftime("%Y-%m-%d"))
+                sessions = exchange_calendar().sessions_in_range(request.params["start_date"], request.params["end_date"])
+                expected = set(sessions.strftime("%Y-%m-%d"))
+                missing = sorted(expected - observed)
+                return {"status": "gaps_observed" if missing else "observations_present",
+                        "requested_session_count": len(expected), "observed_session_count": len(expected & observed),
+                        "missing_requested_session_dates": missing, "date_grid": "XNYS_sessions",
+                        # A bank/Fed holiday can lack a report while NYSE is open.
+                        # This is a presence comparison, not a publisher-calendar
+                        # assertion or permission to fill a missing rate with zero.
+                        "publisher_schedule_verified": False,
+                        "missing_dates_prove_vendor_error": False}
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                return {"status": "unknown", "reason": "coverage_check_failed", "error": repr(exc)}
+        return {"status": "gaps_observed" if record["status"] == "no_data" else "observations_present",
+                "complete_intraday_history_verified": False}
+
+    def session_coverage(self, symbol: str, day: pd.Timestamp, selected: pd.DataFrame,
+                         records: list[dict], missing_times: list[str], failed: bool) -> dict:
+        # These checks concern required price observations. No expected tick
+        # count is invented: nonempty quotes still do not prove a complete feed.
+        required = [history_request(self.cfg, "stock", kind, symbol, day) for kind in ("quote", "eod")]
+        required += [history_request(self.cfg, "option", "quote", symbol, day, contract)
+                     for contract in selected.to_dict("records")]
+        by_id = {record["request_id"]: record for record in records}
+        checks = [{"request_id": request.request_id, "dataset": request.dataset, "params": request.params,
+                   **self.request_coverage(request, by_id.get(request.request_id))} for request in required]
+        missing = [check for check in checks if check["status"] == "gaps_observed"]
+        unknown = sum(check["status"] == "unknown" for check in checks)
+        status = ("unknown" if failed or unknown else "gaps_observed"
+                  if missing or missing_times or selected.empty else "observations_present")
+        return {"status": status, "required_price_requests": checks,
+                "missing_option_quote_count": sum(c["dataset"].startswith("option_") for c in missing),
+                "missing_stock_dataset_count": sum(c["dataset"].startswith("stock_") for c in missing),
+                "unknown_required_request_count": unknown,
+                "no_selected_contracts": selected.empty,
+                "complete_intraday_history_verified": False,
+                "research_sample_usability_verified": False}
 
     def collect_day(self, symbol_cfg: SymbolConfig, day: pd.Timestamp) -> dict:
         # This is the main unit of collection: one underlying on one trading day.
@@ -1577,8 +1721,10 @@ class Collector:
         opened, closed = session_bounds(day, self.cfg)
         scheduled = [at for at in self.cfg.selection_times
                      if opened <= pd.Timestamp(f"{day.date()} {at}", tz=self.cfg.exchange_tz) < closed]
+        missing_times = [at for at in scheduled if at not in {r["selection_time"] for r in references}]
+        coverage = self.session_coverage(symbol, day, selected, records, missing_times, status == "request_error")
         manifest = {**asdict(symbol_cfg), "trade_day": str(day.date()), "status": status,
-                    "reason": reason, "error": error, "output_schema_version": OUTPUT_SCHEMA_VERSION,
+                "reason": reason, "error": error, "output_schema_version": OUTPUT_SCHEMA_VERSION,
                     "policy_id": self.cfg.policy_id, "updated_at_utc": utc_now(),
                     "session_open": opened.isoformat(), "session_close": closed.isoformat(),
                     "intraday_window": "underlying_regular_trading_session",
@@ -1587,8 +1733,7 @@ class Collector:
                     "oi_reported_contract_count": source_counts["open_interest"],
                     "universe_contract_count": len(universe), "selected_contract_count": len(selected),
                     "stock_selection_references": references,
-                    "missing_selection_times": [at for at in scheduled
-                                                if at not in {r["selection_time"] for r in references}],
+                    "missing_selection_times": missing_times, "coverage": coverage,
                     "requests": sorted(records, key=lambda r: (r["dataset"], r["request_id"])),
                     "contracts": file_receipt(contract_path, self.cfg.output_dir, selected),
                     "universe": file_receipt(universe_path, self.cfg.output_dir, universe),
@@ -1599,7 +1744,7 @@ class Collector:
         return manifest
 
     def collect_references(self, symbols: list[SymbolConfig], start: str, end: str,
-                           rate_symbols: list[str], run_id: str) -> list[dict]:
+                           rate_symbols: list[str], run_id: str, *, include_stock_lookback: bool = False) -> list[dict]:
         # Reference data has its own ledger because it serves many symbol-days.
         # Keeping it separate avoids copying rates/VIX into each option table.
         # We save rate percentage units exactly. For instance, a reported 4.25
@@ -1608,22 +1753,31 @@ class Collector:
         records = []
         # These notes travel with the data so later research can interpret units,
         # missing values, and unverified coverage without relying on this script.
+        lookback_datasets = ([f"stock_quotes_{self.cfg.quote_interval}", "stock_trade_quotes_tick", "stock_eod"]
+                             if include_stock_lookback and self.cfg.lookback_sessions else [])
         ledger = {"vendor": "ThetaData", "start": start, "end": end,
+                  "collection_windows": collection_windows(self.cfg, start, end),
+                  "stock_lookback_requested": bool(lookback_datasets),
+                  "option_contract_continuity_guaranteed": False,
                   "requested_rates": sorted(set(rate_symbols)), "rate_units": "percent",
                   "required_datasets": ["corporate_dividend", "corporate_split", "interest_rate_eod",
-                                        "index_eod", f"index_prices_{self.cfg.quote_interval}"],
+                                        "index_eod", f"index_prices_{self.cfg.quote_interval}", *lookback_datasets],
                   "rate_publication_timestamps_verified": False,
                   "corporate_action_range_filters": {"dividend": "ex_dividend_date", "split": "effective_date"},
                   "missing_dividend_amounts": "unknown; not zero", "split_ratio": "before_shares / after_shares",
                   "empty_actions_prove_complete_event_coverage": False,
+                  "later_actions_were_known_at_study_time": "not_assumed; retain announcement dates and unknown values",
                   "index_unchanged_updates_may_be_omitted": True,
                   "adjusted_contract_deliverables": "not_documented_by_Theta; not_inferred",
                   "historical_symbol_mappings": "not_verified"}
         path = self.cfg.output_dir / "references" / f"{run_id}.json"
         def publish():
-            write_json(path, {**ledger, "updated_at_utc": utc_now(), "requests": records})
+            write_json(path, {**ledger, "updated_at_utc": utc_now(), "requests": records,
+                             "requests_with_observed_gaps": sum(r["coverage"]["status"] == "gaps_observed" for r in records),
+                             "requests_with_unknown_coverage": sum(r["coverage"]["status"] == "unknown" for r in records)})
         try:
-            for request in reference_requests(self.cfg, symbols, start, end, rate_symbols):
+            for request in reference_requests(self.cfg, symbols, start, end, rate_symbols,
+                                              include_stock_lookback=include_stock_lookback):
                 if self.store.client.stop_event.is_set():
                     break
                 try:
@@ -1635,7 +1789,8 @@ class Collector:
                     # main() still reports a failed run; completed data is retained.
                     record = {"request_id": request.request_id, "dataset": request.dataset,
                               "status": "request_error", "error": repr(exc)}
-                records.append({**record, "params": request.params})
+                records.append({**record, "params": request.params,
+                                "coverage": self.request_coverage(request, record)})
                 # Raw receipts are committed per request. Batch this progress file
                 # so a multi-year VIX run does not rewrite it thousands of times.
                 if len(records) % 25 == 0 or record["status"] not in GOOD_REQUEST_STATUSES:
@@ -1717,18 +1872,21 @@ class Collector:
         # describe overlapping market information. Adding their row counts is a
         # storage total, not a count of distinct quote updates or executed trades.
         path = self.directory / "availability.csv"
-        columns = ("symbol", "trade_day", "status", "reason", "quoted_contract_count", "traded_contract_count",
+        columns = ("symbol", "trade_day", "status", "coverage_status", "reason", "quoted_contract_count", "traded_contract_count",
                    "oi_reported_contract_count", "universe_contract_count", "selected_contract_count",
                    "selection_reference_count", "missing_selection_times", "request_count", "request_error_count",
-                   "no_data_request_count", "stored_rows", "stored_parquet_bytes", "error")
+                   "no_data_request_count", "missing_option_quote_count", "missing_stock_dataset_count",
+                   "unknown_required_request_count", "stored_rows", "stored_parquet_bytes", "error")
         counts = dict.fromkeys(("complete", "unavailable", "request_error", "not_attempted"), 0)
+        counts.update(days_with_observed_gaps=0, days_with_unknown_coverage=0)
         with atomic_output(path) as temp:
             with temp.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=columns)
                 writer.writeheader()
                 for day in anchors:
                     for symbol in symbols:
-                        row = {"symbol": symbol.symbol, "trade_day": str(day.date()), "status": "not_attempted"}
+                        row = {"symbol": symbol.symbol, "trade_day": str(day.date()), "status": "not_attempted",
+                               "coverage_status": "not_checked"}
                         try:
                             manifest = read_json(self.session_path(symbol.symbol, day))
                             if (manifest["symbol"] != symbol.symbol or manifest["trade_day"] != str(day.date())
@@ -1736,6 +1894,12 @@ class Collector:
                                 raise ValueError("Session identity or status does not match the requested day")
                             row.update({key: manifest.get(key, "") for key in columns if key in manifest})
                             records = manifest["requests"]
+                            coverage = manifest["coverage"]
+                            if coverage["status"] not in {"observations_present", "gaps_observed", "unknown"}:
+                                raise ValueError("Unknown session coverage status")
+                            row.update(coverage_status=coverage["status"],
+                                       **{name: coverage[name] for name in ("missing_option_quote_count",
+                                          "missing_stock_dataset_count", "unknown_required_request_count")})
                             row.update(selection_reference_count=len(manifest["stock_selection_references"]),
                                        missing_selection_times="|".join(manifest["missing_selection_times"]),
                                        request_count=len(records),
@@ -1747,8 +1911,10 @@ class Collector:
                         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                             # One damaged manifest must not prevent a report for
                             # all the other days. Its row explicitly records failure.
-                            row.update(status="request_error", error=repr(exc))
+                            row.update(status="request_error", coverage_status="unknown", error=repr(exc))
                         counts[row["status"]] += 1
+                        counts["days_with_observed_gaps"] += row["coverage_status"] == "gaps_observed"
+                        counts["days_with_unknown_coverage"] += row["coverage_status"] == "unknown"
                         writer.writerow(row)
         return counts
 
@@ -1777,6 +1943,8 @@ def parse_run_scope(argv: list[str] | None = None):
     parser.add_argument("--symbols", nargs="+", type=str.upper, choices=[cfg.symbol for cfg in UNIVERSE])
     parser.add_argument("--start", default=defaults.start_date, help="Inclusive first date (YYYY-MM-DD)")
     parser.add_argument("--end", default=defaults.end_date, help="Inclusive last date (YYYY-MM-DD)")
+    parser.add_argument("--lookback-sessions", type=int, default=defaults.lookback_sessions,
+                        help="Prior stock/rate trading sessions to collect (default: 60; 0 disables the buffer)")
     parser.add_argument("--quote-interval", default=defaults.quote_interval, choices=QUOTE_INTERVALS)
     parser.add_argument("--raw-chunk-rows", type=int, default=defaults.raw_chunk_rows,
                         help="Rows per parsing/storage batch; affects memory use, not which rows are saved")
@@ -1802,10 +1970,11 @@ def parse_run_scope(argv: list[str] | None = None):
         if not pd.Timestamp(defaults.start_date) <= start <= end <= pd.Timestamp(defaults.end_date):
             raise ValueError(f"Dates must be ordered and within {defaults.start_date} through {defaults.end_date}")
         cfg = replace(defaults, quote_interval=args.quote_interval, output_dir=args.output_dir.expanduser().resolve(),
-                      raw_chunk_rows=args.raw_chunk_rows,
+                      raw_chunk_rows=args.raw_chunk_rows, lookback_sessions=args.lookback_sessions,
                       store_raw_payloads=args.store_raw_payloads, refresh_no_data=args.refresh_no_data,
                       max_inflight_requests=args.max_inflight_requests,
                       max_requests_per_second=args.max_requests_per_second)
+        collection_windows(cfg, args.start, args.end)
     except ValueError as exc:
         parser.error(str(exc))
     anchors = exchange_calendar().sessions_in_range(start, end).tz_localize(None)
@@ -1821,6 +1990,7 @@ def main(argv: list[str] | None = None) -> int:
     # Execution is deliberately visible here: decide scope -> preview or connect
     # -> check dates -> collect references -> collect symbol-days -> write reports.
     args, cfg, symbols, anchors = parse_run_scope(argv)
+    windows = collection_windows(cfg, args.start, args.end)
     panels = not (args.references_only or args.coverage_only)
     total = len(symbols) * len(anchors) if panels else 0
     print(f"Scope: {', '.join(s.symbol for s in symbols)}; {args.start} to {args.end}; {total} symbol-days")
@@ -1833,6 +2003,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Coverage mode: available dates for stock quotes/trades and VIX; no history downloads")
     else:
         print(f"Required references: dividends/splits, {len(set(args.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices")
+        print(f"Reference history starts {windows['history_start']}; corporate actions through {windows['corporate_action_end']}")
+        if panels:
+            print(f"Stock lookback: {cfg.lookback_sessions} prior sessions; "
+                  f"{3 * len(symbols) * cfg.lookback_sessions} additional quote/trade/EOD requests")
     if args.plan:
         # Preview ends before opening a network connection or creating output.
         return 0
@@ -1845,6 +2019,7 @@ def main(argv: list[str] | None = None) -> int:
     run = {"run_id": run_id, "started_at_utc": utc_now(), "status": "running", "data_vendor": "ThetaData",
            "policy_id": cfg.policy_id, "policy": cfg.policy(), "config": {**asdict(cfg), "output_dir": str(cfg.output_dir)},
            "scope": {"symbols": [s.symbol for s in symbols], "start": args.start, "end": args.end,
+                     "collection_windows": windows,
                      "references_only": args.references_only, "coverage_only": args.coverage_only,
                      "rate_symbols": args.rate_symbols},
            "code_sha256": file_hash(Path(__file__)), "python": sys.version, "platform": platform.platform(),
@@ -1861,19 +2036,21 @@ def main(argv: list[str] | None = None) -> int:
                     # First record vendor date availability. Observed gaps are
                     # reported; they do not silently shorten the user's date range.
                     run["date_catalogue"] = f"coverage/{run_id}.json"
-                    catalogue = collector.collect_coverage(symbols, anchors, run_id)
+                    catalogue_dates = exchange_calendar().sessions_in_range(windows["history_start"], args.end).tz_localize(None)
+                    catalogue = collector.collect_coverage(symbols, catalogue_dates, run_id)
                     catalogue_errors, catalogue_gaps = catalogue["request_errors"], catalogue["series_with_gaps"]
                     collector.store.client.check_running()
                 if not args.coverage_only:
                     # Fetch the common reference bundle before symbol-day work.
                     # Successful reference pulls also reuse the ordinary raw cache.
                     run["reference_ledger"] = f"references/{run_id}.json"
-                    references = collector.collect_references(symbols, args.start, args.end, args.rate_symbols, run_id)
-                    reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES for r in references)
+                    references = collector.collect_references(symbols, args.start, args.end, args.rate_symbols, run_id,
+                                                              include_stock_lookback=panels)
+                    reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES
+                                             or r["coverage"]["status"] == "unknown" for r in references)
                     # A dividend/split endpoint can correctly return no events.
                     # Missing price/rate history is a coverage gap, not a zero.
-                    reference_gaps = sum(r["status"] == "no_data" and not r["dataset"].startswith("corporate_")
-                                         for r in references)
+                    reference_gaps = sum(r["coverage"]["status"] == "gaps_observed" for r in references)
                     collector.store.client.check_running()
                 if panels:
                     # Advance one trading day at a time, overlapping its symbols.
@@ -1896,6 +2073,7 @@ def main(argv: list[str] | None = None) -> int:
                                     manifest = future.result()
                                     failed += manifest["status"] == "request_error"
                                     print(f"{symbol.symbol} {day.date()}: {manifest['status']}; "
+                                          f"coverage: {manifest['coverage']['status']}; "
                                           f"{manifest['selected_contract_count']} contracts, "
                                           f"{manifest['request_error_count']} failed requests")
                                 except CollectionStopped:
@@ -1924,9 +2102,11 @@ def main(argv: list[str] | None = None) -> int:
                     # 1 = something failed; 2 = completed with observed gaps;
                     # 0 = requested work completed without those reported problems.
                     if (exit_code or failed or reference_failures or catalogue_errors
-                            or coverage.get("request_error", 0) or coverage.get("not_attempted", 0)):
+                            or coverage.get("request_error", 0) or coverage.get("not_attempted", 0)
+                            or coverage.get("days_with_unknown_coverage", 0)):
                         exit_code = 1
-                    elif reference_gaps or catalogue_gaps or coverage.get("unavailable", 0):
+                    elif (reference_gaps or catalogue_gaps or coverage.get("unavailable", 0)
+                          or coverage.get("days_with_observed_gaps", 0)):
                         exit_code = 2
                     run["status"] = {0: "complete", 1: "partial_failure", 2: "coverage_gaps"}[exit_code]
                 run.update(finished_at_utc=utc_now(), failed_days=max(int(failed), coverage.get("request_error", 0)),
