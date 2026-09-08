@@ -10,9 +10,9 @@
 #   settings -> available-date check -> dividends/splits/rates/VIX
 #            -> each trading day and underlying -> coverage/run reports
 # One underlying on one day:
-#   stock quotes + dated option list + stock trades/EOD
+#   stock quotes + dated quoted/traded option lists + bulk OI + stock trades/EOD
 #   -> stock prices at the selection times -> selected option contracts
-#   -> option quotes + option trades + open interest -> saved session record
+#   -> option quotes + option trades -> saved universe and session record
 #
 # Vocabulary used throughout:
 #   underlying: the stock or ETF on which an option is written.
@@ -24,6 +24,51 @@
 #   manifest/ledger: a JSON record of what was requested, saved, or missing.
 #   receipt: a file's location, size, and fingerprint, used to check reuse.
 # The numbered sections below follow the file's order, not its execution order.
+#
+# A suggested first read (search for these exact names):
+#   1. CollectorConfig: what we ask for and the limits on the download sample.
+#   2. main: which tasks run, and in what order.
+#   3. Collector.collect_day: follow one underlying through one trading day.
+#   4. stock_selection_references / select_contracts: why a contract is chosen.
+#   5. RequestStore.collect / save: what reaches disk and what a rerun reuses.
+#   6. write_availability: how to find the days that need attention.
+# You can return to the networking and file-checking helpers after that first
+# pass; their job is to support the same collection sequence reliably.
+#
+# Why each dataset is here:
+#   quotes: preserve displayed prices and their observed updates.
+#   trades with matched quotes: preserve reported transactions and nearby quotes.
+#   open interest (OI): preserve outstanding-contract reports, including quiet
+#     contracts that can be absent from the day's quote/trade lists.
+#   stock EOD: retain the vendor's daily summary as a separate observation type.
+#   dividends/splits: retain corporate events that later pricing may need.
+#   rates: retain the available maturities without choosing a discount curve.
+#   VIX: retain a market-wide reference series for later study design.
+# Collecting these inputs leaves the research choices inspectable. For example,
+# this file never interprets a long trade gap as evidence for a particular alpha.
+#
+# Three different clocks you will see in the saved records:
+#   event time: when the feed reports a quote update or a trade.
+#   sample time: a boundary at which Theta returns the most recent quote.
+#   retrieval time: when this collector obtained the historical response.
+# A daily report also has a report date, which is not a precise publication time.
+# Example: a quote sampled at 10:30:00 might originate from an earlier update.
+# Repeated sampled prices alone cannot tell us whether new quote events occurred.
+#
+# How to inspect a completed run:
+#   availability.csv -> a compact overview of the requested symbol-days.
+#   sessions/*.json -> why contracts were selected and links to exact responses.
+#   universes/*.parquet -> the combined observed contracts before DTE/S/K selection.
+#   contracts/*.parquet -> the smaller set for which quotes/trades were requested.
+#   raw_cache/.../meta.json -> parameters, field names, diagnostics, and receipts.
+#   raw_cache/.../data.parquet -> the actual vendor observations plus parsed clocks.
+# JSON and CSV are readable text; Parquet is a compressed table, opened with a
+# table tool or pandas.read_parquet(). File paths in receipts are relative to
+# --output-dir, so the whole output directory can be moved together.
+#
+# The broad universe is still bounded: these 21 underlyings, the requested dates,
+# and the observed contracts are the inputs to selection. Collecting tick rows
+# for selected options does not mean downloading every option ever listed.
 
 """Historical stock/option collection, kept in one file for review.
 
@@ -33,33 +78,41 @@ ThetaData is the sole market/reference data vendor; there are no provider fallba
 Examples (Theta Terminal v3 must be running for collection):
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03
-  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval tick
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval 1s
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --references-only
   python collector.py --symbols SPY AAPL --start 2018-01-01 --end 2025-12-31 --coverage-only
 
-The default universe and DTE/S/K sampling grid are retained. Discovery uses the
-contracts quoted on each historical date, not today's chain. The three stock
-reference times choose what to download; they are not evaluation samples.
+The default universe and DTE/S/K sampling grid are retained. Discovery combines
+dated quoted/traded contract lists and a bulk open-interest report. Each observed
+contract retains its discovery sources, including contracts found only in OI.
+The three stock reference times choose downloads, not evaluation samples.
 A contract does not need trades, positive OI, or narrow spreads to be collected.
+Quotes default to tick events so later frequency comparisons can sample the same
+source records. Explicit sampled intervals are available for exploratory pulls.
 
 Raw Parquet preserves vendor columns, values, row order, duplicates, conditions,
 and exchange/sequence codes. CSV values remain strings to avoid rounding or
 silently coercing bad values. Added collector_*_utc columns are parsed clocks;
 the vendor clocks remain unchanged. Optional raw CSV saves the response bytes.
 Each request has metadata, a checksum, retrieval time, and coverage diagnostics.
+Downloads go to a temporary disk file, then convert to Parquet in bounded batches.
+Stock-reference selection also scans batches. Duplicate counts are lower bounds
+when a response spans multiple batches; no raw rows are removed. Small discovery
+tables are loaded together, and legacy cache imports can still load whole tables.
 No pricing, waiting-time features, regimes, sample filters, or yield proxies run.
 
 Output (under --output-dir):
   raw_cache/<dataset>/.../request=<id>/latest.json (last successful response)
   raw_cache/<dataset>/.../request=<id>/responses/<id>/{data.parquet,meta.json}
   collection/<policy-id>/sessions/<symbol-day>.json
+  collection/<policy-id>/universes/<symbol-day>.parquet
   collection/<policy-id>/contracts/<symbol-day>.parquet
   collection/<policy-id>/availability.csv
   collection/<policy-id>/runs/<run-id>.json
   references/<run-id>.json (dividends, splits, rates, VIX; standard collection)
   coverage/<run-id>.json (vendor date lists and missing sessions; also --coverage-only)
 Successful raw requests are reused across policy changes. A day is resumable
-only after its selected-contract file and every referenced request are verified.
+only after its universe, selected contracts, and referenced requests are verified.
 Refreshes save a new response; earlier run receipts continue to identify the
 exact files they used. Failed refreshes never replace the last successful cache.
 "complete" means the requests finished, not that the vendor supplied full coverage.
@@ -76,10 +129,14 @@ Relevant pages under https://docs.thetadata.us/operations/:
 Corporate-action schemas: /corporate_action/{dividend,split} in the OpenAPI spec.
 Error codes: https://docs.thetadata.us/Articles/Errors-Exchanges-Conditions/Error-Codes.html
 
-Limits: the quote universe is a date-wide observation, not an intraday listing
-snapshot. 1s quotes are samples; use --quote-interval tick for quote events when
-your subscription supports them. Requests cover the exchange's regular session.
-OI is requested on the report date and describes the previous session's close.
+Limits: the combined universe is date-wide observed evidence, not a complete
+listing file or an intraday listing snapshot. Tick access depends on the account;
+the collector does not substitute a sampled interval if tick access fails.
+Sample timestamps do not reveal the original quote's event time or event age.
+Intraday requests use the underlying's regular session, including early closes;
+they do not include any option trading after the underlying's session ends.
+One bulk OI pull per symbol-day describes the previous session's close; missing
+reports remain missing. Quotes/trades need separate pulls per selected contract.
 Theta EOD is generated around 17:15 ET, not a 16:00 quote. The reference bundle
 includes SOFR and every documented Treasury tenor, plus VIX EOD and intraday
 prices at the requested quote interval. Rates keep vendor percentage units and
@@ -105,6 +162,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import socket
 import sys
 import tempfile
@@ -121,10 +179,12 @@ from pathlib import Path
 import re
 from uuid import uuid4
 from urllib.parse import urlsplit
+from typing import BinaryIO, Iterable
 
 import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
 from requests.adapters import HTTPAdapter
@@ -138,7 +198,7 @@ else:
 # 1. Collection settings and the existing research universe.
 # Schema versions identify the layout/meaning of our saved files. They let the
 # resume checks distinguish compatible data from an older output format.
-OUTPUT_SCHEMA_VERSION = "2026-09-07-raw-collection-v1"
+OUTPUT_SCHEMA_VERSION = "2026-09-08-research-collection-v2"
 RAW_SCHEMA_VERSION = 1
 # Keep the original default root so existing raw caches can be reused.
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "data" / "multi_year_bsm_backtest_output"
@@ -155,7 +215,8 @@ TRADE_FIELDS = ("trade_timestamp", "quote_timestamp", "sequence", "condition", "
                 "exchange", "price", *QUOTE_FIELDS)
 # An option's identity needs all four fields. "right" means call or put.
 CONTRACT_FIELDS = ("symbol", "expiration", "strike", "right")
-SELECTION_COLUMNS = (*CONTRACT_FIELDS, "contract_key", "dte_days", "selection_times")
+DISCOVERY_COLUMNS = (*CONTRACT_FIELDS, "discovery_sources")
+SELECTION_COLUMNS = (*CONTRACT_FIELDS, "contract_key", "dte_days", "selection_times", "discovery_sources")
 # SOFR is an overnight reference rate; Treasury suffixes specify months/years.
 # Collecting several maturities keeps the later choice of a pricing rate open.
 RATE_SYMBOLS = ("SOFR", "TREASURY_M1", "TREASURY_M3", "TREASURY_M6", "TREASURY_Y1",
@@ -175,6 +236,8 @@ REPORT_DATE_COLUMNS = {"interest_rate_eod": "created", "corporate_dividend": "ex
 
 @dataclass(frozen=True)
 class SymbolConfig:
+    # A dataclass groups related named values. frozen=True prevents accidentally
+    # changing them while several worker threads are using the same settings.
     # Descriptive research labels for one underlying. They are saved with its
     # session record; they do not create vendor requests or compute features.
     symbol: str
@@ -186,6 +249,8 @@ class SymbolConfig:
 # This is the explicit study list, not a historical list of all listed assets.
 # --symbols selects a subset. A listed symbol can still lack data on some dates.
 UNIVERSE = [
+    # These group/sector labels are descriptive. They do not change which prices
+    # Theta returns and they are not classifications of a day's market regime.
     SymbolConfig("SPY", "ETF", "broad_market_etf", "broad_market"),
     SymbolConfig("QQQ", "ETF", "growth_etf", "technology"),
     SymbolConfig("IWM", "ETF", "small_cap_etf", "small_cap"),
@@ -212,6 +277,9 @@ UNIVERSE = [
 
 @dataclass(frozen=True)
 class CollectorConfig:
+    # Defaults define a collection plan, not the paper's final experiment.
+    # The command line overrides a few operational choices; the selection grid
+    # below is deliberately visible in this single file for research review.
     # Requests go through the user's local Theta Terminal v3 application.
     base_url: str = "http://127.0.0.1:25503/v3"
     # Default study bounds. The CLI can request a smaller slice within them.
@@ -231,22 +299,36 @@ class CollectorConfig:
     min_dte: int = 7
     max_dte: int = 180
     exchange_tz: str = "America/New_York"
-    # "1s" requests sampled quotes. "tick" requests quote events. Trades are
-    # requested as individual events regardless of this quote setting.
-    quote_interval: str = "1s"
+    # Keep quote events so later frequency comparisons can use the same source
+    # records. A sampled quote cannot reveal updates between its sample times.
+    # Explicit sampled requests remain available for smaller exploratory pulls.
+    quote_interval: str = "tick"
+    # "Tick" here means a reported quote event, not a fixed amount of wall time
+    # and not necessarily a change in the midpoint. The vendor may report size
+    # or other quote updates while the displayed price stays the same.
+    # Bound parsing/Parquet batches instead of holding a tick day entirely in RAM.
+    raw_chunk_rows: int = 100_000
     stock_venue: str = "utp_cta"
     # At these New York times, use a recent stock quote to choose option strikes.
     # These times select downloads; all requested session observations are saved.
     selection_times: tuple[str, ...] = ("10:30:00", "13:00:00", "15:00:00")
-    # A selection reference cannot use a stock quote older than this many seconds.
+    # Taking the union across these times allows the downloaded strikes to move
+    # with the underlying price. It is still a download sample: an option far
+    # from every target at all three times may never be selected.
+    # Limit the age of the last observation used for selection. In sampled mode
+    # this is the sample's age; the original quote's event time is not supplied.
     max_stock_quote_age_seconds: int = 70
     # Ask Theta to match a trade to a quote strictly before its timestamp.
     trade_quote_exclusive: bool = True
+    # "Exclusive" concerns matching clocks: the matched quote precedes the trade
+    # strictly. It does not prove the displayed quote was executable for that trade.
     # Workers overlap downloads: first across symbol-days, then option requests.
     # The shared client below still caps total requests in flight and start rate.
     max_symbol_day_workers: int = 2
     max_contract_workers: int = 4
     max_requests_per_second: float = 8.0
+    # This is our own start-rate limit. Concurrency is the separate number of
+    # unfinished requests, and must fit the account's Theta subscription allowance.
     max_inflight_requests: int = 8
     # Parquet tables and request metadata are always saved. This flag also keeps
     # the exact successful response bytes, which use additional disk space.
@@ -273,6 +355,8 @@ class CollectorConfig:
                      "max_requests_per_second", "max_inflight_requests", "max_stock_quote_age_seconds"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if not isinstance(self.raw_chunk_rows, int) or self.raw_chunk_rows <= 0:
+            raise ValueError("raw_chunk_rows must be a positive integer")
         if (not self.selection_times or tuple(sorted(set(self.selection_times))) != self.selection_times
                 or any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d", t) for t in self.selection_times)):
             raise ValueError("selection_times must be unique, ordered HH:MM:SS values")
@@ -282,6 +366,9 @@ class CollectorConfig:
     def policy(self) -> dict:
         # Worker counts, scope, and the separate reference bundle do not change
         # which contracts are selected or invalidate already collected sessions.
+        # For example, changing the S/K grid changes the policy ID; lowering the
+        # parsing batch size does not. Raw responses can be reused in either case
+        # when their endpoint arguments and stored files still match exactly.
         names = ("option_rights", "target_dtes", "max_expirations_per_day", "moneyness_targets",
                  "strikes_per_moneyness_target", "min_dte", "max_dte", "exchange_tz",
                  "quote_interval", "stock_venue", "selection_times", "max_stock_quote_age_seconds",
@@ -305,6 +392,9 @@ class Request:
     endpoint: str
     params: dict
     vendor: str = field(default="ThetaData", init=False)
+    # This object describes a pull; creating it has no network side effect.
+    # One object can describe a whole stock day, one option's quotes, or a range
+    # of rate reports. Its arguments, not its Python variable name, identify it.
 
     def identity(self) -> dict:
         return asdict(self)
@@ -319,8 +409,10 @@ class Request:
     def required_columns(self) -> tuple[str, ...]:
         # A successful HTTP response must also look like the requested table.
         # This catches error pages or incompatible schemas before cache reuse.
+        # Columns are checked for presence, not restricted to this list. If Theta
+        # supplies an additional field, it remains in the saved raw table.
         kind = self.endpoint.rsplit("/", 1)[-1]
-        if self.dataset == "quoted_contracts":
+        if self.dataset in {"quoted_contracts", "traded_contracts"}:
             return CONTRACT_FIELDS
         if self.dataset in REFERENCE_COLUMNS:
             return REFERENCE_COLUMNS[self.dataset]
@@ -331,6 +423,37 @@ class Request:
                   "open_interest": ("timestamp", "open_interest"),
                   "eod": ("created", "last_trade", "open", "high", "low", "close", "volume", "count")}
         return ((*CONTRACT_FIELDS,) if self.endpoint.startswith("/option/") else ()) + fields[kind]
+
+    @property
+    def report_date_column(self) -> str | None:
+        return "date" if "/list/dates" in self.endpoint else REPORT_DATE_COLUMNS.get(self.dataset)
+
+    def observation_semantics(self) -> dict:
+        # Keep clocks distinct: a sampled-quote timestamp is a sample boundary,
+        # not proof that the underlying quote was updated at that moment.
+        # These descriptions are saved alongside each request. Later code can
+        # read the meaning of a clock without guessing from the dataset name.
+        kind = self.endpoint.rsplit("/", 1)[-1]
+        if self.report_date_column:
+            return {"kind": "dated_report", "date_column": self.report_date_column,
+                    "publication_time_verified": False}
+        if "/list/contracts/" in self.endpoint:
+            return {"kind": "date_wide_observed_contracts", "intraday_listing_time_verified": False}
+        if kind == "quote":
+            tick = self.params.get("interval") == "tick"
+            return {"kind": "quote_events" if tick else "sampled_quotes",
+                    "timestamp_role": "quote_event" if tick else "sample_boundary",
+                    "quote_event_time_available": tick}
+        if kind == "trade_quote":
+            return {"kind": "trade_events_with_matched_quotes", "timestamp_role": "trade_event",
+                    "matched_quote_clock": "quote_timestamp", "exclusive": self.params.get("exclusive")}
+        if kind == "open_interest":
+            return {"kind": "open_interest_report", "describes": "previous_trading_session_close",
+                    "missing_report_means_zero": False}
+        if kind == "price":
+            return {"kind": "index_price_updates" if self.params.get("interval") == "tick" else "sampled_index_prices",
+                    "unchanged_updates_may_be_omitted": True}
+        return {"kind": "end_of_day_report", "is_regular_session_close_quote": False}
 
 
 # 3. File writing, receipts, and locking.
@@ -383,6 +506,8 @@ def write_parquet(path: Path, frame: pd.DataFrame) -> None:
 def file_receipt(path: Path, root: Path, frame: pd.DataFrame | None = None) -> dict:
     # Relative paths keep receipts usable if the whole output folder is moved.
     # Table receipts additionally remember row counts and column names.
+    # A SHA-256 fingerprint is a compact identifier of the bytes. It helps detect
+    # a changed file; it does not certify the economic accuracy of Theta's data.
     stat = path.stat()
     receipt = {"path": path.relative_to(root).as_posix(), "size": stat.st_size,
                "mtime_ns": stat.st_mtime_ns, "sha256": file_hash(path)}
@@ -448,6 +573,9 @@ def output_lock(output_dir: Path):
 def parse_vendor_clock(values: pd.Series, exchange_tz: str) -> pd.Series:
     # Naive Theta clocks are exchange local. Aware clocks keep their stated
     # offset. Date-only interest-rate reports deliberately do not use this.
+    # "Naive" means the text has no timezone offset. "Aware" means it includes
+    # one, such as -05:00. Both become separate UTC columns for later alignment;
+    # conversion does not alter the original vendor timestamp text.
     text = values.astype("string").str.strip()
     aware = text.str.contains(r"(?:Z|[+-]\d{2}:?\d{2})$", case=False, na=False)
     parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns, UTC]")
@@ -465,6 +593,8 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
     # bad quotes, and clock problems describe the data; they do not delete rows.
     result = frame.copy()
     diagnostics = {"duplicate_rows": int(frame.duplicated().sum()), "clocks": {}}
+    # A repeated row is counted, not removed. A sequence code, condition, or
+    # repeated price may matter when distinguishing events from sampling artifacts.
     clocks = ("timestamp", "trade_timestamp", "quote_timestamp", "last_trade", "created")
     for name in clocks:
         if name not in frame or (name == "created" and request.dataset == "interest_rate_eod"):
@@ -482,11 +612,13 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
     if {"bid", "ask"}.issubset(frame):
         # Bid = displayed buying price; ask = displayed selling price. A crossed
         # quote has bid > ask. Numeric conversion here is only for counting.
+        # We do not turn the midpoint of a problematic quote into a research
+        # price here. Raw preservation and selection-reference checks are separate.
         bid, ask = (pd.to_numeric(frame[side], errors="coerce") for side in ("bid", "ask"))
         diagnostics.update(invalid_bid_ask_rows=int((~np.isfinite(bid) | ~np.isfinite(ask)).sum()),
                            nonpositive_bid_ask_rows=int((bid.le(0) | ask.le(0)).sum()),
                            crossed_quote_rows=int(bid.gt(ask).sum()))
-    report_date = REPORT_DATE_COLUMNS.get(request.dataset)
+    report_date = request.report_date_column
     # A report date tells us which day the record concerns, not the precise
     # time researchers could first have known it. Do not invent that timestamp.
     if report_date and report_date in frame:
@@ -516,6 +648,9 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
 
 def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: CollectorConfig) -> list[str]:
     """Flag misrouted responses without dropping or correcting vendor records."""
+    # A table for the wrong symbol, option, or date can look otherwise plausible.
+    # Record such mismatches as a failed response so it cannot silently satisfy
+    # a different request. Its original rows remain available for inspection.
     if frame.empty:
         return []
     issues = []
@@ -530,18 +665,20 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
         if (expiry.isna().any() or (~np.isfinite(strike) | strike.le(0)).any()
                 or not right.isin(["call", "put"]).all()):
             issues.append("invalid_contract_identity")
-        if "expiration" in request.params and (
-                expiry.ne(pd.Timestamp(request.params["expiration"])).any()
-                or strike.ne(float(request.params["strike"])).any()
-                or right.ne(request.params["right"]).any()):
+        # Bulk OI explicitly requests all expirations/strikes/rights. Validate
+        # returned identities without treating the wildcard as a literal contract.
+        if ((request.params.get("expiration") not in {None, "*"}
+                and expiry.ne(pd.Timestamp(request.params["expiration"])).any())
+                or (request.params.get("strike") not in {None, "*"}
+                    and strike.ne(float(request.params["strike"])).any())
+                or (request.params.get("right") in {"call", "put"}
+                    and right.ne(request.params["right"]).any())):
             issues.append("unexpected_contract_identity")
     start = request.params.get("date", request.params.get("start_date"))
     # Compare market records on their exchange-local calendar date. A UTC date
     # can differ from the local date, so it is not used directly for this check.
     end = request.params.get("date", request.params.get("end_date"))
-    report_date = REPORT_DATE_COLUMNS.get(request.dataset)
-    if "/list/dates" in request.endpoint:
-        report_date = "date"
+    report_date = request.report_date_column
     primary = report_date or next((name for name in ("timestamp", "trade_timestamp", "created") if name in frame), None)
     if primary and primary in frame:
         if report_date:
@@ -558,6 +695,88 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
     return issues
 
 
+class RawDiagnostics:
+    """Accumulate small quality summaries while raw rows are written in batches."""
+    # Only counts, date summaries, and the last clock of each batch carry forward.
+    # The entire tick history does not need to stay in memory to describe it.
+
+    def __init__(self, request: Request, cfg: CollectorConfig):
+        self.request, self.cfg = request, cfg
+        self.rows = self.chunks = 0
+        self.quality = {"clocks": {}}
+        self.issues, self.report_dates = set(), set()
+        self.last_clocks = {}
+        self.report_missing = 0
+
+    def add(self, raw: pd.DataFrame) -> pd.DataFrame:
+        frame, quality = raw_frame_with_diagnostics(raw, self.request, self.cfg)
+        self.rows += len(frame)
+        self.chunks += 1
+        # Global all-missing checks happen in finish(), not separately per chunk.
+        self.issues.update(issue for issue in response_identity_issues(raw, self.request, self.cfg)
+                           if issue != "no_parseable_report_dates")
+        for name, value in quality.items():
+            if name not in {"clocks", "report_dates"}:
+                self.quality[name] = self.quality.get(name, 0) + value
+        for name, info in quality["clocks"].items():
+            parsed = frame[f"collector_{name}_utc"]
+            if not isinstance(parsed.dtype, pd.DatetimeTZDtype):
+                parsed = parse_vendor_clock(raw[name], self.cfg.exchange_tz)
+            valid = parsed.dropna()
+            target = self.quality["clocks"].setdefault(name, {
+                "unparseable_or_missing": 0, "out_of_order_transitions": 0,
+                "first_utc": None, "last_utc": None})
+            for count in ("unparseable_or_missing", "out_of_order_transitions"):
+                target[count] += info[count]
+            if valid.empty:
+                continue
+            previous = self.last_clocks.get(name)
+            # A boundary still belongs to the same vendor response. Compare the
+            # first clock here with the last one in the previous batch, so an
+            # out-of-order row or missing sample at that boundary is not overlooked.
+            if previous is not None:
+                target["out_of_order_transitions"] += int(valid.iloc[0] < previous)
+                if name == "timestamp" and "absent_interior_sample_slots" in quality:
+                    gap = (valid.iloc[0] - previous).total_seconds() / interval_seconds(self.request.params["interval"])
+                    self.quality["absent_interior_sample_slots"] += max(int(np.ceil(gap - 1e-9)) - 1, 0)
+            self.last_clocks[name] = valid.iloc[-1]
+            for key, choose in (("first_utc", min), ("last_utc", max)):
+                target[key] = choose((v for v in (target[key], info[key]) if v is not None), key=pd.Timestamp)
+        column = self.request.report_date_column
+        if column and column in raw:
+            dates = pd.to_datetime(raw[column].str.strip(), format="mixed", errors="coerce")
+            self.report_dates.update(dates.dropna().dt.strftime("%Y-%m-%d"))
+            self.report_missing += int(dates.isna().sum())
+        return frame
+
+    def finish(self) -> dict:
+        # "No usable clock anywhere" can only be decided after reading all
+        # batches. A first batch with blank clocks does not establish that alone.
+        if self.request.report_date_column:
+            self.quality["report_dates"] = {
+                "column": self.request.report_date_column, "unparseable_or_missing": self.report_missing,
+                "first": min(self.report_dates) if self.report_dates else None,
+                "last": max(self.report_dates) if self.report_dates else None,
+                "unique_count": len(self.report_dates), "publication_time_verified": False}
+            if self.report_missing:
+                self.issues.add("invalid_report_dates" if self.report_dates else "no_parseable_report_dates")
+        else:
+            primary = next((name for name in ("timestamp", "trade_timestamp", "created")
+                            if name in self.quality["clocks"]), None)
+            if primary and self.rows and self.quality["clocks"][primary]["unparseable_or_missing"] == self.rows:
+                self.issues.add("no_parseable_report_dates")
+        # Exact global deduplication would need memory proportional to the full
+        # response. Keep every raw row and label this diagnostic as a lower bound.
+        self.quality.update(read_chunks=self.chunks, duplicate_count_is_lower_bound=self.chunks > 1,
+                            duplicate_count_scope="within_read_chunks" if self.chunks > 1 else "whole_response",
+                            response_identity_issues=sorted(self.issues))
+        clock = self.quality["clocks"].get("timestamp", {})
+        if "absent_interior_sample_slots" in self.quality and clock.get("out_of_order_transitions"):
+            self.quality["absent_interior_sample_slots"] = None
+            self.quality["sample_gap_diagnostic_unavailable_reason"] = "out_of_order_timestamps"
+        return self.quality
+
+
 def interval_seconds(interval: str) -> float:
     # API "m" means minutes; pandas also accepts other, ambiguous abbreviations.
     if interval.endswith("ms"):
@@ -566,6 +785,8 @@ def interval_seconds(interval: str) -> float:
 
 
 def format_strike(value) -> str:
+    # Decimal handles the contract's dollar strike without float formatting
+    # artifacts. This is request-identity formatting, not option-price rounding.
     # Use decimal arithmetic for the URL and contract key: binary floats can
     # create spurious digits. Reject values beyond the supported 0.001 precision.
     strike = Decimal(str(value))
@@ -581,6 +802,8 @@ class CollectionStopped(RuntimeError):
 
 
 class ThetaClient:
+    # This class handles transport only. RequestStore decides how the returned
+    # bytes become tables and whether they are suitable for cache reuse.
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         self.local = threading.local()
@@ -639,30 +862,42 @@ class ThetaClient:
             self.check_running()
             yield
 
-    def download(self, request: Request) -> tuple[bytes | None, dict]:
+    def download(self, request: Request, payload: BinaryIO) -> dict:
         # At most six attempts. Retry temporary failures such as rate limits
         # and server errors; return other failures so they can be recorded.
         meta = {}
         for attempt in range(6):
             started = time.perf_counter()
             retry_after = 0.0
+            payload.seek(0)
+            payload.truncate()
+            # A retry starts the same response file from scratch. Appending would
+            # mix two attempts into one apparent dataset and duplicate observations.
+            fingerprint = hashlib.sha256()
+            meta = {"attempts": attempt + 1}
             try:
                 with self.request_slot():
-                    response = self.session().get(
-                        self.cfg.base_url.rstrip("/") + request.endpoint,
-                        params=request.params, timeout=(10, 120))
-                payload = response.content
-                # Keep the response's identity and timing even if it failed.
-                # These details help explain missing data later.
-                meta = {"request_url": response.url, "status_code": response.status_code,
-                        "response_headers": dict(response.headers), "attempts": attempt + 1,
-                        "elapsed_ms": (time.perf_counter() - started) * 1000,
-                        "payload_sha256": hashlib.sha256(payload).hexdigest(), "payload_bytes": len(payload)}
+                    with self.session().get(self.cfg.base_url.rstrip("/") + request.endpoint,
+                                            params=request.params, timeout=(10, 120), stream=True) as response:
+                        meta.update(request_url=response.url, status_code=response.status_code,
+                                    response_headers=dict(response.headers))
+                        # Hold the request slot until all bytes arrive. A large
+                        # tick response goes to disk instead of response.content.
+                        for piece in response.iter_content(chunk_size=256 * 1024):
+                            payload.write(piece)
+                            fingerprint.update(piece)
+                meta.update(elapsed_ms=(time.perf_counter() - started) * 1000,
+                            payload_sha256=fingerprint.hexdigest(), payload_bytes=payload.tell())
+                payload.seek(0)
                 if response.status_code in {200, 472}:
                     # 200 is an ordinary response; Theta uses 472 for no data.
                     # The storage layer records an empty result separately.
-                    return payload, meta
-                meta["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
+                    # HTTP success alone is not a valid table: schema and identity
+                    # checks still happen after the CSV is read.
+                    return meta
+                preview = payload.read(500).decode("utf-8", errors="replace")
+                payload.seek(0)
+                meta["error"] = f"HTTP {response.status_code}: {preview}"
                 if response.status_code not in {429, 474, 500, 502, 503, 504, 571} or attempt == 5:
                     # Permissions, invalid parameters, and terminal configuration
                     # need action, not thousands more requests. Sustained terminal
@@ -670,27 +905,32 @@ class ThetaClient:
                     if response.status_code in {400, 401, 403, 404, 429, 471, 473, 474, 475, 476, 478, 571}:
                         self.stop(f"Theta HTTP {response.status_code} for {request.endpoint}: "
                                   "check Theta access, terminal state, and request settings, then rerun.")
-                    return payload, meta
+                    return meta
                 try:
                     retry_after = float(response.headers.get("Retry-After", 0))
                 except ValueError:
                     pass
             except requests.RequestException as exc:
-                payload = None
-                meta = {"error": repr(exc), "attempts": attempt + 1, "status_code": None}
+                # Keep a final truncated response as failure evidence, but never
+                # parse its valid-looking prefix as a complete market-data pull.
+                meta.update(error=repr(exc), status_code=None, response_incomplete=True,
+                            payload_sha256=fingerprint.hexdigest(), payload_bytes=payload.tell())
+                payload.seek(0)
                 if attempt == 5:
                     self.stop(f"Theta connection failed after six attempts for {request.endpoint}; rerun when it is available.")
-                    return payload, meta
+                    return meta
             # Increase the delay between attempts, considering Theta's requested
             # Retry-After delay too. Both delays are bounded by the limits below.
             self.stop_event.wait(max(min(30.0, 2 ** attempt), min(max(retry_after, 0), 120.0)))
             self.check_running()
-        return None, meta
+        return meta
 
 
 # 6. Save and reuse individual responses independently of contract selection.
 # RequestStore is the common route for stocks, options, and reference data.
 class RequestStore:
+    # Think of this as a library of exact request results. Session manifests
+    # borrow receipts from that library; they do not own separate raw copies.
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         self.root = cfg.output_dir
@@ -711,6 +951,8 @@ class RequestStore:
     def cached(self, request: Request) -> dict | None:
         # Return a reusable receipt, or None to trigger collection. Merely finding
         # a file is insufficient: settings, status, and saved artifacts must agree.
+        # A reusable empty response is still useful evidence. It avoids asking
+        # the same unavailable question every run unless --refresh-no-data is set.
         path = self.directory(request) / "meta.json"
         try:
             # latest.json points to an immutable response. Older collector caches
@@ -744,12 +986,15 @@ class RequestStore:
         return {"request_id": request.request_id, "dataset": request.dataset,
                 "status": meta["status"], "row_count": meta.get("row_count", 0),
                 "status_code": meta.get("status_code"),
+                "observation_semantics": request.observation_semantics(),
                 "error": meta.get("error", ""), "data": meta.get("data"),
                 "payload": meta.get("payload"), "metadata": file_receipt(meta_path, self.root)}
 
     def collect(self, request: Request, *, refresh: bool = False) -> dict:
         # Order: reuse current cache -> import a compatible older cache -> download.
         # Date-catalogue refreshes skip current cache reuse to see newly added dates.
+        # The returned object is a receipt, not the potentially huge market table.
+        # Call read() for a small discovery table or iter_frames() for tick rows.
         self.client.check_running()
         with self.locks[hash(request.request_id) % len(self.locks)]:
             self.client.check_running()
@@ -760,70 +1005,113 @@ class RequestStore:
             if legacy is not None:
                 frame, response_meta, payload = legacy
                 return self.save(request, frame, response_meta, payload)
-            payload, response_meta = self.client.download(request)
-            status = response_meta.get("status_code")
-            frame = pd.DataFrame(columns=request.required_columns)
-            if status not in {200, 472}:
-                return self.save(request, frame, response_meta, payload, "request_error")
-            if status == 200:
+            self.root.mkdir(parents=True, exist_ok=True)
+            # The temporary response is closed/deleted on every exit path. Keeping
+            # it on disk allows parsing and optional exact-byte retention without
+            # loading a full tick day into memory or making extra vendor requests.
+            with tempfile.TemporaryFile(dir=self.root) as payload:
+                # There are two batch sizes: the network moves blocks of bytes;
+                # pandas later reads groups of CSV rows. Neither selects or
+                # resamples observations. The temporary file needs disk space for
+                # one response even when exact successful CSV retention is disabled.
+                response_meta = self.client.download(request, payload)
+                status = response_meta.get("status_code")
+                empty = pd.DataFrame(columns=request.required_columns)
+                if status not in {200, 472}:
+                    return self.save(request, empty, response_meta, payload, "request_error")
+                if status == 472:
+                    return self.save(request, empty, response_meta, payload)
                 try:
                     content_type = response_meta.get("response_headers", {}).get("Content-Type", "").lower()
                     if content_type and not any(t in content_type for t in ("csv", "text/plain", "octet-stream")):
                         raise ValueError(f"Unexpected response content type: {content_type}")
-                    # Read every vendor field as text. This preserves long sequence
-                    # numbers, decimal spelling, and blanks before any interpretation.
-                    frame = pd.read_csv(BytesIO(payload), dtype="string", keep_default_na=False)
+                    # Text fields preserve precision, condition codes, and blanks.
+                    frames = pd.read_csv(payload, dtype="string", keep_default_na=False,
+                                         chunksize=self.cfg.raw_chunk_rows)
                 except pd.errors.EmptyDataError:
-                    # A successful empty body and 472 are distinct in HTTP metadata.
-                    pass
-                except Exception as exc:
+                    return self.save(request, empty, response_meta, payload)
+                except (ValueError, UnicodeError) as exc:
                     response_meta["error"] = f"Invalid CSV response: {exc}"
-                    return self.save(request, frame, response_meta, payload, "invalid_response")
-            return self.save(request, frame, response_meta, payload)
+                    return self.save(request, empty, response_meta, payload, "invalid_response")
+                try:
+                    return self.save(request, frames, response_meta, payload)
+                finally:
+                    frames.close()
 
-    def save(self, request: Request, frame: pd.DataFrame, response_meta: dict,
-             payload: bytes | None = None, status: str | None = None) -> dict:
+    def save(self, request: Request, frames: pd.DataFrame | Iterable[pd.DataFrame], response_meta: dict,
+             payload: bytes | BinaryIO | None = None, status: str | None = None) -> dict:
         # Save the table even when it is empty or invalid, with an explicit status.
         # Retained evidence lets us distinguish absent data from a broken request.
-        # Every actual attempt gets new files, including failures. Overwriting
+        # Every collected response gets new files, including failures. Overwriting
         # data.parquet in place would change data referenced by an earlier run.
         cache_directory = self.directory(request)
         directory = cache_directory / "responses" / uuid4().hex
-        missing = set(request.required_columns) - set(frame.columns)
-        # collector_ is reserved for our added fields, so a vendor field cannot
-        # silently masquerade as one of our parsed timestamps.
-        if missing or any(str(column).startswith("collector_") for column in frame.columns):
-            status = status or "invalid_response"
-            response_meta["error"] = f"Missing required columns {sorted(missing)} or reserved collector_ column"
-        frame = frame.astype("string").fillna("")
-        frame, quality = raw_frame_with_diagnostics(frame, request, self.cfg)
-        quality["response_identity_issues"] = response_identity_issues(frame, request, self.cfg)
+        if isinstance(frames, pd.DataFrame):
+            source = frames
+            frames = (source.iloc[start:start + self.cfg.raw_chunk_rows]
+                      for start in range(0, max(len(source), 1), self.cfg.raw_chunk_rows))
+        diagnostics = RawDiagnostics(request, self.cfg)
+        # One Parquet file can contain many row groups. The writer below appends
+        # groups in incoming order; batch boundaries do not create new datasets.
+        data_path = directory / "data.parquet"
+        writer, columns = None, []
+        with atomic_output(data_path) as temp:
+            try:
+                for raw in frames:
+                    missing = set(request.required_columns) - set(raw.columns)
+                    # collector_ is reserved for added clocks, never vendor fields.
+                    if missing or any(str(column).startswith("collector_") for column in raw.columns):
+                        status = status or "invalid_response"
+                        response_meta["error"] = f"Missing required columns {sorted(missing)} or reserved collector_ column"
+                    frame = diagnostics.add(raw.astype("string").fillna(""))
+                    # The Arrow table connects pandas to the Parquet writer.
+                    # preserve_index=False omits pandas' artificial row labels;
+                    # all vendor columns and their order remain in the table.
+                    table = pa.Table.from_pandas(frame, preserve_index=False)
+                    if writer is None:
+                        columns = list(frame.columns)
+                        writer = pq.ParquetWriter(temp, table.schema, compression="zstd")
+                    writer.write_table(table)
+            except (ValueError, UnicodeError) as exc:
+                # A malformed later chunk invalidates the request even if its
+                # prefix parsed. Preserve the full response for inspection/retry.
+                status = status or "invalid_response"
+                response_meta["error"] = f"Invalid CSV/table response: {exc}"
+            finally:
+                if writer is not None:
+                    writer.close()
+            if writer is None:
+                frame = diagnostics.add(pd.DataFrame(columns=request.required_columns, dtype="string"))
+                columns = list(frame.columns)
+                frame.to_parquet(temp, index=False, compression="zstd")
+        # The receipt describes rows actually written, including a retained prefix
+        # of an invalid response, not rows merely seen before a conversion failed.
+        with pq.ParquetFile(data_path) as parquet:
+            stored_rows, columns = parquet.metadata.num_rows, parquet.schema_arrow.names
+        quality = diagnostics.finish()
         if quality["response_identity_issues"]:
             status = status or "invalid_response"
             response_meta["error"] = ", ".join(quality["response_identity_issues"])
         if status is None:
-            status = "no_data" if frame.empty else "available"
-            # An unparseable primary clock indicates an unusable response, but
-            # preserve it for inspection. Bad individual rows are never discarded.
-            primary = next((name for name in ("timestamp", "trade_timestamp", "created")
-                            if name in quality["clocks"]), None)
-            if primary and len(frame) and quality["clocks"][primary]["unparseable_or_missing"] == len(frame):
-                status = "invalid_response"
-                response_meta["error"] = f"No parseable {primary} values"
+            status = "no_data" if diagnostics.rows == 0 else "available"
+        # The request record ties four things together: what was asked, what
+        # arrived, how it was interpreted, and exactly which files were saved.
         meta = {"request": request.identity(), "request_id": request.request_id,
                 "raw_schema_version": RAW_SCHEMA_VERSION, "timestamp_timezone": self.cfg.exchange_tz,
                 "fetched_at_utc": response_meta.pop("fetched_at_utc", utc_now()), "saved_at_utc": utc_now(),
-                "status": status, "row_count": len(frame), "quality": quality,
+                "status": status, "row_count": stored_rows, "quality": quality,
+                "observation_semantics": request.observation_semantics(),
                 "collector_code_sha256": file_hash(Path(__file__)), **response_meta}
-        data_path = directory / "data.parquet"
-        write_parquet(data_path, frame)
-        meta["data"] = file_receipt(data_path, self.root, frame)
+        meta["data"] = {**file_receipt(data_path, self.root), "rows": stored_rows, "columns": columns}
         # Preserve unsuccessful responses even without --store-raw-payloads.
         # They explain schema errors, entitlement failures and vendor messages.
         if payload is not None and (self.cfg.store_raw_payloads or status not in GOOD_REQUEST_STATUSES):
             payload_path = directory / "raw_response.csv"
             with atomic_output(payload_path) as temp:
-                temp.write_bytes(payload)
+                source = BytesIO(payload) if isinstance(payload, bytes) else payload
+                source.seek(0)
+                with temp.open("wb") as handle:
+                    shutil.copyfileobj(source, handle, length=256 * 1024)
             meta["payload"] = file_receipt(payload_path, self.root)
         # Publish this attempt's receipt after its files exist, then atomically
         # advance the cache pointer only on success. A failed refresh remains
@@ -838,7 +1126,9 @@ class RequestStore:
         """Reuse valid pre-refactor raw quotes/OI/chains without changing old files."""
         # Compatibility with the original collector's folder layout. Import only
         # exact matching requests whose saved fingerprint still checks out.
-        if request.dataset not in {"quoted_contracts", "option_open_interest",
+        # If an older table already parsed numeric values, original formatting
+        # cannot be recovered without its CSV bytes. Metadata records that limit.
+        if request.params.get("expiration") == "*" or request.dataset not in {"quoted_contracts", "option_open_interest",
                                     "stock_quotes_" + self.cfg.quote_interval, "option_quotes_" + self.cfg.quote_interval}:
             return None
         params = request.params
@@ -888,6 +1178,14 @@ class RequestStore:
             return pd.DataFrame()
         return pd.read_parquet(self.root / record["data"]["path"])
 
+    def iter_frames(self, record: dict, columns: list[str] | None = None):
+        # In particular, finding three stock references must not reload the entire
+        # tick table that we just carefully wrote in bounded batches.
+        if record["status"] in GOOD_REQUEST_STATUSES and record.get("data"):
+            with pq.ParquetFile(self.root / record["data"]["path"]) as parquet:
+                for batch in parquet.iter_batches(batch_size=self.cfg.raw_chunk_rows, columns=columns):
+                    yield batch.to_pandas()
+
 
 # 7. Build requests using the exchange calendar and each endpoint's arguments.
 # Cache the calendar object so every request does not reconstruct it.
@@ -899,6 +1197,8 @@ def exchange_calendar():
 def session_bounds(day: pd.Timestamp, cfg: CollectorConfig) -> tuple[pd.Timestamp, pd.Timestamp]:
     # Read the day's actual open/close, including early closes, instead of
     # assuming every weekday has a full 09:30-16:00 session.
+    # The calendar gives UTC instants; conversion produces New York local times
+    # with the correct daylight-saving offset for that date.
     calendar = exchange_calendar()
     return (calendar.session_open(day).tz_convert(cfg.exchange_tz),
             calendar.session_close(day).tz_convert(cfg.exchange_tz))
@@ -910,10 +1210,15 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
     # asset selects stock/option/index; kind selects quote/trade_quote/OI/etc.
     params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
     if asset == "option":
-        if contract is None:
+        if contract is None and kind == "open_interest":
+            # Theta's wildcard OI request returns reports across expirations and
+            # strikes for the underlying. "both" explicitly includes calls/puts.
+            params.update(expiration="*", strike="*", right="both")
+        elif contract is None:
             raise ValueError("Option history requires an observed contract")
-        params.update(expiration=contract["expiration"], strike=format_strike(contract["strike"]),
-                      right=contract["right"])
+        else:
+            params.update(expiration=contract["expiration"], strike=format_strike(contract["strike"]),
+                          right=contract["right"])
     if kind in {"quote", "price"}:
         params["interval"] = cfg.quote_interval
         dataset = f"{asset}_{kind}s_{cfg.quote_interval}"
@@ -956,8 +1261,10 @@ def reference_requests(cfg: CollectorConfig, symbols: list[SymbolConfig], start:
 # 8. Choose actual listed contracts to download using the study's sampling grid.
 # These functions use working copies; the vendor's raw tables stay unchanged.
 def normalize_chain(frame: pd.DataFrame, symbol: str, cfg: CollectorConfig) -> pd.DataFrame:
-    # The "chain" is the dated list of quoted option contracts. Convert its
+    # The "chain" is a dated list of observed option contracts. Convert its
     # identities to comparable types and remove duplicate identities for selection.
+    # Deduplicating this list means requesting each contract once. It does not
+    # deduplicate any of that contract's raw quote, trade, or OI observations.
     if frame.empty:
         return pd.DataFrame(columns=CONTRACT_FIELDS)
     chain = frame.loc[:, CONTRACT_FIELDS].copy()
@@ -967,50 +1274,81 @@ def normalize_chain(frame: pd.DataFrame, symbol: str, cfg: CollectorConfig) -> p
     if (chain["symbol"].ne(symbol).any() or chain[["expiration", "strike"]].isna().any().any()
             or not np.isfinite(chain["strike"]).all() or chain["strike"].le(0).any()
             or not chain["right"].isin(["call", "put"]).all()):
-        raise ValueError("Invalid identity in dated quote universe")
+        raise ValueError("Invalid identity in dated observed universe")
     for strike in chain["strike"].unique():
         format_strike(strike)
     return (chain.loc[chain["right"].isin(cfg.option_rights)].drop_duplicates()
             .sort_values(["expiration", "strike", "right"]).reset_index(drop=True))
 
 
-def stock_selection_references(frame: pd.DataFrame, day: pd.Timestamp, cfg: CollectorConfig) -> list[dict]:
+def observed_contract_universe(frames: dict[str, pd.DataFrame], symbol: str,
+                               cfg: CollectorConfig) -> tuple[pd.DataFrame, dict]:
+    # OI can reveal a contract with no quote or trade that day. Combining all
+    # three dated sources avoids requiring current-day activity for discovery.
+    # This is still an observed universe, not a complete historical listing file.
+    # Example: the same call appears in the quote and OI tables. It becomes one
+    # candidate with discovery_sources="open_interest|quote". An OI-only put can
+    # also remain a candidate even if its later quote/trade pulls return no data.
+    tables = {name: normalize_chain(frame, symbol, cfg) for name, frame in frames.items()}
+    counts = {name: len(table) for name, table in tables.items()}
+    parts = [table.assign(discovery_sources=name) for name, table in tables.items() if not table.empty]
+    if not parts:
+        return pd.DataFrame(columns=DISCOVERY_COLUMNS), counts
+    combined = pd.concat(parts, ignore_index=True)
+    combined = combined.groupby(list(CONTRACT_FIELDS), as_index=False, sort=True)["discovery_sources"].agg(
+        lambda sources: "|".join(sorted(set(sources))))
+    return combined.loc[:, DISCOVERY_COLUMNS], counts
+
+
+def stock_selection_references(frames: pd.DataFrame | Iterable[pd.DataFrame], day: pd.Timestamp,
+                               cfg: CollectorConfig) -> list[dict]:
     # Produce up to three stock midpoints, each with its source quote and age.
     # The midpoint is (bid + ask) / 2 and is used only to target option strikes.
-    if frame.empty:
-        return []
-    # Only the stock spot used to choose strikes needs a usable quote. Raw storage
-    # never uses this condition policy, and option observations are never filtered.
-    quotes = frame.copy()
-    quotes["_clock"] = parse_vendor_clock(quotes["timestamp"], cfg.exchange_tz)
-    allowed = pd.Series(True, index=quotes.index)
-    # Apply the existing allowed-condition policy only to this stock lookup.
-    # Blank conditions are accepted; unlisted/non-numeric codes are excluded here.
-    for column in ("bid_condition", "ask_condition"):
-        text = quotes[column].astype("string").str.strip()
-        allowed &= text.eq("") | pd.to_numeric(text, errors="coerce").isin([0, 1, 50])
-    quotes = quotes.loc[allowed & quotes["_clock"].notna()].sort_values("_clock", kind="stable")
+    # "Reference" here means a stock price used by the selector; it is different
+    # from the dividends/rates/VIX reference bundle collected for later research.
     opened, closed = session_bounds(day, cfg)
+    times = {at: pd.Timestamp(f"{day.date()} {at}", tz=cfg.exchange_tz) for at in cfg.selection_times}
+    times = {at: clock for at, clock in times.items() if opened <= clock < closed}
+    latest = {}
+    for frame in [frames] if isinstance(frames, pd.DataFrame) else frames:
+        if frame.empty:
+            continue
+        quotes = frame.copy()
+        quotes["_clock"] = parse_vendor_clock(quotes["timestamp"], cfg.exchange_tz)
+        quotes = quotes.loc[quotes["_clock"].notna()].sort_values("_clock", kind="stable")
+        for at, clock in times.items():
+            # <= prevents a later quote from supplying an earlier stock reference.
+            # A stable sort keeps original row order when several clocks tie; the
+            # last such row wins, including across successive reading batches.
+            prior = quotes.loc[quotes["_clock"].between(opened, clock)]
+            if not prior.empty:
+                row = prior.iloc[-1]
+                if at not in latest or row["_clock"] >= latest[at]["_clock"]:
+                    latest[at] = row
+    # First find the actual last observation; only then assess its usability.
+    # Filtering first could hide a halt/non-firm quote behind an older good quote.
     references = []
-    for selection_time in cfg.selection_times:
-        at = pd.Timestamp(f"{day.date()} {selection_time}", tz=cfg.exchange_tz)
-        if not opened <= at < closed:
-            # For example, a 15:00 reference is skipped on a 13:00 early close.
+    for selection_time, at in times.items():
+        if selection_time not in latest:
             continue
-        prior = quotes.loc[quotes["_clock"].between(opened, at)]
-        # Never look forward for the stock price at a selection time. Use the
-        # latest allowed quote at or before it, then check its prices and age.
-        if prior.empty:
+        row = latest[selection_time]
+        conditions = [str(row[column]).strip() for column in ("bid_condition", "ask_condition")]
+        # Theta condition 0 = regular, 1 = bid/ask auto-executable, and 50 =
+        # national BBO. Blank codes are accepted as unspecified by this selection
+        # policy. Halted or non-firm observations cannot supply the reference.
+        # Their raw rows are still saved; this check only controls strike selection.
+        if any(text and pd.to_numeric(text, errors="coerce") not in {0, 1, 50} for text in conditions):
             continue
-        row = prior.iloc[-1]
         bid, ask = (pd.to_numeric(row[side], errors="coerce") for side in ("bid", "ask"))
         age = (at - row["_clock"]).total_seconds()
         if not (np.isfinite(bid) and np.isfinite(ask) and 0 < bid <= ask
                 and age <= cfg.max_stock_quote_age_seconds):
             continue
         references.append({"selection_time": selection_time, "stock_mid": float((bid + ask) / 2),
-                           "quote_timestamp": str(row["timestamp"]), "quote_timestamp_utc": row["_clock"].isoformat(),
-                           "sample_age_seconds": age})
+                           "observation_timestamp": str(row["timestamp"]), "observation_timestamp_utc": row["_clock"].isoformat(),
+                           "observation_age_seconds": age,
+                           "timestamp_role": "quote_event" if cfg.quote_interval == "tick" else "sample_boundary",
+                           "quote_event_age_seconds": age if cfg.quote_interval == "tick" else None})
     return references
 
 
@@ -1018,6 +1356,8 @@ def eligible_expirations(day: pd.Timestamp, expirations, cfg: CollectorConfig) -
     # Restrict to the DTE window, then choose the nearest unused expiration for
     # each target in order. Ties prefer shorter DTE. Removing each choice prevents
     # two targets from selecting the same expiration twice.
+    # These are calendar-day distances, not trading-day counts or a maturity
+    # year fraction. A future pricing module must choose its own time convention.
     remaining = sorted(exp for exp in expirations if cfg.min_dte <= (exp - day).days <= cfg.max_dte)
     selected = []
     for target in cfg.target_dtes:
@@ -1035,6 +1375,11 @@ def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[di
                      cfg: CollectorConfig) -> pd.DataFrame:
     # For each chosen expiration, find listed strikes near each S/K target at
     # each stock reference time. The output records both identity and why chosen.
+    # Worked example: if the stock midpoint is $100 and S/K target is 0.80,
+    # target K is $125. With available strikes $124 and $126, the tie chooses
+    # $124. If a later stock reference chooses $126, both enter the download set.
+    # No option midpoint, trading volume, fitted volatility, or model result is
+    # used to rank these contracts; those would add different selection rules.
     rows = []
     for expiration in eligible_expirations(day, chain["expiration"].unique(), cfg):
         family = chain.loc[chain["expiration"].eq(expiration)]
@@ -1053,11 +1398,15 @@ def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[di
         # Download the union across selection times once. Keep only call/put
         # identities actually present in the dated chain; do not invent pairs.
         for contract in family.loc[family["strike"].isin(selected)].itertuples(index=False):
+            # The key combines the four identity fields into a readable label.
+            # selection_times explains why we chose it; discovery_sources explains
+            # which vendor tables established it as an observed candidate.
             expiry, strike = expiration.strftime("%Y-%m-%d"), format_strike(contract.strike)
             rows.append({"symbol": contract.symbol, "expiration": expiry, "strike": strike,
                          "right": contract.right, "contract_key": f"{contract.symbol}|{expiry}|{strike}|{contract.right}",
                          "dte_days": (expiration - day).days,
-                         "selection_times": "|".join(at for at, values in chosen_by_time.items() if contract.strike in values)})
+                         "selection_times": "|".join(at for at, values in chosen_by_time.items() if contract.strike in values),
+                         "discovery_sources": getattr(contract, "discovery_sources", "")})
     return pd.DataFrame(rows, columns=SELECTION_COLUMNS)
 
 
@@ -1065,6 +1414,8 @@ def select_contracts(chain: pd.DataFrame, day: pd.Timestamp, references: list[di
 # A session manifest is the small record connecting selected contracts to their
 # request receipts. It can be read without opening the much larger market tables.
 class Collector:
+    # The coordinator connects the pieces above: describe requests, save raw
+    # results, choose contracts, and publish a small record of the completed work.
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         self.store = RequestStore(cfg)
@@ -1097,13 +1448,16 @@ class Collector:
                 return False
             records = manifest["requests"]
             selected_count = manifest["selected_contract_count"]
-            # Four base requests: stock quotes, dated chain, stock trades, stock EOD.
-            # Each selected option adds three: quotes, trades, and open interest.
-            if (len(records) != 4 + 3 * selected_count
+            # Six shared pulls: stock quotes/trades/EOD, quoted/traded contract
+            # lists, and one OI report covering all returned option contracts.
+            # Each selected option then adds two requests: quotes and trades.
+            if (len(records) != 6 + 2 * selected_count
                     or len({r["request_id"] for r in records}) != len(records)
-                    or manifest["contracts"]["rows"] != selected_count):
+                    or manifest["expected_request_count"] != len(records)
+                    or manifest["contracts"]["rows"] != selected_count
+                    or manifest["universe"]["rows"] != manifest["universe_contract_count"]):
                 return False
-            if not artifact_valid(manifest["contracts"], self.cfg.output_dir):
+            if not all(artifact_valid(manifest[name], self.cfg.output_dir) for name in ("contracts", "universe")):
                 return False
             for record in records:
                 if record["status"] not in GOOD_REQUEST_STATUSES:
@@ -1133,47 +1487,67 @@ class Collector:
     def collect_day(self, symbol_cfg: SymbolConfig, day: pd.Timestamp) -> dict:
         # This is the main unit of collection: one underlying on one trading day.
         # Its result is a manifest, while the large raw tables are saved separately.
+        # Read the five steps below as one story. Once a raw request is saved,
+        # a later problem in this day does not erase it or require downloading
+        # it again on the next attempt.
         symbol = symbol_cfg.symbol
         records, references = [], []
         selected = pd.DataFrame(columns=SELECTION_COLUMNS)
-        reason, error, discovered = "", "", 0
+        universe = pd.DataFrame(columns=DISCOVERY_COLUMNS)
+        source_counts = dict.fromkeys(("quote", "trade", "open_interest"), 0)
+        reason, error = "", ""
         try:
-            # Step 1: save the stock quotes needed for selection, plus the dated
-            # option universe. This universe describes quotes observed that day;
-            # it does not establish when each contract first became available.
+            # Step 1: save the stock quotes and three dated option-discovery
+            # sources. A quiet contract can appear in OI even without a quote
+            # or trade that day. These are date-wide observations, not evidence
+            # that a contract was already listed at each intraday selection time.
             stock = self.store.collect(history_request(self.cfg, "stock", "quote", symbol, day))
             records.append(stock)
             # Discovery is independent of stock availability. Keep the dated
             # universe even when stock quotes cannot support strike selection.
-            chain_record = self.store.collect(Request("quoted_contracts", "/option/list/contracts/quote",
-                                              {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}))
-            records.append(chain_record)
+            discovery = {}
+            for kind, dataset in (("quote", "quoted_contracts"), ("trade", "traded_contracts")):
+                record = self.store.collect(Request(dataset, f"/option/list/contracts/{kind}",
+                                           {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}))
+                records.append(record)
+                discovery[kind] = self.store.read(record)
+            # One wildcard OI request supplies both discovery and the raw reports
+            # for every returned contract. We never fill an absent OI report with
+            # zero, or issue another OI request for each selected contract.
+            oi_record = self.store.collect(history_request(self.cfg, "option", "open_interest", symbol, day))
+            records.append(oi_record)
+            discovery["open_interest"] = self.store.read(oi_record)
+            universe, source_counts = observed_contract_universe(discovery, symbol, self.cfg)
             # Step 2: also save individual stock trades and the day's EOD record.
             # Stock trades are retained independently of the quote sampling rate.
             for kind in ("trade_quote", "eod"):
                 records.append(self.store.collect(history_request(self.cfg, "stock", kind, symbol, day)))
-            chain = normalize_chain(self.store.read(chain_record), symbol, self.cfg)
-            discovered = len(chain)
             # Step 3: obtain the stock references, then choose the option contracts.
-            # A chosen contract gets its requested whole-session history, even if
+            # A chosen contract gets its requested regular-session history, even if
             # a later selection time caused us to choose it.
-            references = stock_selection_references(self.store.read(stock), day, self.cfg)
-            selected = select_contracts(chain, day, references, self.cfg)
-            if chain.empty:
-                reason = "no_quoted_contracts"
+            # That is a retrospective research download design. The resulting set
+            # is not a trading universe known at the beginning of that session.
+            references = stock_selection_references(self.store.iter_frames(
+                stock, columns=["timestamp", "bid", "ask", "bid_condition", "ask_condition"]), day, self.cfg)
+            selected = select_contracts(universe, day, references, self.cfg)
+            if universe.empty:
+                reason = "no_observed_contracts"
             elif not references:
                 reason = "stock_selection_reference_unavailable"
             elif selected.empty:
                 reason = "no_contracts_in_sampling_window"
-            # Step 4: collect three data types per selected option concurrently.
+            # Step 4: collect quotes and trades per selected option concurrently.
             # No trade-count, spread, or OI threshold removes a chosen contract.
             with self.workers(self.cfg.max_contract_workers) as pool:
                 futures = []
                 for contract in selected.to_dict("records"):
-                    for kind in ("quote", "trade_quote", "open_interest"):
+                    for kind in ("quote", "trade_quote"):
                         request = history_request(self.cfg, "option", kind, symbol, day, contract)
                         futures.append(pool.submit(self.store.collect, request))
                 for future in as_completed(futures):
+                    # A future is a handle for a worker's eventual result. Receipts
+                    # arrive in completion order here; the manifest sorts them for
+                    # readability without rearranging rows inside the raw tables.
                     try:
                         records.append(future.result())
                     except CollectionStopped as exc:
@@ -1193,7 +1567,11 @@ class Collector:
         # including any valid empty responses, not full observed market coverage.
         status = "request_error" if error or failures else ("unavailable" if selected.empty else "complete")
         contract_path = self.directory / "contracts" / f"symbol={symbol}__date={day.date()}.parquet"
+        universe_path = self.directory / "universes" / f"symbol={symbol}__date={day.date()}.parquet"
         write_parquet(contract_path, selected)
+        write_parquet(universe_path, universe)
+        # Keeping both lists lets a reviewer distinguish a contract that was
+        # observed but not selected from one absent from all discovery responses.
         # Step 5: record selection coverage and receipts. Times outside this
         # day's session are not counted as missing selection references.
         opened, closed = session_bounds(day, self.cfg)
@@ -1203,13 +1581,18 @@ class Collector:
                     "reason": reason, "error": error, "output_schema_version": OUTPUT_SCHEMA_VERSION,
                     "policy_id": self.cfg.policy_id, "updated_at_utc": utc_now(),
                     "session_open": opened.isoformat(), "session_close": closed.isoformat(),
-                    "quoted_contract_count": discovered, "selected_contract_count": len(selected),
+                    "intraday_window": "underlying_regular_trading_session",
+                    "discovery_scope": "union of dated quote/trade lists and prior-session OI reports; complete listing coverage unverified",
+                    "quoted_contract_count": source_counts["quote"], "traded_contract_count": source_counts["trade"],
+                    "oi_reported_contract_count": source_counts["open_interest"],
+                    "universe_contract_count": len(universe), "selected_contract_count": len(selected),
                     "stock_selection_references": references,
                     "missing_selection_times": [at for at in scheduled
                                                 if at not in {r["selection_time"] for r in references}],
                     "requests": sorted(records, key=lambda r: (r["dataset"], r["request_id"])),
                     "contracts": file_receipt(contract_path, self.cfg.output_dir, selected),
-                    "request_error_count": failures, "expected_request_count": 4 + 3 * len(selected)}
+                    "universe": file_receipt(universe_path, self.cfg.output_dir, universe),
+                    "request_error_count": failures, "expected_request_count": 6 + 2 * len(selected)}
         # Publish last. The manifest references exact artifacts, not a filename glob.
         write_json(self.session_path(symbol, day), manifest)
         self.store.client.check_running()
@@ -1219,6 +1602,9 @@ class Collector:
                            rate_symbols: list[str], run_id: str) -> list[dict]:
         # Reference data has its own ledger because it serves many symbol-days.
         # Keeping it separate avoids copying rates/VIX into each option table.
+        # We save rate percentage units exactly. For instance, a reported 4.25
+        # remains 4.25; converting to a decimal or a continuous discount rate is
+        # a later modeling decision, not a collection step.
         records = []
         # These notes travel with the data so later research can interpret units,
         # missing values, and unverified coverage without relying on this script.
@@ -1262,6 +1648,9 @@ class Collector:
     def collect_coverage(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex, run_id: str) -> dict:
         # Ask "which dates does Theta list?" before requesting detailed history.
         # anchors are the exchange sessions within the user's requested window.
+        # A listed date means the vendor advertises some data for that series.
+        # It cannot establish that every event/interval or option is present, or
+        # that this account can download the requested historical detail.
         requests_to_make = [
             Request(f"stock_{kind}_dates", f"/stock/list/dates/{kind}", {"symbol": symbol.symbol, "format": "csv"})
             for symbol in symbols for kind in ("quote", "trade")
@@ -1324,8 +1713,12 @@ class Collector:
         # Build a small CSV with one row per requested symbol-day. It summarizes
         # manifests, including days never attempted, without loading raw tables.
         # Counts/bytes describe saved artifacts, not unique economic events.
+        # For example, a standalone quote and a quote matched to a trade can
+        # describe overlapping market information. Adding their row counts is a
+        # storage total, not a count of distinct quote updates or executed trades.
         path = self.directory / "availability.csv"
-        columns = ("symbol", "trade_day", "status", "reason", "quoted_contract_count", "selected_contract_count",
+        columns = ("symbol", "trade_day", "status", "reason", "quoted_contract_count", "traded_contract_count",
+                   "oi_reported_contract_count", "universe_contract_count", "selected_contract_count",
                    "selection_reference_count", "missing_selection_times", "request_count", "request_error_count",
                    "no_data_request_count", "stored_rows", "stored_parquet_bytes", "error")
         counts = dict.fromkeys(("complete", "unavailable", "request_error", "not_attempted"), 0)
@@ -1376,12 +1769,17 @@ def package_versions() -> dict:
 def parse_run_scope(argv: list[str] | None = None):
     # Translate command-line arguments into settings, symbols, and trading days.
     # This performs no downloads or output writes, so --plan can stop here safely.
+    # "argv" is the list of arguments after the script name. If omitted, argparse
+    # reads the actual command line. Supplying a list also permits a small local
+    # check to exercise this entry point without launching a separate process.
     defaults = CollectorConfig()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--symbols", nargs="+", type=str.upper, choices=[cfg.symbol for cfg in UNIVERSE])
     parser.add_argument("--start", default=defaults.start_date, help="Inclusive first date (YYYY-MM-DD)")
     parser.add_argument("--end", default=defaults.end_date, help="Inclusive last date (YYYY-MM-DD)")
     parser.add_argument("--quote-interval", default=defaults.quote_interval, choices=QUOTE_INTERVALS)
+    parser.add_argument("--raw-chunk-rows", type=int, default=defaults.raw_chunk_rows,
+                        help="Rows per parsing/storage batch; affects memory use, not which rows are saved")
     parser.add_argument("--output-dir", type=Path, default=defaults.output_dir)
     parser.add_argument("--store-raw-payloads", action="store_true", help="Also preserve exact Theta response bytes")
     parser.add_argument("--refresh-no-data", action="store_true", help="Retry previously empty requests")
@@ -1404,6 +1802,7 @@ def parse_run_scope(argv: list[str] | None = None):
         if not pd.Timestamp(defaults.start_date) <= start <= end <= pd.Timestamp(defaults.end_date):
             raise ValueError(f"Dates must be ordered and within {defaults.start_date} through {defaults.end_date}")
         cfg = replace(defaults, quote_interval=args.quote_interval, output_dir=args.output_dir.expanduser().resolve(),
+                      raw_chunk_rows=args.raw_chunk_rows,
                       store_raw_payloads=args.store_raw_payloads, refresh_no_data=args.refresh_no_data,
                       max_inflight_requests=args.max_inflight_requests,
                       max_requests_per_second=args.max_requests_per_second)
@@ -1419,11 +1818,16 @@ def parse_run_scope(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> int:
     # Start reading here for execution order. "panels" means the stock/option
     # observations organized by underlying and trading day, not fitted models.
+    # Execution is deliberately visible here: decide scope -> preview or connect
+    # -> check dates -> collect references -> collect symbol-days -> write reports.
     args, cfg, symbols, anchors = parse_run_scope(argv)
     panels = not (args.references_only or args.coverage_only)
     total = len(symbols) * len(anchors) if panels else 0
     print(f"Scope: {', '.join(s.symbol for s in symbols)}; {args.start} to {args.end}; {total} symbol-days")
     print(f"Vendor: ThetaData; quotes: {cfg.quote_interval}; trades: events with matched quotes; stock venue: {cfg.stock_venue}")
+    if panels:
+        print("Contract discovery: dated quote/trade lists plus bulk OI; 6 shared requests + 2 per selected option/day")
+        print(f"Quote timestamps: {'events' if cfg.quote_interval == 'tick' else 'sample boundaries'}; parsing batches: {cfg.raw_chunk_rows:,} rows")
     print(f"Output: {cfg.output_dir}")
     if args.coverage_only:
         print("Coverage mode: available dates for stock quotes/trades and VIX; no history downloads")
@@ -1516,6 +1920,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Failure takes priority over a known gap. Completed requests do
                 # not establish completeness of all vendor history/reference data.
                 if run["status"] == "running":
+                    # Exit codes summarize collection, not research success:
+                    # 1 = something failed; 2 = completed with observed gaps;
+                    # 0 = requested work completed without those reported problems.
                     if (exit_code or failed or reference_failures or catalogue_errors
                             or coverage.get("request_error", 0) or coverage.get("not_attempted", 0)):
                         exit_code = 1
