@@ -10,9 +10,9 @@
 #   settings -> available-date check -> reference data and earlier stock history
 #            -> each trading day and underlying -> coverage/run reports
 # One underlying on one day:
-#   stock quotes + dated quoted/traded option lists + bulk OI + stock trades/EOD
+#   stock snapshots + dated quoted/traded option lists + bulk OI + daily reports
 #   -> stock prices at the selection times -> selected option contracts
-#   -> option quotes + option trades -> saved universe and session record
+#   -> option snapshots by expiration -> saved universe and session record
 #
 # Vocabulary used throughout:
 #   underlying: the stock or ETF on which an option is written.
@@ -38,11 +38,10 @@
 # pass; their job is to support the same collection sequence reliably.
 #
 # Why each dataset is here:
-#   quotes: preserve displayed prices and their observed updates.
-#   trades with matched quotes: preserve reported transactions and nearby quotes.
+#   hourly and near-close quotes: preserve displayed prices at matching times.
+#   stock/option EOD: retain daily volume and trade counts without every trade.
 #   open interest (OI): preserve outstanding-contract reports, including quiet
 #     contracts that can be absent from the day's quote/trade lists.
-#   stock EOD: retain the vendor's daily summary as a separate observation type.
 #   dividends/splits: retain corporate events that later pricing may need.
 #   rates: retain the available maturities without choosing a discount curve.
 #   VIX: retain a market-wide reference series for later study design.
@@ -61,7 +60,7 @@
 #   availability.csv -> a compact overview of the requested symbol-days.
 #   sessions/*.json -> why contracts were selected and links to exact responses.
 #   universes/*.parquet -> the combined observed contracts before DTE/S/K selection.
-#   contracts/*.parquet -> the smaller set for which quotes/trades were requested.
+#   contracts/*.parquet -> selected research contracts within the bulk responses.
 #   raw_cache/.../meta.json -> parameters, field names, diagnostics, and receipts.
 #   raw_cache/.../data.parquet -> the actual vendor observations plus parsed clocks.
 # JSON and CSV are readable text; Parquet is a compressed table, opened with a
@@ -69,8 +68,8 @@
 # --output-dir, so the whole output directory can be moved together.
 #
 # The broad universe is still bounded: these 21 underlyings, the requested dates,
-# and the observed contracts are the inputs to selection. Collecting tick rows
-# for selected options does not mean downloading every option ever listed.
+# and the observed contracts are the inputs to selection. Bulk quote responses
+# include extra strikes; their presence does not put them in the research sample.
 
 """Historical stock/option collection, kept in one file for review.
 
@@ -80,24 +79,41 @@ ThetaData is the sole market/reference data vendor; there are no provider fallba
 Examples (Theta Terminal v3 must be running for collection):
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --lookback-sessions 0
-  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval 1s --lookback-sessions 0
+  python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-02 --quote-interval 1h --lookback-sessions 0
   python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --references-only
   python collector.py --symbols SPY AAPL --start 2018-01-01 --end 2025-12-31 --coverage-only
 
 The default universe and DTE/S/K sampling grid are retained. Discovery combines
 dated quoted/traded contract lists and a bulk open-interest report. Each observed
 contract retains its discovery sources, including contracts found only in OI.
-The three stock reference times choose downloads, not evaluation samples.
+Stock references at 10:30, 13:30, and 15:30 ET choose the research contracts.
 A contract does not need trades, positive OI, or narrow spreads to be collected.
-Quotes default to tick events so later frequency comparisons can sample the same
-source records. Explicit sampled intervals are available for exploratory pulls.
-Normal runs also collect stock quotes/trades/EOD for 60 earlier trading sessions
+Quotes default to hourly snapshots on the regular-session grid (09:30, 10:30,
+... 15:30 on a normal day), plus a snapshot five minutes before the actual close.
+That near-close snapshot supports a consistent daily comparison: 15:55 normally,
+12:55 on a 13:00 early close. It is separate from Theta's later EOD report.
+The collector saves bid/ask fields, not calculated pricing inputs or candles.
+Sampled quotes cannot reveal intervening updates or exact trade waiting times.
+Normal runs also collect stock snapshots/EOD for 60 earlier trading sessions
 by default. --lookback-sessions changes this buffer; 0 disables it. Rates and
-VIX EOD start at the same earlier date, while VIX intraday and option selection
-stay within the study dates. --references-only omits the earlier stock pulls.
+VIX EOD use the same requested history window, while VIX intraday and option
+selection stay within study dates. Standard index access starts 2022-01-01;
+earlier requested VIX sessions are recorded as subscription coverage gaps and
+are not sent to the endpoint. --references-only omits the earlier stock pulls.
 Corporate actions extend through study end + max_dte, covering possible option
 expiration dates. Later events retain their announcement dates and unknown
 amounts; collection never assumes those events were already known during study.
+
+Daily stock and option EOD reports retain volume and trade counts. No individual
+trade downloads run. Dated traded-contract LISTS still aid contract discovery.
+One bulk EOD and one bulk OI report serve the whole underlying-day. Each selected
+expiration adds two bulk quote requests: hourly and near-close, all strikes and
+both rights. This gives seven shared requests plus two per selected expiration,
+at most 17 per underlying-day with the default five-expiration cap. Extra bulk
+strikes stay raw; contracts.parquet remains the selected research sample.
+Four HTTP slots are shared across all workers for Standard. The default has no
+artificial requests-per-second delay; --max-requests-per-second can add one.
+References use bounded concurrent batches and completed requests are reused.
 
 Raw Parquet preserves vendor columns, values, row order, duplicates, conditions,
 and exchange/sequence codes. CSV values remain strings to avoid rounding or
@@ -132,8 +148,9 @@ Refreshes save a new response; earlier run receipts continue to identify the
 exact files they used. Failed refreshes never replace the last successful cache.
 "complete" means the requests finished, not that the vendor supplied full coverage.
 Each session also reports observations_present, gaps_observed, or unknown
-coverage. Empty option quotes and missing stock references are visible gaps;
-empty trades or OI reports remain valid responses without invented zero activity.
+coverage. Check every selected contract inside the bulk replies, including
+missing hourly samples, absent near-close snapshots, and missing daily reports.
+Empty OI reports remain valid responses without invented zero activity.
 Daily rate/index coverage lists requested exchange sessions without a dated
 report. Rate publishers can observe holidays when NYSE is open; missing dates
 are observed absences, not automatic vendor errors or instructions to fill rates.
@@ -145,31 +162,33 @@ time out. Handled interruptions still publish coverage and run records.
 
 Official API specification: https://docs.thetadata.us/openapiv3.yaml
 Relevant pages under https://docs.thetadata.us/operations/:
-  {stock,option}_history_{quote,trade_quote}.html
+  {stock,option}_{history,at_time}_quote.html
   option_list_contracts.html; option_history_open_interest.html
-  stock_history_eod.html; interest_rate_history_eod.html
+  {stock,option}_history_eod.html; interest_rate_history_eod.html
 Corporate-action schemas: /corporate_action/{dividend,split} in the OpenAPI spec.
 Error codes: https://docs.thetadata.us/Articles/Errors-Exchanges-Conditions/Error-Codes.html
 
 Limits: the combined universe is date-wide observed evidence, not a complete
-listing file or an intraday listing snapshot. Tick access depends on the account;
-the collector does not substitute a sampled interval if tick access fails.
+listing file or an intraday listing snapshot. The stock/option subscriptions must
+cover the requested history; access failures do not trigger a provider fallback.
 Sample timestamps do not reveal the original quote's event time or event age.
 Intraday requests use the underlying's regular session, including early closes;
 they do not include any option trading after the underlying's session ends.
 One bulk OI pull per symbol-day describes the previous session's close; missing
-reports remain missing. Quotes/trades need separate pulls per selected contract.
+reports remain missing. Extra strike rows in bulk replies are not sample members.
 Theta EOD is generated around 17:15 ET, not a 16:00 quote. The reference bundle
 includes SOFR and every documented Treasury tenor, plus VIX EOD and intraday
-prices at the requested quote interval. Rates keep vendor percentage units and
-report dates; no discount curve is inferred. Corporate actions retain dates,
+prices at the requested quote interval plus near-close. Rates keep vendor
+percentage units and report dates; no discount curve is inferred. Corporate actions retain dates,
 missing amounts, distribution components, and split ratios (before / after).
 Action range filters use ex-dividend / effective dates, not announcement dates.
 Date-only reports never become fabricated publication timestamps or vintages.
 Index updates with unchanged prices can be omitted by Theta; absence of an index
 update is not a measurement of underlying trade inactivity.
 
-Coverage limits: Theta documents missing pre-2020 underlying history for SPY and
+Coverage limits: Standard index history starts 2022; the reference ledger names
+earlier excluded VIX sessions. Historical rates need the appropriate rate-data
+subscription too. Theta documents missing pre-2020 underlying history for SPY and
 other CTA-only symbols. --coverage-only queries current vendor date lists for
 each stock and VIX; it does not prove intraday completeness or plan entitlements.
 Adjusted option deliverables, historical symbol mappings, and reference-data
@@ -197,6 +216,7 @@ from decimal import Decimal
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO, TextIOWrapper
+from itertools import islice
 from pathlib import Path
 import re
 from uuid import uuid4
@@ -220,15 +240,16 @@ else:
 # 1. Collection settings and the existing research universe.
 # Schema versions identify the layout/meaning of our saved files. They let the
 # resume checks distinguish compatible data from an older output format.
-OUTPUT_SCHEMA_VERSION = "2026-09-08-coverage-v3"
+OUTPUT_SCHEMA_VERSION = "2026-09-08-hourly-v4"
 # Version 2 requires strict CSV record validation. Earlier parsed caches cannot
 # prove that no field was silently lost, so their original files stay preserved
 # but cannot satisfy new requests without reading verified CSV bytes again.
 RAW_SCHEMA_VERSION = 2
 # Keep the original default root so existing raw caches can be reused.
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "data" / "multi_year_bsm_backtest_output"
-QUOTE_INTERVALS = ("tick", "10ms", "100ms", "500ms", "1s", "5s", "10s", "15s",
-                   "30s", "1m", "5m", "10m", "15m", "30m", "1h")
+# Standard stock history supports one-minute and coarser snapshots. The default
+# is hourly; the same setting applies to stock, option, and index history.
+QUOTE_INTERVALS = ("1m", "5m", "10m", "15m", "30m", "1h")
 # Both statuses mean a request finished successfully. "no_data" means Theta
 # returned no rows; it does not mean that an asset had zero prices or activity.
 GOOD_REQUEST_STATUSES = {"available", "no_data"}
@@ -236,8 +257,6 @@ GOOD_REQUEST_STATUSES = {"available", "no_data"}
 # Extra vendor fields also survive in raw storage.
 QUOTE_FIELDS = ("bid_size", "bid_exchange", "bid", "bid_condition",
                 "ask_size", "ask_exchange", "ask", "ask_condition")
-TRADE_FIELDS = ("trade_timestamp", "quote_timestamp", "sequence", "condition", "size",
-                "exchange", "price", *QUOTE_FIELDS)
 # An option's identity needs all four fields. "right" means call or put.
 CONTRACT_FIELDS = ("symbol", "expiration", "strike", "right")
 DISCOVERY_COLUMNS = (*CONTRACT_FIELDS, "discovery_sources")
@@ -310,6 +329,10 @@ class CollectorConfig:
     # Default study bounds. The CLI can request a smaller slice within them.
     start_date: str = "2018-01-01"
     end_date: str = "2025-12-31"
+    # Standard indices start here; stock/options have different history limits.
+    # Earlier requested VIX sessions are recorded as access gaps, never invented
+    # or sent repeatedly to an endpoint this plan cannot use for those dates.
+    index_history_start: str = "2022-01-01"
     # Extra stock/rate history before the requested study start. This is a
     # configurable download buffer, not the paper's chosen calibration window.
     # Set --lookback-sessions 0 explicitly for a small pull without that buffer.
@@ -328,37 +351,35 @@ class CollectorConfig:
     min_dte: int = 7
     max_dte: int = 180
     exchange_tz: str = "America/New_York"
-    # Keep quote events so later frequency comparisons can use the same source
-    # records. A sampled quote cannot reveal updates between its sample times.
-    # Explicit sampled requests remain available for smaller exploratory pulls.
-    quote_interval: str = "tick"
-    # "Tick" here means a reported quote event, not a fixed amount of wall time
-    # and not necessarily a change in the midpoint. The vendor may report size
-    # or other quote updates while the displayed price stays the same.
-    # Bound parsing/Parquet batches instead of holding a tick day entirely in RAM.
+    # Hourly prices support the planned hourly/daily comparison. These snapshots
+    # cannot reconstruct intervening quote updates or exact trade waiting times.
+    quote_interval: str = "1h"
+    # A separate at-time request captures five minutes before the actual close:
+    # 15:55 normally, 12:55 on a 13:00 early close. EOD reports are not a substitute
+    # for this snapshot because Theta generates them later, around 17:15 ET.
+    near_close_minutes: int = 5
+    # Bound parsing/Parquet batches when a bulk response contains many strikes.
     raw_chunk_rows: int = 100_000
     stock_venue: str = "utp_cta"
     # At these New York times, use a recent stock quote to choose option strikes.
     # These times select downloads; all requested session observations are saved.
-    selection_times: tuple[str, ...] = ("10:30:00", "13:00:00", "15:00:00")
+    selection_times: tuple[str, ...] = ("10:30:00", "13:30:00", "15:30:00")
+    # These now lie on the hourly grid starting at 09:30. The old 13:00/15:00
+    # references would fall between samples and fail the age check below.
     # Taking the union across these times allows the downloaded strikes to move
     # with the underlying price. It is still a download sample: an option far
     # from every target at all three times may never be selected.
     # Limit the age of the last observation used for selection. In sampled mode
     # this is the sample's age; the original quote's event time is not supplied.
     max_stock_quote_age_seconds: int = 70
-    # Ask Theta to match a trade to a quote strictly before its timestamp.
-    trade_quote_exclusive: bool = True
-    # "Exclusive" concerns matching clocks: the matched quote precedes the trade
-    # strictly. It does not prove the displayed quote was executable for that trade.
-    # Workers overlap downloads: first across symbol-days, then option requests.
-    # The shared client below still caps total requests in flight and start rate.
-    max_symbol_day_workers: int = 2
-    max_contract_workers: int = 4
-    max_requests_per_second: float = 8.0
-    # This is our own start-rate limit. Concurrency is the separate number of
-    # unfinished requests, and must fit the account's Theta subscription allowance.
-    max_inflight_requests: int = 8
+    # Overlap symbol-days and bulk requests, sharing four HTTP slots across ALL
+    # workers. Standard's allowance is account-wide, including other clients.
+    max_symbol_day_workers: int = 4
+    max_batch_workers: int = 4
+    max_inflight_requests: int = 4
+    # Theta limits simultaneous requests, not paid requests per second. Zero
+    # removes our former artificial pacing delay; a positive value opts into it.
+    max_requests_per_second: float = 0.0
     # Parquet tables and request metadata are always saved. This flag also keeps
     # the exact successful response bytes, which use additional disk space.
     store_raw_payloads: bool = False
@@ -380,10 +401,16 @@ class CollectorConfig:
         if not self.moneyness_targets or any(not np.isfinite(x) or x <= 0 for x in self.moneyness_targets):
             raise ValueError("moneyness_targets must be finite and positive")
         for name in ("max_expirations_per_day", "strikes_per_moneyness_target",
-                     "max_symbol_day_workers", "max_contract_workers",
-                     "max_requests_per_second", "max_inflight_requests", "max_stock_quote_age_seconds"):
+                     "max_symbol_day_workers", "max_batch_workers",
+                     "max_inflight_requests", "max_stock_quote_age_seconds"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if not np.isfinite(self.max_requests_per_second) or self.max_requests_per_second < 0:
+            raise ValueError("max_requests_per_second must be nonnegative; 0 disables pacing")
+        if self.max_inflight_requests > 4:
+            raise ValueError("Standard allows at most four simultaneous requests across the account")
+        if not isinstance(self.near_close_minutes, int) or not 1 <= self.near_close_minutes <= 30:
+            raise ValueError("near_close_minutes must be an integer from 1 through 30")
         if not isinstance(self.raw_chunk_rows, int) or self.raw_chunk_rows <= 0:
             raise ValueError("raw_chunk_rows must be a positive integer")
         if not isinstance(self.lookback_sessions, int) or self.lookback_sessions < 0:
@@ -402,8 +429,7 @@ class CollectorConfig:
         # when their endpoint arguments and stored files still match exactly.
         names = ("option_rights", "target_dtes", "max_expirations_per_day", "moneyness_targets",
                  "strikes_per_moneyness_target", "min_dte", "max_dte", "exchange_tz",
-                 "quote_interval", "stock_venue", "selection_times", "max_stock_quote_age_seconds",
-                 "trade_quote_exclusive")
+                 "quote_interval", "near_close_minutes", "stock_venue", "selection_times", "max_stock_quote_age_seconds")
         return {"output_schema_version": OUTPUT_SCHEMA_VERSION,
                 **{name: getattr(self, name) for name in names}}
 
@@ -449,7 +475,7 @@ class Request:
             return REFERENCE_COLUMNS[self.dataset]
         if "/list/dates" in self.endpoint:
             return ("date",)
-        fields = {"quote": ("timestamp", *QUOTE_FIELDS), "trade_quote": TRADE_FIELDS,
+        fields = {"quote": ("timestamp", *QUOTE_FIELDS),
                   "price": ("timestamp", "price"),
                   "open_interest": ("timestamp", "open_interest"),
                   "eod": ("created", "last_trade", "open", "high", "low", "close", "volume", "count")}
@@ -470,19 +496,18 @@ class Request:
                     "publication_time_verified": False}
         if "/list/contracts/" in self.endpoint:
             return {"kind": "date_wide_observed_contracts", "intraday_listing_time_verified": False}
+        if "/at_time/" in self.endpoint:
+            return {"kind": "at_time_snapshot", "requested_time": self.params["time_of_day"],
+                    "timestamp_role": "vendor_at_time_timestamp", "quote_event_time_available": False,
+                    "purpose": "near_close_daily_comparison"}
         if kind == "quote":
-            tick = self.params.get("interval") == "tick"
-            return {"kind": "quote_events" if tick else "sampled_quotes",
-                    "timestamp_role": "quote_event" if tick else "sample_boundary",
-                    "quote_event_time_available": tick}
-        if kind == "trade_quote":
-            return {"kind": "trade_events_with_matched_quotes", "timestamp_role": "trade_event",
-                    "matched_quote_clock": "quote_timestamp", "exclusive": self.params.get("exclusive")}
+            return {"kind": "sampled_quotes", "timestamp_role": "sample_boundary",
+                    "quote_event_time_available": False}
         if kind == "open_interest":
             return {"kind": "open_interest_report", "describes": "previous_trading_session_close",
                     "missing_report_means_zero": False}
         if kind == "price":
-            return {"kind": "index_price_updates" if self.params.get("interval") == "tick" else "sampled_index_prices",
+            return {"kind": "sampled_index_prices",
                     "unchanged_updates_may_be_omitted": True}
         return {"kind": "end_of_day_report", "is_regular_session_close_quote": False}
 
@@ -699,7 +724,10 @@ def raw_frame_with_diagnostics(frame: pd.DataFrame, request: Request, cfg: Colle
         # A blank payment amount remains unknown; treating it as zero would
         # silently create a dividend assumption for later pricing work.
         diagnostics["unknown_dividend_amount_rows"] = int(frame["amount"].astype("string").str.strip().eq("").sum())
-    if request.endpoint.endswith("/quote") and "collector_timestamp_utc" in result:
+    if (request.endpoint.endswith("/history/quote") and "collector_timestamp_utc" in result
+            and request.params.get("strike") != "*"):
+        # Mixing timestamps from different strikes would hide missing samples.
+        # Bulk responses are checked per selected contract in session_coverage.
         interval = request.params.get("interval", "tick")
         if interval != "tick":
             seconds = interval_seconds(interval)
@@ -764,7 +792,7 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
 class RawDiagnostics:
     """Accumulate small quality summaries while raw rows are written in batches."""
     # Only counts, date summaries, and the last clock of each batch carry forward.
-    # The entire tick history does not need to stay in memory to describe it.
+    # The entire bulk response does not need to stay in memory to describe it.
 
     def __init__(self, request: Request, cfg: CollectorConfig):
         self.request, self.cfg = request, cfg
@@ -921,7 +949,8 @@ class ThetaClient:
             self.check_running()
             with self.pace_lock:
                 wait = max(0.0, self.next_allowed - time.monotonic())
-                self.next_allowed = max(time.monotonic(), self.next_allowed) + 1 / self.cfg.max_requests_per_second
+                self.next_allowed = (max(time.monotonic(), self.next_allowed) + 1 / self.cfg.max_requests_per_second
+                                     if self.cfg.max_requests_per_second else time.monotonic())
             # Waiting workers wake promptly on cancellation, instead of starting
             # another HTTP request after the user or another worker stopped the run.
             self.stop_event.wait(wait)
@@ -948,7 +977,7 @@ class ThetaClient:
                         meta.update(request_url=response.url, status_code=response.status_code,
                                     response_headers=dict(response.headers))
                         # Hold the request slot until all bytes arrive. A large
-                        # tick response goes to disk instead of response.content.
+                        # bulk response goes to disk instead of response.content.
                         for piece in response.iter_content(chunk_size=256 * 1024):
                             payload.write(piece)
                             fingerprint.update(piece)
@@ -1001,6 +1030,9 @@ class RequestStore:
         self.cfg = cfg
         self.root = cfg.output_dir
         self.client = ThetaClient(cfg)
+        # Bind receipts to the code at startup and avoid rereading this whole
+        # source file for every response in a multi-year collection.
+        self.code_sha256 = file_hash(Path(__file__))
         # Requests with the same key share a lock, so workers cannot write the
         # same cache entry at once. Unrelated requests can usually proceed together.
         self.locks = tuple(threading.Lock() for _ in range(128))
@@ -1061,7 +1093,7 @@ class RequestStore:
         # Order: reuse current cache -> import a compatible older cache -> download.
         # Date-catalogue refreshes skip current cache reuse to see newly added dates.
         # The returned object is a receipt, not the potentially huge market table.
-        # Call read() for a small discovery table or iter_frames() for tick rows.
+        # Call read() for a small discovery table or iter_frames() for bulk rows.
         self.client.check_running()
         with self.locks[hash(request.request_id) % len(self.locks)]:
             self.client.check_running()
@@ -1075,7 +1107,7 @@ class RequestStore:
             self.root.mkdir(parents=True, exist_ok=True)
             # The temporary response is closed/deleted on every exit path. Keeping
             # it on disk allows parsing and optional exact-byte retention without
-            # loading a full tick day into memory or making extra vendor requests.
+            # loading a whole bulk response into memory or making extra requests.
             with tempfile.TemporaryFile(dir=self.root) as payload:
                 # There are two batch sizes: the network moves blocks of bytes;
                 # the CSV reader later groups complete records. Neither selects or
@@ -1165,7 +1197,7 @@ class RequestStore:
                 "fetched_at_utc": response_meta.pop("fetched_at_utc", utc_now()), "saved_at_utc": utc_now(),
                 "status": status, "row_count": stored_rows, "quality": quality,
                 "observation_semantics": request.observation_semantics(),
-                "collector_code_sha256": file_hash(Path(__file__)), **response_meta}
+                "collector_code_sha256": self.code_sha256, **response_meta}
         meta["data"] = {**file_receipt(data_path, self.root), "rows": stored_rows, "columns": columns}
         # Preserve unsuccessful responses even without --store-raw-payloads.
         # They explain schema errors, entitlement failures and vendor messages.
@@ -1192,8 +1224,9 @@ class RequestStore:
         # exact matching requests whose saved fingerprint still checks out.
         # Revalidate the original CSV bytes. An older parsed table alone cannot
         # establish that its parser preserved every input field.
-        if request.params.get("expiration") == "*" or request.dataset not in {"quoted_contracts", "option_open_interest",
-                                    "stock_quotes_" + self.cfg.quote_interval, "option_quotes_" + self.cfg.quote_interval}:
+        if ("*" in (request.params.get("expiration"), request.params.get("strike"))
+                or request.dataset not in {"quoted_contracts", "option_open_interest",
+                                    "stock_quotes_" + self.cfg.quote_interval, "option_quotes_" + self.cfg.quote_interval}):
             return None
         params = request.params
         day = pd.Timestamp(params["date"]).strftime("%Y-%m-%d")
@@ -1240,7 +1273,7 @@ class RequestStore:
 
     def iter_frames(self, record: dict, columns: list[str] | None = None):
         # In particular, finding three stock references must not reload the entire
-        # tick table that we just carefully wrote in bounded batches.
+        # table that we just carefully wrote in bounded batches.
         if record["status"] in GOOD_REQUEST_STATUSES and record.get("data"):
             with pq.ParquetFile(self.root / record["data"]["path"]) as parquet:
                 for batch in parquet.iter_batches(batch_size=self.cfg.raw_chunk_rows, columns=columns):
@@ -1267,24 +1300,22 @@ def session_bounds(day: pd.Timestamp, cfg: CollectorConfig) -> tuple[pd.Timestam
 def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
                     day: pd.Timestamp, contract: dict | None = None) -> Request:
     # Construct a request only; this function does not call the network.
-    # asset selects stock/option/index; kind selects quote/trade_quote/OI/etc.
+    # asset selects stock/option/index; kind selects sampled quotes or reports.
     params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
     if asset == "option":
-        if contract is None and kind == "open_interest":
-            # Theta's wildcard OI request returns reports across expirations and
-            # strikes for the underlying. "both" explicitly includes calls/puts.
+        if contract is None and kind in {"open_interest", "eod"}:
+            # One wildcard report supplies OI or daily volume/count for all
+            # returned contracts. "both" explicitly includes calls and puts.
             params.update(expiration="*", strike="*", right="both")
         elif contract is None:
             raise ValueError("Option history requires an observed contract")
         else:
-            params.update(expiration=contract["expiration"], strike=format_strike(contract["strike"]),
+            strike = contract.get("strike", "*")
+            params.update(expiration=contract["expiration"], strike="*" if strike == "*" else format_strike(strike),
                           right=contract["right"])
     if kind in {"quote", "price"}:
         params["interval"] = cfg.quote_interval
         dataset = f"{asset}_{kind}s_{cfg.quote_interval}"
-    elif kind == "trade_quote":
-        params["exclusive"] = str(cfg.trade_quote_exclusive).lower()
-        dataset = f"{asset}_trade_quotes_tick"
     else:
         dataset = f"{asset}_{kind}"
     if kind == "eod":
@@ -1299,6 +1330,50 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
         if asset == "stock":
             params["venue"] = cfg.stock_venue
     return Request(dataset, f"/{asset}/history/{kind}", params)
+
+
+def near_close_request(cfg: CollectorConfig, asset: str, symbol: str,
+                       day: pd.Timestamp, expiration: str | None = None) -> Request:
+    # At-time is a documented snapshot endpoint, so we do not assume an hourly
+    # response includes 15:55 or treat a 17:15 EOD quote as the market close.
+    # Minute boundaries also avoid Theta's documented slow sub-minute lookup.
+    _, closed = session_bounds(day, cfg)
+    at = closed - pd.Timedelta(minutes=cfg.near_close_minutes)
+    kind = "price" if asset == "index" else "quote"
+    params = {"symbol": symbol, "start_date": day.strftime("%Y%m%d"),
+              "end_date": day.strftime("%Y%m%d"), "time_of_day": at.strftime("%H:%M:%S.000"), "format": "csv"}
+    if asset == "option":
+        if expiration is None:
+            raise ValueError("Option near-close requests require a selected expiration")
+        params.update(expiration=expiration, strike="*", right="both")
+    elif asset == "stock":
+        params["venue"] = cfg.stock_venue
+    return Request(f"{asset}_{kind}s_near_close", f"/{asset}/at_time/{kind}", params)
+
+
+def shared_day_requests(cfg: CollectorConfig, symbol: str, day: pd.Timestamp) -> list[Request]:
+    # Seven shared requests, independent of the number of selected contracts.
+    # Keep dated trade LISTS for discovery, without downloading individual trades.
+    return [history_request(cfg, "stock", "quote", symbol, day), near_close_request(cfg, "stock", symbol, day),
+            history_request(cfg, "stock", "eod", symbol, day),
+            *[Request(dataset, f"/option/list/contracts/{kind}",
+                      {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"})
+              for kind, dataset in (("quote", "quoted_contracts"), ("trade", "traded_contracts"))],
+            history_request(cfg, "option", "open_interest", symbol, day),
+            history_request(cfg, "option", "eod", symbol, day)]
+
+
+def option_quote_requests(cfg: CollectorConfig, symbol: str, day: pd.Timestamp,
+                          selected: pd.DataFrame) -> list[Request]:
+    # Theta accepts all strikes/rights for a specific expiration in one request.
+    # Keep those raw responses intact, including extra strikes. The selected
+    # contract table remains the research sample; bulk transport does not enlarge it.
+    requests_to_make = []
+    for expiration in sorted(selected["expiration"].unique()):
+        family = {"expiration": expiration, "strike": "*", "right": "both"}
+        requests_to_make.extend([history_request(cfg, "option", "quote", symbol, day, family),
+                                 near_close_request(cfg, "option", symbol, day, expiration)])
+    return requests_to_make
 
 
 def collection_windows(cfg: CollectorConfig, start: str, end: str) -> dict:
@@ -1332,18 +1407,24 @@ def reference_requests(cfg: CollectorConfig, symbols: list[SymbolConfig], start:
                           {"symbol": symbol.symbol, **window, "end_date": windows["corporate_action_end"]})
     for symbol in sorted(set(rate_symbols)):
         yield Request("interest_rate_eod", "/interest_rate/history/eod", {"symbol": symbol, **window})
-    yield Request("index_eod", "/index/history/eod", {"symbol": "VIX", **window})
-    for day in exchange_calendar().sessions_in_range(start, end).tz_localize(None):
-        # Sub-minute index history must be requested one day at a time.
+    index_start = max(windows["history_start"], cfg.index_history_start)
+    if index_start <= end:
+        yield Request("index_eod", "/index/history/eod", {"symbol": "VIX", **window, "start_date": index_start})
+    index_days = (exchange_calendar().sessions_in_range(max(start, cfg.index_history_start), end).tz_localize(None)
+                  if max(start, cfg.index_history_start) <= end else [])
+    for day in index_days:
+        # Daily boundaries let the near-close snapshot follow early closes.
         yield history_request(cfg, "index", "price", "VIX", day)
+        yield near_close_request(cfg, "index", "VIX", day)
     if include_stock_lookback:
-        # Only normal panel runs request earlier stock quotes/trades/EOD. These
+        # Only normal panel runs request earlier stock snapshots/EOD. These
         # raw pulls have ordinary cache receipts and coverage in the reference
         # ledger; no option sample or calibration is performed in the lookback.
         for date in windows["lookback_dates"]:
             for symbol in symbols:
-                for kind in ("quote", "trade_quote", "eod"):
+                for kind in ("quote", "eod"):
                     yield history_request(cfg, "stock", kind, symbol.symbol, pd.Timestamp(date))
+                yield near_close_request(cfg, "stock", symbol.symbol, pd.Timestamp(date))
 
 
 # 8. Choose actual listed contracts to download using the study's sampling grid.
@@ -1376,7 +1457,7 @@ def observed_contract_universe(frames: dict[str, pd.DataFrame], symbol: str,
     # This is still an observed universe, not a complete historical listing file.
     # Example: the same call appears in the quote and OI tables. It becomes one
     # candidate with discovery_sources="open_interest|quote". An OI-only put can
-    # also remain a candidate even if its later quote/trade pulls return no data.
+    # also remain a candidate even if its later quote requests return no data.
     tables = {name: normalize_chain(frame, symbol, cfg) for name, frame in frames.items()}
     counts = {name: len(table) for name, table in tables.items()}
     parts = [table.assign(discovery_sources=name) for name, table in tables.items() if not table.empty]
@@ -1435,8 +1516,7 @@ def stock_selection_references(frames: pd.DataFrame | Iterable[pd.DataFrame], da
         references.append({"selection_time": selection_time, "stock_mid": float((bid + ask) / 2),
                            "observation_timestamp": str(row["timestamp"]), "observation_timestamp_utc": row["_clock"].isoformat(),
                            "observation_age_seconds": age,
-                           "timestamp_role": "quote_event" if cfg.quote_interval == "tick" else "sample_boundary",
-                           "quote_event_age_seconds": age if cfg.quote_interval == "tick" else None})
+                           "timestamp_role": "sample_boundary", "quote_event_age_seconds": None})
     return references
 
 
@@ -1526,6 +1606,25 @@ class Collector:
     def session_path(self, symbol: str, day: pd.Timestamp) -> Path:
         return self.directory / "sessions" / f"symbol={symbol}__date={day.date()}.json"
 
+    def collect_batch(self, requests_to_make: list[Request]) -> Iterable[tuple[Request, dict]]:
+        # Small batches overlap network waits and parsing. The shared client
+        # still allows at most four active HTTP requests across every worker.
+        # Yield receipts as they finish, so the caller retains earlier results
+        # even if a later future raises or the operator interrupts the batch.
+        with self.workers(self.cfg.max_batch_workers) as pool:
+            futures = {pool.submit(self.store.collect, request): request for request in requests_to_make}
+            for future in as_completed(futures):
+                request = futures[future]
+                try:
+                    record = future.result()
+                except CollectionStopped:
+                    continue
+                except Exception as exc:
+                    self.store.client.stop(f"Unable to save {request.dataset}: {exc}")
+                    record = {"request_id": request.request_id, "dataset": request.dataset,
+                              "params": request.params, "status": "request_error", "error": repr(exc)}
+                yield request, record
+
     def manifest_valid(self, manifest: dict) -> bool:
         # A saved "complete" label alone is not enough to skip work. Check that
         # the policy matches and every expected request/artifact is accounted for.
@@ -1537,16 +1636,20 @@ class Collector:
                 return False
             records = manifest["requests"]
             selected_count = manifest["selected_contract_count"]
-            # Six shared pulls: stock quotes/trades/EOD, quoted/traded contract
-            # lists, and one OI report covering all returned option contracts.
-            # Each selected option then adds two requests: quotes and trades.
-            if (len(records) != 6 + 2 * selected_count
-                    or len({r["request_id"] for r in records}) != len(records)
-                    or manifest["expected_request_count"] != len(records)
+            if (manifest["expected_request_count"] != len(records)
                     or manifest["contracts"]["rows"] != selected_count
                     or manifest["universe"]["rows"] != manifest["universe_contract_count"]):
                 return False
             if not all(artifact_valid(manifest[name], self.cfg.output_dir) for name in ("contracts", "universe")):
+                return False
+            selected = pd.read_parquet(self.cfg.output_dir / manifest["contracts"]["path"])
+            day = pd.Timestamp(manifest["trade_day"])
+            expected = (shared_day_requests(self.cfg, manifest["symbol"], day)
+                        + option_quote_requests(self.cfg, manifest["symbol"], day, selected))
+            # Check the actual batch identities, not a per-contract request-count
+            # formula that stopped being valid when transport became bulk.
+            if (len(records) != len(expected)
+                    or {r["request_id"] for r in records} != {r.request_id for r in expected}):
                 return False
             for record in records:
                 if record["status"] not in GOOD_REQUEST_STATUSES:
@@ -1577,11 +1680,13 @@ class Collector:
         """Describe observed presence separately from successful HTTP/file handling."""
         if record is None or record["status"] not in GOOD_REQUEST_STATUSES:
             return {"status": "unknown", "reason": "request_not_completed_successfully"}
-        # Trades, OI, and corporate actions are event/report driven. A successful
+        # OI and corporate actions are event/report driven. A successful
         # empty response does not by itself establish a missing required price.
         # In particular, do not label quiet contracts as failed collections.
-        if request.dataset.startswith("corporate_") or request.endpoint.endswith(("/trade_quote", "/open_interest")):
+        if request.dataset.startswith("corporate_") or request.endpoint.endswith("/open_interest"):
             return {"status": "not_assessed", "reason": "empty_event_reports_can_be_valid"}
+        if request.endpoint.endswith("/quote") and request.endpoint.startswith("/stock/"):
+            return self.quote_or_contract_report_coverage(request, record)
         if request.endpoint.endswith("/eod"):
             try:
                 frame = self.store.read(record)
@@ -1606,22 +1711,84 @@ class Collector:
         return {"status": "gaps_observed" if record["status"] == "no_data" else "observations_present",
                 "complete_intraday_history_verified": False}
 
+    def quote_or_contract_report_coverage(self, request: Request, record: dict | None,
+                                          selected: pd.DataFrame | None = None) -> dict:
+        # A bulk response can contain thousands of rows while omitting one of
+        # our selected options. Scan it once, checking each selected identity.
+        # For sampled quotes also compare the actual clock grid, including its
+        # first and last points. A repeated sampled price still counts as a row.
+        if record is None or record["status"] not in GOOD_REQUEST_STATUSES:
+            return {"status": "unknown", "reason": "request_not_completed_successfully"}
+        option = request.endpoint.startswith("/option/")
+        if option:
+            chosen = selected
+            if request.params.get("expiration") != "*":
+                chosen = chosen.loc[chosen["expiration"].eq(request.params["expiration"])]
+            wanted = set(chosen["contract_key"])
+        else:
+            wanted = {request.params["symbol"]}
+        if not wanted:
+            return {"status": "not_assessed", "reason": "no_selected_contracts"}
+        sampled = request.endpoint.endswith("/history/quote")
+        expected_times = set()
+        if sampled:
+            day = pd.Timestamp(request.params["date"])
+            opened, closed = session_bounds(day, self.cfg)
+            expected_times = set(pd.date_range(opened, closed,
+                freq=pd.Timedelta(seconds=interval_seconds(request.params["interval"]))).tz_convert("UTC"))
+        clocks = {key: set() for key in wanted}
+        column = "created" if request.endpoint.endswith("/eod") else "timestamp"
+        columns = [*CONTRACT_FIELDS, column] if option else [column]
+        try:
+            for frame in self.store.iter_frames(record, columns=columns):
+                if option:
+                    keys = (frame["symbol"] + "|" + pd.to_datetime(frame["expiration"], format="mixed").dt.strftime("%Y-%m-%d")
+                            + "|" + frame["strike"].map(format_strike) + "|"
+                            + frame["right"].str.lower().replace({"c": "call", "p": "put"}))
+                else:
+                    keys = [request.params["symbol"]] * len(frame)
+                for key, clock in zip(keys, parse_vendor_clock(frame[column], self.cfg.exchange_tz)):
+                    if key in wanted and pd.notna(clock):
+                        clocks[key].add(clock)
+            missing = []
+            for key in sorted(wanted):
+                absent = expected_times - clocks[key]
+                if (sampled and absent) or not clocks[key]:
+                    missing.append({"contract_key" if option else "symbol": key,
+                                    "missing_sample_times": [t.tz_convert(self.cfg.exchange_tz).strftime("%H:%M:%S")
+                                                             for t in sorted(absent)] if sampled else [],
+                                    "reason": "missing_sample_rows" if sampled else "no_dated_observation"})
+            return {"status": "gaps_observed" if missing else "observations_present",
+                    "checked_contract_count": len(wanted) if option else 0,
+                    "expected_samples_per_series": len(expected_times) if sampled else 1,
+                    "missing_observations": missing, "quote_event_age_verified": False,
+                    "research_sample_usability_verified": False}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"status": "unknown", "reason": "coverage_check_failed", "error": repr(exc)}
+
     def session_coverage(self, symbol: str, day: pd.Timestamp, selected: pd.DataFrame,
                          records: list[dict], missing_times: list[str], failed: bool) -> dict:
-        # These checks concern required price observations. No expected tick
-        # count is invented: nonempty quotes still do not prove a complete feed.
-        required = [history_request(self.cfg, "stock", kind, symbol, day) for kind in ("quote", "eod")]
-        required += [history_request(self.cfg, "option", "quote", symbol, day, contract)
-                     for contract in selected.to_dict("records")]
+        # Required hourly/near-close prices and daily reports are assessed on
+        # the selected sample. Extra downloaded strikes do not fill its gaps.
+        required = [request for request in shared_day_requests(self.cfg, symbol, day)
+                    if request.endpoint.endswith(("/quote", "/eod")) and "/list/" not in request.endpoint]
+        required += option_quote_requests(self.cfg, symbol, day, selected)
         by_id = {record["request_id"]: record for record in records}
-        checks = [{"request_id": request.request_id, "dataset": request.dataset, "params": request.params,
-                   **self.request_coverage(request, by_id.get(request.request_id))} for request in required]
+        checks = []
+        for request in required:
+            record = by_id.get(request.request_id)
+            coverage = (self.quote_or_contract_report_coverage(request, record, selected)
+                        if request.endpoint.startswith("/option/") else self.request_coverage(request, record))
+            checks.append({"request_id": request.request_id, "dataset": request.dataset, "params": request.params, **coverage})
         missing = [check for check in checks if check["status"] == "gaps_observed"]
         unknown = sum(check["status"] == "unknown" for check in checks)
         status = ("unknown" if failed or unknown else "gaps_observed"
                   if missing or missing_times or selected.empty else "observations_present")
         return {"status": status, "required_price_requests": checks,
-                "missing_option_quote_count": sum(c["dataset"].startswith("option_") for c in missing),
+                "missing_option_quote_count": len({row["contract_key"] for c in missing
+                    if c["dataset"].startswith("option_quotes_") for row in c["missing_observations"]}),
+                "missing_option_eod_count": len({row["contract_key"] for c in missing
+                    if c["dataset"] == "option_eod" for row in c["missing_observations"]}),
                 "missing_stock_dataset_count": sum(c["dataset"].startswith("stock_") for c in missing),
                 "unknown_required_request_count": unknown,
                 "no_selected_contracts": selected.empty,
@@ -1641,31 +1808,20 @@ class Collector:
         source_counts = dict.fromkeys(("quote", "trade", "open_interest"), 0)
         reason, error = "", ""
         try:
-            # Step 1: save the stock quotes and three dated option-discovery
-            # sources. A quiet contract can appear in OI even without a quote
-            # or trade that day. These are date-wide observations, not evidence
-            # that a contract was already listed at each intraday selection time.
-            stock = self.store.collect(history_request(self.cfg, "stock", "quote", symbol, day))
-            records.append(stock)
-            # Discovery is independent of stock availability. Keep the dated
-            # universe even when stock quotes cannot support strike selection.
-            discovery = {}
-            for kind, dataset in (("quote", "quoted_contracts"), ("trade", "traded_contracts")):
-                record = self.store.collect(Request(dataset, f"/option/list/contracts/{kind}",
-                                           {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}))
-                records.append(record)
-                discovery[kind] = self.store.read(record)
-            # One wildcard OI request supplies both discovery and the raw reports
-            # for every returned contract. We never fill an absent OI report with
-            # zero, or issue another OI request for each selected contract.
-            oi_record = self.store.collect(history_request(self.cfg, "option", "open_interest", symbol, day))
-            records.append(oi_record)
-            discovery["open_interest"] = self.store.read(oi_record)
+            # Step 1: overlap seven shared pulls: hourly/near-close stock quotes,
+            # stock EOD, two dated contract lists, bulk OI, and bulk option EOD.
+            # Daily EOD reports supply volume and trade counts without tick trades.
+            completed = self.collect_batch(shared_day_requests(self.cfg, symbol, day))
+            records.extend(record for _, record in completed)
+            by_dataset = {record["dataset"]: record for record in records}
+            self.store.client.check_running()
+            stock = by_dataset[f"stock_quotes_{self.cfg.quote_interval}"]
+            # Step 2: discovery remains independent of stock availability. OI-only
+            # contracts remain eligible; their absent quotes are recorded later.
+            discovery = {kind: self.store.read(by_dataset[dataset]) for kind, dataset in
+                         (("quote", "quoted_contracts"), ("trade", "traded_contracts"),
+                          ("open_interest", "option_open_interest"))}
             universe, source_counts = observed_contract_universe(discovery, symbol, self.cfg)
-            # Step 2: also save individual stock trades and the day's EOD record.
-            # Stock trades are retained independently of the quote sampling rate.
-            for kind in ("trade_quote", "eod"):
-                records.append(self.store.collect(history_request(self.cfg, "stock", kind, symbol, day)))
             # Step 3: obtain the stock references, then choose the option contracts.
             # A chosen contract gets its requested regular-session history, even if
             # a later selection time caused us to choose it.
@@ -1680,28 +1836,13 @@ class Collector:
                 reason = "stock_selection_reference_unavailable"
             elif selected.empty:
                 reason = "no_contracts_in_sampling_window"
-            # Step 4: collect quotes and trades per selected option concurrently.
+            # Step 4: two quote requests per selected expiration, covering all
+            # strikes/rights: hourly history and a separate near-close snapshot.
             # No trade-count, spread, or OI threshold removes a chosen contract.
-            with self.workers(self.cfg.max_contract_workers) as pool:
-                futures = []
-                for contract in selected.to_dict("records"):
-                    for kind in ("quote", "trade_quote"):
-                        request = history_request(self.cfg, "option", kind, symbol, day, contract)
-                        futures.append(pool.submit(self.store.collect, request))
-                for future in as_completed(futures):
-                    # A future is a handle for a worker's eventual result. Receipts
-                    # arrive in completion order here; the manifest sorts them for
-                    # readability without rearranging rows inside the raw tables.
-                    try:
-                        records.append(future.result())
-                    except CollectionStopped as exc:
-                        # Another worker can notice the stop before the triggering
-                        # request finishes saving. Drain results so its receipt and
-                        # other completed downloads still enter the session manifest.
-                        error = repr(exc)
-                    except Exception as exc:
-                        error = repr(exc)
-                        self.store.client.stop(f"Unable to finish an option request: {exc}")
+            # Extra bulk rows stay raw; contracts.parquet identifies the sample.
+            completed = self.collect_batch(option_quote_requests(self.cfg, symbol, day, selected))
+            records.extend(record for _, record in completed)
+            self.store.client.check_running()
         except Exception as exc:
             # Completed raw pulls survive; a failed day never satisfies resume.
             error = repr(exc)
@@ -1728,6 +1869,10 @@ class Collector:
                     "policy_id": self.cfg.policy_id, "updated_at_utc": utc_now(),
                     "session_open": opened.isoformat(), "session_close": closed.isoformat(),
                     "intraday_window": "underlying_regular_trading_session",
+                    "quote_interval": self.cfg.quote_interval,
+                    "near_close_time": (closed - pd.Timedelta(minutes=self.cfg.near_close_minutes)).strftime("%H:%M:%S"),
+                    "option_quote_batching": "all_strikes_and_rights_per_selected_expiration",
+                    "daily_activity_source": "Theta stock/option EOD volume and count; no individual trades",
                     "discovery_scope": "union of dated quote/trade lists and prior-session OI reports; complete listing coverage unverified",
                     "quoted_contract_count": source_counts["quote"], "traded_contract_count": source_counts["trade"],
                     "oi_reported_contract_count": source_counts["open_interest"],
@@ -1737,14 +1882,15 @@ class Collector:
                     "requests": sorted(records, key=lambda r: (r["dataset"], r["request_id"])),
                     "contracts": file_receipt(contract_path, self.cfg.output_dir, selected),
                     "universe": file_receipt(universe_path, self.cfg.output_dir, universe),
-                    "request_error_count": failures, "expected_request_count": 6 + 2 * len(selected)}
+                    "request_error_count": failures,
+                    "expected_request_count": 7 + 2 * selected["expiration"].nunique()}
         # Publish last. The manifest references exact artifacts, not a filename glob.
         write_json(self.session_path(symbol, day), manifest)
         self.store.client.check_running()
         return manifest
 
     def collect_references(self, symbols: list[SymbolConfig], start: str, end: str,
-                           rate_symbols: list[str], run_id: str, *, include_stock_lookback: bool = False) -> list[dict]:
+                           rate_symbols: list[str], run_id: str, *, include_stock_lookback: bool = False) -> dict:
         # Reference data has its own ledger because it serves many symbol-days.
         # Keeping it separate avoids copying rates/VIX into each option table.
         # We save rate percentage units exactly. For instance, a reported 4.25
@@ -1753,15 +1899,23 @@ class Collector:
         records = []
         # These notes travel with the data so later research can interpret units,
         # missing values, and unverified coverage without relying on this script.
-        lookback_datasets = ([f"stock_quotes_{self.cfg.quote_interval}", "stock_trade_quotes_tick", "stock_eod"]
+        lookback_datasets = ([f"stock_quotes_{self.cfg.quote_interval}", "stock_quotes_near_close", "stock_eod"]
                              if include_stock_lookback and self.cfg.lookback_sessions else [])
+        windows = collection_windows(self.cfg, start, end)
+        index_excluded = [date for date in exchange_calendar().sessions_in_range(windows["history_start"], end).strftime("%Y-%m-%d")
+                          if date < self.cfg.index_history_start]
+        access_gaps = ([{"symbol": "VIX", "reason": "before_standard_index_history_start",
+                        "access_start": self.cfg.index_history_start,
+                        "unrequested_eod_session_dates": index_excluded,
+                        "unrequested_intraday_session_dates": [date for date in index_excluded if date >= start]}]
+                       if index_excluded else [])
         ledger = {"vendor": "ThetaData", "start": start, "end": end,
-                  "collection_windows": collection_windows(self.cfg, start, end),
+                  "collection_windows": windows, "subscription_coverage_gaps": access_gaps,
                   "stock_lookback_requested": bool(lookback_datasets),
                   "option_contract_continuity_guaranteed": False,
                   "requested_rates": sorted(set(rate_symbols)), "rate_units": "percent",
                   "required_datasets": ["corporate_dividend", "corporate_split", "interest_rate_eod",
-                                        "index_eod", f"index_prices_{self.cfg.quote_interval}", *lookback_datasets],
+                                        "index_eod", f"index_prices_{self.cfg.quote_interval}", "index_prices_near_close", *lookback_datasets],
                   "rate_publication_timestamps_verified": False,
                   "corporate_action_range_filters": {"dividend": "ex_dividend_date", "split": "effective_date"},
                   "missing_dividend_amounts": "unknown; not zero", "split_ratio": "before_shares / after_shares",
@@ -1772,33 +1926,28 @@ class Collector:
                   "historical_symbol_mappings": "not_verified"}
         path = self.cfg.output_dir / "references" / f"{run_id}.json"
         def publish():
-            write_json(path, {**ledger, "updated_at_utc": utc_now(), "requests": records,
-                             "requests_with_observed_gaps": sum(r["coverage"]["status"] == "gaps_observed" for r in records),
-                             "requests_with_unknown_coverage": sum(r["coverage"]["status"] == "unknown" for r in records)})
+            ledger.update(updated_at_utc=utc_now(), requests=records,
+                          requests_with_observed_gaps=sum(r["coverage"]["status"] == "gaps_observed" for r in records),
+                          requests_with_unknown_coverage=sum(r["coverage"]["status"] == "unknown" for r in records))
+            write_json(path, ledger)
         try:
-            for request in reference_requests(self.cfg, symbols, start, end, rate_symbols,
-                                              include_stock_lookback=include_stock_lookback):
-                if self.store.client.stop_event.is_set():
+            pending = iter(reference_requests(self.cfg, symbols, start, end, rate_symbols,
+                                              include_stock_lookback=include_stock_lookback))
+            while not self.store.client.stop_event.is_set():
+                # A bounded queue keeps eight years of reference work from being
+                # scheduled at once. Finished response files are reusable even if
+                # a later batch fails or the operator stops the run.
+                batch = list(islice(pending, 32))
+                if not batch:
                     break
-                try:
-                    record = self.store.collect(request)
-                except CollectionStopped:
-                    break
-                except Exception as exc:
-                    # Record the failed reference and continue the remaining pulls.
-                    # main() still reports a failed run; completed data is retained.
-                    record = {"request_id": request.request_id, "dataset": request.dataset,
-                              "status": "request_error", "error": repr(exc)}
-                records.append({**record, "params": request.params,
-                                "coverage": self.request_coverage(request, record)})
-                # Raw receipts are committed per request. Batch this progress file
-                # so a multi-year VIX run does not rewrite it thousands of times.
-                if len(records) % 25 == 0 or record["status"] not in GOOD_REQUEST_STATUSES:
-                    publish()
-                print(f"Reference {request.params['symbol']} {request.dataset}: {record['status']}")
+                for request, record in self.collect_batch(batch):
+                    records.append({**record, "params": request.params,
+                                    "coverage": self.request_coverage(request, record)})
+                publish()
+                print(f"References: {len(records)} requests recorded")
         finally:
             publish()
-        return records
+        return ledger
 
     def collect_coverage(self, symbols: list[SymbolConfig], anchors: pd.DatetimeIndex, run_id: str) -> dict:
         # Ask "which dates does Theta list?" before requesting detailed history.
@@ -1875,7 +2024,7 @@ class Collector:
         columns = ("symbol", "trade_day", "status", "coverage_status", "reason", "quoted_contract_count", "traded_contract_count",
                    "oi_reported_contract_count", "universe_contract_count", "selected_contract_count",
                    "selection_reference_count", "missing_selection_times", "request_count", "request_error_count",
-                   "no_data_request_count", "missing_option_quote_count", "missing_stock_dataset_count",
+                   "no_data_request_count", "missing_option_quote_count", "missing_option_eod_count", "missing_stock_dataset_count",
                    "unknown_required_request_count", "stored_rows", "stored_parquet_bytes", "error")
         counts = dict.fromkeys(("complete", "unavailable", "request_error", "not_attempted"), 0)
         counts.update(days_with_observed_gaps=0, days_with_unknown_coverage=0)
@@ -1898,7 +2047,7 @@ class Collector:
                             if coverage["status"] not in {"observations_present", "gaps_observed", "unknown"}:
                                 raise ValueError("Unknown session coverage status")
                             row.update(coverage_status=coverage["status"],
-                                       **{name: coverage[name] for name in ("missing_option_quote_count",
+                                       **{name: coverage[name] for name in ("missing_option_quote_count", "missing_option_eod_count",
                                           "missing_stock_dataset_count", "unknown_required_request_count")})
                             row.update(selection_reference_count=len(manifest["stock_selection_references"]),
                                        missing_selection_times="|".join(manifest["missing_selection_times"]),
@@ -1952,8 +2101,9 @@ def parse_run_scope(argv: list[str] | None = None):
     parser.add_argument("--store-raw-payloads", action="store_true", help="Also preserve exact Theta response bytes")
     parser.add_argument("--refresh-no-data", action="store_true", help="Retry previously empty requests")
     parser.add_argument("--max-inflight-requests", type=int, default=defaults.max_inflight_requests,
-                        help="Set within your Theta subscription's concurrency allowance")
-    parser.add_argument("--max-requests-per-second", type=float, default=defaults.max_requests_per_second)
+                        help="1 through 4 for Standard; lower this if another client shares the account")
+    parser.add_argument("--max-requests-per-second", type=float, default=defaults.max_requests_per_second,
+                        help="Optional request-start pacing; default 0 means only the concurrency cap applies")
     parser.add_argument("--rate-symbols", nargs="+", default=list(RATE_SYMBOLS), type=str.upper, choices=RATE_SYMBOLS,
                         help="Theta rate series to collect; defaults to SOFR and all documented Treasury tenors")
     modes = parser.add_mutually_exclusive_group()
@@ -1994,19 +2144,22 @@ def main(argv: list[str] | None = None) -> int:
     panels = not (args.references_only or args.coverage_only)
     total = len(symbols) * len(anchors) if panels else 0
     print(f"Scope: {', '.join(s.symbol for s in symbols)}; {args.start} to {args.end}; {total} symbol-days")
-    print(f"Vendor: ThetaData; quotes: {cfg.quote_interval}; trades: events with matched quotes; stock venue: {cfg.stock_venue}")
+    print(f"Vendor: ThetaData; quotes: {cfg.quote_interval} plus near-close; daily volume/count from EOD; stock venue: {cfg.stock_venue}")
     if panels:
-        print("Contract discovery: dated quote/trade lists plus bulk OI; 6 shared requests + 2 per selected option/day")
-        print(f"Quote timestamps: {'events' if cfg.quote_interval == 'tick' else 'sample boundaries'}; parsing batches: {cfg.raw_chunk_rows:,} rows")
+        print(f"Bulk collection: 7 shared requests + 2 per selected expiration/day (at most {7 + 2 * cfg.max_expirations_per_day})")
+        print(f"Near-close snapshot: {cfg.near_close_minutes} minutes before the actual close; quote sample age is not event age")
+        print(f"Standard: {cfg.max_inflight_requests} simultaneous requests; "
+              f"request-start cap: {str(cfg.max_requests_per_second) + '/s' if cfg.max_requests_per_second else 'none'}")
     print(f"Output: {cfg.output_dir}")
     if args.coverage_only:
         print("Coverage mode: available dates for stock quotes/trades and VIX; no history downloads")
     else:
         print(f"Required references: dividends/splits, {len(set(args.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices")
         print(f"Reference history starts {windows['history_start']}; corporate actions through {windows['corporate_action_end']}")
+        print(f"Standard VIX history starts {cfg.index_history_start}; earlier requested sessions are reported as access gaps")
         if panels:
             print(f"Stock lookback: {cfg.lookback_sessions} prior sessions; "
-                  f"{3 * len(symbols) * cfg.lookback_sessions} additional quote/trade/EOD requests")
+                  f"{3 * len(symbols) * cfg.lookback_sessions} additional hourly/near-close/EOD requests")
     if args.plan:
         # Preview ends before opening a network connection or creating output.
         return 0
@@ -2022,7 +2175,7 @@ def main(argv: list[str] | None = None) -> int:
                      "collection_windows": windows,
                      "references_only": args.references_only, "coverage_only": args.coverage_only,
                      "rate_symbols": args.rate_symbols},
-           "code_sha256": file_hash(Path(__file__)), "python": sys.version, "platform": platform.platform(),
+           "code_sha256": collector.store.code_sha256, "python": sys.version, "platform": platform.platform(),
            "packages": package_versions(), "resumed_days": 0, "processed_days": 0}
     failed = reference_failures = reference_gaps = catalogue_errors = catalogue_gaps = 0
     exit_code = 0
@@ -2047,10 +2200,10 @@ def main(argv: list[str] | None = None) -> int:
                     references = collector.collect_references(symbols, args.start, args.end, args.rate_symbols, run_id,
                                                               include_stock_lookback=panels)
                     reference_failures = sum(r["status"] not in GOOD_REQUEST_STATUSES
-                                             or r["coverage"]["status"] == "unknown" for r in references)
+                                             or r["coverage"]["status"] == "unknown" for r in references["requests"])
                     # A dividend/split endpoint can correctly return no events.
                     # Missing price/rate history is a coverage gap, not a zero.
-                    reference_gaps = sum(r["coverage"]["status"] == "gaps_observed" for r in references)
+                    reference_gaps = references["requests_with_observed_gaps"] + len(references["subscription_coverage_gaps"])
                     collector.store.client.check_running()
                 if panels:
                     # Advance one trading day at a time, overlapping its symbols.
