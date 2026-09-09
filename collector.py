@@ -62,14 +62,14 @@
 #   universes/*.parquet -> the combined observed contracts before DTE/S/K selection.
 #   contracts/*.parquet -> selected research contracts within the bulk responses.
 #   raw_cache/.../meta.json -> parameters, field names, diagnostics, and receipts.
-#   raw_cache/.../data.parquet -> the actual vendor observations plus parsed clocks.
+#   raw_cache/.../data.parquet -> retained vendor observations plus parsed clocks.
 # JSON and CSV are readable text; Parquet is a compressed table, opened with a
 # table tool or pandas.read_parquet(). File paths in receipts are relative to
 # --output-dir, so the whole output directory can be moved together.
 #
 # The broad universe is still bounded: these 21 underlyings, the requested dates,
 # and the observed contracts are the inputs to selection. Bulk quote responses
-# include extra strikes; their presence does not put them in the research sample.
+# include extra strikes in transit; only selected contracts' quotes are stored.
 
 """Historical stock/option collection, kept in one file for review.
 
@@ -109,25 +109,31 @@ trade downloads run. Dated traded-contract LISTS still aid contract discovery.
 One bulk EOD and one bulk OI report serve the whole underlying-day. Each selected
 expiration adds two bulk quote requests: hourly and near-close, all strikes and
 both rights. This gives seven shared requests plus two per selected expiration,
-at most 17 per underlying-day with the default five-expiration cap. Extra bulk
-strikes stay raw; contracts.parquet remains the selected research sample.
+at most 17 per underlying-day with the default five-expiration cap. The writer
+keeps only the contracts listed in contracts.parquet from each bulk quote reply.
+Quoted/traded contract lists, OI, and option EOD requests set max_dte to the
+selection limit (180 days by default), avoiding longer maturities outside the study.
 Four HTTP slots are shared across all workers for Standard. The default has no
 artificial requests-per-second delay; --max-requests-per-second can add one.
 References use bounded concurrent batches and completed requests are reused.
 
-Raw Parquet preserves vendor columns, values, row order, duplicates, conditions,
-and exchange/sequence codes. CSV values remain strings to avoid rounding or
-silently coercing bad values. Added collector_*_utc columns are parsed clocks;
-the vendor clocks remain unchanged. Optional raw CSV saves the response bytes.
+For retained observations, Parquet preserves vendor columns, values, row order,
+duplicates, conditions, and exchange/sequence codes. CSV values remain strings
+to avoid rounding or silently coercing bad values. Added collector_*_utc columns are parsed clocks;
+the vendor clocks remain unchanged. Optional raw CSV saves the full response
+bytes, including unselected quotes, and therefore uses more storage.
 Each request has metadata, a checksum, retrieval time, and coverage diagnostics.
 Downloads go to a temporary disk file, then convert to Parquet in bounded batches.
 Every CSV record must match a unique, nonempty header. Extra/missing fields and
 malformed quoted records are rejected even at batch boundaries. Valid quoted
 commas/newlines, empty cells, exact numeric text, and extra named columns survive.
 Stock-reference selection also scans batches. Duplicate counts are lower bounds
-when a response spans multiple batches; no raw rows are removed. Small discovery
+when a response spans multiple batches. Only unselected option quotes are removed;
+quality diagnostics describe all parsed rows before this storage filter. Metadata
+records the retained contract keys, parsed-row count, and excluded-row count;
+availability.csv also totals excluded quote rows per symbol-day. Small discovery
 tables are loaded together, and legacy cache imports can still load whole tables.
-No pricing, waiting-time features, regimes, sample filters, or yield proxies run.
+No pricing, waiting-time features, regimes, liquidity filters, or yield proxies run.
 
 Output (under --output-dir):
   raw_cache/<dataset>/.../request=<id>/latest.json (last successful response)
@@ -139,8 +145,10 @@ Output (under --output-dir):
   collection/<policy-id>/runs/<run-id>.json
   references/<run-id>.json (references, stock lookback, and per-request coverage)
   coverage/<run-id>.json (vendor date lists and missing sessions; also --coverage-only)
-Successful strictly parsed requests are reused across policy changes. Old parsed
-caches without strict CSV validation are fetched again; original files remain.
+Successful strictly parsed requests with the same retained scope are reusable.
+Changing the selected contracts changes quote cache keys; broader selections may
+need another bulk download. Existing full-response files are not rewritten.
+Old parsed caches without strict CSV validation are fetched again; original files remain.
 Pre-refactor caches with verified CSV bytes can be revalidated locally.
 A day is resumable
 only after its universe, selected contracts, and referenced requests are verified.
@@ -175,7 +183,8 @@ Sample timestamps do not reveal the original quote's event time or event age.
 Intraday requests use the underlying's regular session, including early closes;
 they do not include any option trading after the underlying's session ends.
 One bulk OI pull per symbol-day describes the previous session's close; missing
-reports remain missing. Extra strike rows in bulk replies are not sample members.
+reports remain missing. Unselected quotes are counted and excluded from Parquet;
+other responses retain all returned rows within their requested scope.
 Theta EOD is generated around 17:15 ET, not a 16:00 quote. The reference bundle
 includes SOFR and every documented Treasury tenor, plus VIX EOD and intraday
 prices at the requested quote interval plus near-close. Rates keep vendor
@@ -212,7 +221,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO, TextIOWrapper
@@ -240,7 +249,7 @@ else:
 # 1. Collection settings and the existing research universe.
 # Schema versions identify the layout/meaning of our saved files. They let the
 # resume checks distinguish compatible data from an older output format.
-OUTPUT_SCHEMA_VERSION = "2026-09-08-hourly-v4"
+OUTPUT_SCHEMA_VERSION = "2026-09-08-selected-quotes-v5"
 # Version 2 requires strict CSV record validation. Earlier parsed caches cannot
 # prove that no field was silently lost, so their original files stay preserved
 # but cannot satisfy new requests without reading verified CSV bytes again.
@@ -425,8 +434,8 @@ class CollectorConfig:
         # Worker counts, scope, and the separate reference bundle do not change
         # which contracts are selected or invalidate already collected sessions.
         # For example, changing the S/K grid changes the policy ID; lowering the
-        # parsing batch size does not. Raw responses can be reused in either case
-        # when their endpoint arguments and stored files still match exactly.
+        # parsing batch size does not. Saved responses can be reused when their
+        # endpoint arguments, retained contract sets, and files match exactly.
         names = ("option_rights", "target_dtes", "max_expirations_per_day", "moneyness_targets",
                  "strikes_per_moneyness_target", "min_dte", "max_dte", "exchange_tz",
                  "quote_interval", "near_close_minutes", "stock_venue", "selection_times", "max_stock_quote_age_seconds")
@@ -449,17 +458,30 @@ class Request:
     endpoint: str
     params: dict
     vendor: str = field(default="ThetaData", init=False)
+    # None saves the full response. A tuple restricts stored option quotes to
+    # these exact contract keys, while the HTTP request can still use strike=*.
+    # This is a local storage rule, never an extra parameter sent to Theta.
+    retained_contract_keys: tuple[str, ...] | None = None
     # This object describes a pull; creating it has no network side effect.
     # One object can describe a whole stock day, one option's quotes, or a range
     # of rate reports. Its arguments, not its Python variable name, identify it.
 
     def identity(self) -> dict:
-        return asdict(self)
+        identity = asdict(self)
+        if self.retained_contract_keys is None:
+            # Full-response requests retain their old cache identity.
+            identity.pop("retained_contract_keys")
+        else:
+            # JSON reads lists, not tuples. Canonical order also means reordering
+            # the selection table does not cause another identical download.
+            identity["retained_contract_keys"] = sorted(set(self.retained_contract_keys))
+        return identity
 
     @property
     def request_id(self) -> str:
         # Identical requests get the same cache key even in different runs.
-        # Changing a date, strike, interval, or another argument changes this key.
+        # Changing the retained contracts also changes this key: a narrower saved
+        # sample must never satisfy a later request for a broader sample.
         return digest_json(self.identity())[:24]
 
     @property
@@ -768,6 +790,10 @@ def response_identity_issues(frame: pd.DataFrame, request: Request, cfg: Collect
                 or (request.params.get("right") in {"call", "put"}
                     and right.ne(request.params["right"]).any())):
             issues.append("unexpected_contract_identity")
+        if "max_dte" in request.params:
+            requested_day = pd.Timestamp(request.params.get("date", request.params.get("start_date")))
+            if (expiry - requested_day).dt.days.gt(request.params["max_dte"]).any():
+                issues.append("expiration_outside_requested_dte")
     start = request.params.get("date", request.params.get("start_date"))
     # Compare market records on their exchange-local calendar date. A UTC date
     # can differ from the local date, so it is not used directly for this check.
@@ -860,7 +886,7 @@ class RawDiagnostics:
             if primary and self.rows and self.quality["clocks"][primary]["unparseable_or_missing"] == self.rows:
                 self.issues.add("no_parseable_report_dates")
         # Exact global deduplication would need memory proportional to the full
-        # response. Keep every raw row and label this diagnostic as a lower bound.
+        # response. Count before storage filtering and label the lower bound.
         self.quality.update(read_chunks=self.chunks, duplicate_count_is_lower_bound=self.chunks > 1,
                             duplicate_count_scope="within_read_chunks" if self.chunks > 1 else "whole_response",
                             response_identity_issues=sorted(self.issues))
@@ -883,10 +909,23 @@ def format_strike(value) -> str:
     # artifacts. This is request-identity formatting, not option-price rounding.
     # Use decimal arithmetic for the URL and contract key: binary floats can
     # create spurious digits. Reject values beyond the supported 0.001 precision.
-    strike = Decimal(str(value))
-    if not strike.is_finite() or strike <= 0 or strike != strike.quantize(Decimal("0.001")):
-        raise ValueError(f"Invalid option strike: {value!r}")
+    try:
+        strike = Decimal(str(value))
+        if not strike.is_finite() or strike <= 0 or strike != strike.quantize(Decimal("0.001")):
+            raise ValueError(f"Invalid option strike: {value!r}")
+    except InvalidOperation as exc:
+        # Treat malformed vendor strikes like other invalid response values, so
+        # the caller can retain the original response for inspection and retry.
+        raise ValueError(f"Invalid option strike: {value!r}") from exc
     return format(strike, ".3f").rstrip("0").rstrip(".")
+
+
+def option_contract_keys(frame: pd.DataFrame) -> pd.Series:
+    # Normalize identities only for matching. The vendor columns themselves keep
+    # their exact text, including strike spelling, quote precision, and blanks.
+    return (frame["symbol"] + "|" + pd.to_datetime(frame["expiration"], format="mixed").dt.strftime("%Y-%m-%d")
+            + "|" + frame["strike"].map(format_strike) + "|"
+            + frame["right"].str.lower().replace({"c": "call", "p": "put"}))
 
 
 # 5. Talk to Theta Terminal: connections, shared request limits, and retries.
@@ -1024,8 +1063,8 @@ class ThetaClient:
 # 6. Save and reuse individual responses independently of contract selection.
 # RequestStore is the common route for stocks, options, and reference data.
 class RequestStore:
-    # Think of this as a library of exact request results. Session manifests
-    # borrow receipts from that library; they do not own separate raw copies.
+    # This library holds request results and their storage scope. Session manifests
+    # borrow receipts from it; they do not own separate copies of the data.
     def __init__(self, cfg: CollectorConfig):
         self.cfg = cfg
         self.root = cfg.output_dir
@@ -1086,6 +1125,7 @@ class RequestStore:
                 "status": meta["status"], "row_count": meta.get("row_count", 0),
                 "status_code": meta.get("status_code"),
                 "observation_semantics": request.observation_semantics(),
+                "retention": meta.get("retention", {}),
                 "error": meta.get("error", ""), "data": meta.get("data"),
                 "payload": meta.get("payload"), "metadata": file_receipt(meta_path, self.root)}
 
@@ -1147,6 +1187,8 @@ class RequestStore:
             frames = (source.iloc[start:start + self.cfg.raw_chunk_rows]
                       for start in range(0, max(len(source), 1), self.cfg.raw_chunk_rows))
         diagnostics = RawDiagnostics(request, self.cfg)
+        retained = None if request.retained_contract_keys is None else set(request.retained_contract_keys)
+        excluded_rows = 0
         # One Parquet file can contain many row groups. The writer below appends
         # groups in incoming order; batch boundaries do not create new datasets.
         data_path = directory / "data.parquet"
@@ -1160,6 +1202,14 @@ class RequestStore:
                         status = status or "invalid_response"
                         response_meta["error"] = f"Missing required columns {sorted(missing)} or reserved collector_ column"
                     frame = diagnostics.add(raw.astype("string").fillna(""))
+                    if retained is not None and not missing:
+                        # Check every parsed row before filtering: a bad response
+                        # must not look valid just because its bad rows were outside
+                        # our sample. Retain every observation of each selected
+                        # contract, including repeated prices and duplicate rows.
+                        keep = option_contract_keys(frame).isin(retained)
+                        excluded_rows += int((~keep).sum())
+                        frame = frame.loc[keep]
                     # The Arrow table connects pandas to the Parquet writer.
                     # preserve_index=False omits pandas' artificial row labels;
                     # all vendor columns and their order remain in the table.
@@ -1167,7 +1217,10 @@ class RequestStore:
                     if writer is None:
                         columns = list(frame.columns)
                         writer = pq.ParquetWriter(temp, table.schema, compression="zstd")
-                    writer.write_table(table)
+                    # A batch with only unselected quotes still establishes the
+                    # schema, but needs no empty row group or repeated footer data.
+                    if len(table):
+                        writer.write_table(table)
             except (ValueError, UnicodeError) as exc:
                 # A malformed later chunk invalidates the request even if its
                 # prefix parsed. Preserve the full response for inspection/retry.
@@ -1189,6 +1242,9 @@ class RequestStore:
             status = status or "invalid_response"
             response_meta["error"] = ", ".join(quality["response_identity_issues"])
         if status is None:
+            # A nonempty bulk reply can contain none of our selected contracts.
+            # Its receipt then has zero stored rows and explicit exclusions;
+            # coverage still reports the absent selected quotes as gaps.
             status = "no_data" if diagnostics.rows == 0 else "available"
         # The request record ties four things together: what was asked, what
         # arrived, how it was interpreted, and exactly which files were saved.
@@ -1196,6 +1252,9 @@ class RequestStore:
                 "raw_schema_version": RAW_SCHEMA_VERSION, "timestamp_timezone": self.cfg.exchange_tz,
                 "fetched_at_utc": response_meta.pop("fetched_at_utc", utc_now()), "saved_at_utc": utc_now(),
                 "status": status, "row_count": stored_rows, "quality": quality,
+                "quality_scope": "parsed_rows_before_storage_filter",
+                "retention": {"mode": "full_response" if retained is None else "selected_contracts",
+                              "parsed_rows": diagnostics.rows, "excluded_rows": excluded_rows},
                 "observation_semantics": request.observation_semantics(),
                 "collector_code_sha256": self.code_sha256, **response_meta}
         meta["data"] = {**file_receipt(data_path, self.root), "rows": stored_rows, "columns": columns}
@@ -1304,9 +1363,9 @@ def history_request(cfg: CollectorConfig, asset: str, kind: str, symbol: str,
     params = {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"}
     if asset == "option":
         if contract is None and kind in {"open_interest", "eod"}:
-            # One wildcard report supplies OI or daily volume/count for all
-            # returned contracts. "both" explicitly includes calls and puts.
-            params.update(expiration="*", strike="*", right="both")
+            # One wildcard report supplies OI or daily volume/count within the
+            # study's maturity limit. "both" explicitly includes calls and puts.
+            params.update(expiration="*", strike="*", right="both", max_dte=cfg.max_dte)
         elif contract is None:
             raise ValueError("Option history requires an observed contract")
         else:
@@ -1357,7 +1416,7 @@ def shared_day_requests(cfg: CollectorConfig, symbol: str, day: pd.Timestamp) ->
     return [history_request(cfg, "stock", "quote", symbol, day), near_close_request(cfg, "stock", symbol, day),
             history_request(cfg, "stock", "eod", symbol, day),
             *[Request(dataset, f"/option/list/contracts/{kind}",
-                      {"symbol": symbol, "date": day.strftime("%Y%m%d"), "format": "csv"})
+                      {"symbol": symbol, "date": day.strftime("%Y%m%d"), "max_dte": cfg.max_dte, "format": "csv"})
               for kind, dataset in (("quote", "quoted_contracts"), ("trade", "traded_contracts"))],
             history_request(cfg, "option", "open_interest", symbol, day),
             history_request(cfg, "option", "eod", symbol, day)]
@@ -1366,13 +1425,16 @@ def shared_day_requests(cfg: CollectorConfig, symbol: str, day: pd.Timestamp) ->
 def option_quote_requests(cfg: CollectorConfig, symbol: str, day: pd.Timestamp,
                           selected: pd.DataFrame) -> list[Request]:
     # Theta accepts all strikes/rights for a specific expiration in one request.
-    # Keep those raw responses intact, including extra strikes. The selected
-    # contract table remains the research sample; bulk transport does not enlarge it.
+    # Download in bulk for speed, but write quotes only for selected identities.
+    # The full selection is part of each cache key, so changing the sample cannot
+    # silently reuse files that omitted the newly requested contracts.
     requests_to_make = []
     for expiration in sorted(selected["expiration"].unique()):
         family = {"expiration": expiration, "strike": "*", "right": "both"}
-        requests_to_make.extend([history_request(cfg, "option", "quote", symbol, day, family),
-                                 near_close_request(cfg, "option", symbol, day, expiration)])
+        keys = tuple(sorted(selected.loc[selected["expiration"].eq(expiration), "contract_key"].unique()))
+        requests_to_make.extend([
+            replace(history_request(cfg, "option", "quote", symbol, day, family), retained_contract_keys=keys),
+            replace(near_close_request(cfg, "option", symbol, day, expiration), retained_contract_keys=keys)])
     return requests_to_make
 
 
@@ -1742,9 +1804,7 @@ class Collector:
         try:
             for frame in self.store.iter_frames(record, columns=columns):
                 if option:
-                    keys = (frame["symbol"] + "|" + pd.to_datetime(frame["expiration"], format="mixed").dt.strftime("%Y-%m-%d")
-                            + "|" + frame["strike"].map(format_strike) + "|"
-                            + frame["right"].str.lower().replace({"c": "call", "p": "put"}))
+                    keys = option_contract_keys(frame)
                 else:
                     keys = [request.params["symbol"]] * len(frame)
                 for key, clock in zip(keys, parse_vendor_clock(frame[column], self.cfg.exchange_tz)):
@@ -1839,7 +1899,8 @@ class Collector:
             # Step 4: two quote requests per selected expiration, covering all
             # strikes/rights: hourly history and a separate near-close snapshot.
             # No trade-count, spread, or OI threshold removes a chosen contract.
-            # Extra bulk rows stay raw; contracts.parquet identifies the sample.
+            # The writer keeps only this day's selected contracts. All their
+            # observations and vendor fields survive; excluded rows are counted.
             completed = self.collect_batch(option_quote_requests(self.cfg, symbol, day, selected))
             records.extend(record for _, record in completed)
             self.store.client.check_running()
@@ -1872,8 +1933,10 @@ class Collector:
                     "quote_interval": self.cfg.quote_interval,
                     "near_close_time": (closed - pd.Timedelta(minutes=self.cfg.near_close_minutes)).strftime("%H:%M:%S"),
                     "option_quote_batching": "all_strikes_and_rights_per_selected_expiration",
+                    "option_quote_retention": "selected_contracts",
                     "daily_activity_source": "Theta stock/option EOD volume and count; no individual trades",
-                    "discovery_scope": "union of dated quote/trade lists and prior-session OI reports; complete listing coverage unverified",
+                    "discovery_scope": "union of dated quote/trade lists and prior-session OI reports within max_dte; complete listing coverage unverified",
+                    "discovery_max_dte": self.cfg.max_dte,
                     "quoted_contract_count": source_counts["quote"], "traded_contract_count": source_counts["trade"],
                     "oi_reported_contract_count": source_counts["open_interest"],
                     "universe_contract_count": len(universe), "selected_contract_count": len(selected),
@@ -2025,7 +2088,7 @@ class Collector:
                    "oi_reported_contract_count", "universe_contract_count", "selected_contract_count",
                    "selection_reference_count", "missing_selection_times", "request_count", "request_error_count",
                    "no_data_request_count", "missing_option_quote_count", "missing_option_eod_count", "missing_stock_dataset_count",
-                   "unknown_required_request_count", "stored_rows", "stored_parquet_bytes", "error")
+                   "unknown_required_request_count", "stored_rows", "excluded_quote_rows", "stored_parquet_bytes", "error")
         counts = dict.fromkeys(("complete", "unavailable", "request_error", "not_attempted"), 0)
         counts.update(days_with_observed_gaps=0, days_with_unknown_coverage=0)
         with atomic_output(path) as temp:
@@ -2054,6 +2117,7 @@ class Collector:
                                        request_count=len(records),
                                        no_data_request_count=sum(r["status"] == "no_data" for r in records),
                                        stored_rows=sum(r.get("row_count", 0) for r in records),
+                                       excluded_quote_rows=sum(r.get("retention", {}).get("excluded_rows", 0) for r in records),
                                        stored_parquet_bytes=sum((r.get("data") or {}).get("size", 0) for r in records))
                         except FileNotFoundError:
                             pass
@@ -2147,6 +2211,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Vendor: ThetaData; quotes: {cfg.quote_interval} plus near-close; daily volume/count from EOD; stock venue: {cfg.stock_venue}")
     if panels:
         print(f"Bulk collection: 7 shared requests + 2 per selected expiration/day (at most {7 + 2 * cfg.max_expirations_per_day})")
+        print(f"Storage: selected option contracts only; broad option reports/lists capped at {cfg.max_dte} days to expiration")
         print(f"Near-close snapshot: {cfg.near_close_minutes} minutes before the actual close; quote sample age is not event age")
         print(f"Standard: {cfg.max_inflight_requests} simultaneous requests; "
               f"request-start cap: {str(cfg.max_requests_per_second) + '/s' if cfg.max_requests_per_second else 'none'}")
