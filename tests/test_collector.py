@@ -202,6 +202,32 @@ def _download_fixture(client, request, payload):
 
 
 class PlanningAndSelectionTest(unittest.TestCase):
+    def test_contract_keys_preserve_precision_rows_and_raw_fields(self):
+        frame = pd.DataFrame(
+            {
+                "symbol": ["SPY"] * 3,
+                "expiration": ["20250110", "2025-01-10", "20250110"],
+                "strike": ["100.000", "100.125", "100.000"],
+                "right": ["C", "p", "C"],
+            },
+            index=[3, 1, 3],
+        )
+        original = frame.copy(deep=True)
+        keys = planning.option_contract_keys(frame)
+        self.assertEqual(
+            keys.tolist(),
+            [
+                "SPY|2025-01-10|100|call",
+                "SPY|2025-01-10|100.125|put",
+                "SPY|2025-01-10|100|call",
+            ],
+        )
+        self.assertEqual(keys.index.tolist(), [3, 1, 3])
+        pd.testing.assert_frame_equal(frame, original)
+        for strike in ("100.0001", "NaN", "0"):
+            with self.subTest(strike=strike), self.assertRaises(ValueError):
+                planning.option_contract_keys(frame.assign(strike=strike))
+
     def test_weekly_enrollment_uses_exchange_weeks_not_month_or_data_boundaries(
         self,
     ):
@@ -499,6 +525,16 @@ class SavedCollectionTest(unittest.TestCase):
                     for c in download.call_args_list
                 )
             )
+            oi = [
+                c.args[1]
+                for c in download.call_args_list
+                if c.args[1].dataset == "option_open_interest"
+            ]
+            self.assertEqual(len(oi), 1)
+            self.assertTrue(oi[0].retained_contract_windows)
+        self.assertEqual(
+            self.store.session("SPY", DAY)["universe_status"], "not_requested"
+        )
         self.assertGreater(
             self.store.session("SPY", DAY)["selected_contract_count"], 0
         )
@@ -665,7 +701,7 @@ class SavedCollectionTest(unittest.TestCase):
             1,
         )
 
-    def test_weekly_entries_keep_daily_followup_and_only_tracked_eod(self):
+    def test_weekly_discovery_preserves_daily_cohort_reports(self):
         cfg = dataclasses.replace(
             self.cfg, end_date="2025-01-06", moneyness_targets=(1.0,)
         )
@@ -676,6 +712,21 @@ class SavedCollectionTest(unittest.TestCase):
 
         def shifted_prices(client, request, payload):
             data = _payload(request)
+            if (
+                request.dataset == "option_open_interest"
+                and request.params["date"] == "20250103"
+            ):
+                frame = pd.read_csv(io.BytesIO(data), dtype="string")
+                # A missing tracked OI report remains a gap, not a zero or a
+                # reason to drop the option from its remaining observations.
+                frame = frame.loc[
+                    ~(
+                        frame["strike"].eq("100")
+                        & frame["right"].eq("put")
+                        & frame["expiration"].eq(EXPIRATIONS[0])
+                    )
+                ]
+                data = frame.to_csv(index=False).encode()
             if request.dataset == "option_eod":
                 frame = pd.read_csv(io.BytesIO(data), dtype="string")
                 # A quiet option's last trade can predate selection. Retention
@@ -724,7 +775,42 @@ class SavedCollectionTest(unittest.TestCase):
             [s["selected_contract_count"] for s in sessions], [10, 10, 18]
         )
         self.assertEqual(sessions[1]["missing_selection_times"], [])
-        self.assertEqual(sessions[1]["universe_contract_count"], 20)
+        self.assertEqual(
+            [s["universe_status"] for s in sessions],
+            ["observed", "not_requested", "observed"],
+        )
+        self.assertIsNone(sessions[1]["universe_contract_count"])
+        self.assertIsNone(sessions[1]["oi_reported_contract_count"])
+        self.assertEqual(sessions[1]["coverage"]["missing_option_oi_count"], 1)
+        oi_check = next(
+            c
+            for c in sessions[1]["coverage"]["required_price_requests"]
+            if c["dataset"] == "option_open_interest"
+        )
+        self.assertEqual(
+            oi_check["missing_observations"][0]["reason"],
+            "missing_oi_report; zero_oi_not_inferred",
+        )
+        for record in manifest["requests"]:
+            if record["dataset"] in {"quoted_contracts", "traded_contracts"}:
+                self.assertNotEqual(record["params"]["date"], "20250103")
+        oi = [
+            r
+            for r in manifest["requests"]
+            if r["dataset"] == "option_open_interest"
+        ]
+        self.assertEqual(len(oi), 3)
+        friday = next(r for r in oi if r["params"]["date"] == "20250103")
+        self.assertEqual(friday["row_count"], 9)
+        self.assertEqual(
+            self.store.metadata(friday)["retention"]["excluded_rows"], 10
+        )
+        for record in oi:
+            if record is not friday:
+                self.assertEqual(
+                    self.store.metadata(record)["retention"]["mode"],
+                    "full_response",
+                )
         eod = next(
             r for r in manifest["requests"] if r["dataset"] == "option_eod"
         )

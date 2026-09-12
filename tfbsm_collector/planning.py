@@ -259,14 +259,24 @@ def option_contract_keys(frame: pd.DataFrame) -> pd.Series:
         A series aligned to the input index. Identity spellings are normalized
         only in these keys; the input vendor fields are unchanged.
     """
+    # Hourly rows repeat the same strikes and expirations. Normalize each
+    # distinct value once per batch without rounding prices or changing rows.
+    strikes = {
+        value: format_strike(value) for value in frame["strike"].unique()
+    }
+    expirations = pd.Series(frame["expiration"].unique())
+    dates = dict(
+        zip(
+            expirations,
+            pd.to_datetime(expirations, format="mixed").dt.strftime("%Y-%m-%d"),
+        )
+    )
     return (
         frame["symbol"]
         + "|"
-        + pd.to_datetime(frame["expiration"], format="mixed").dt.strftime(
-            "%Y-%m-%d"
-        )
+        + frame["expiration"].map(dates)
         + "|"
-        + frame["strike"].map(format_strike)
+        + frame["strike"].map(strikes)
         + "|"
         + frame["right"].str.lower().replace({"c": "call", "p": "put"})
     )
@@ -532,35 +542,35 @@ def underlying_requests(
 def discovery_requests(
     cfg: config.CollectorConfig, symbol: str, days
 ) -> list[Request]:
-    """Collect dated membership lists and daily bulk open-interest reports.
+    """Collect full candidate evidence only on weekly enrollment dates.
 
     Listing requests remain dated even though their small responses are packed
     together on disk. An expiration observed later must not enter an earlier
-    day's candidate universe.
+    day's candidate universe. Open interest also discovers quiet contracts that
+    need not appear in that day's quote or trade list.
     """
     requests_to_make = []
     for day in days:
-        # OI supplies that day's candidate universe. Keep its request daily so
-        # selection can stream the report without loading a month of full chains.
+        if not is_enrollment_day(day, cfg):
+            continue
         requests_to_make.append(
             history_request(cfg, "option", "open_interest", symbol, day)
         )
-        if str(day.date()) <= cfg.end_date:
-            for kind in ("quote", "trade"):
-                requests_to_make.append(
-                    Request(
-                        "quoted_contracts"
-                        if kind == "quote"
-                        else "traded_contracts",
-                        f"/option/list/contracts/{kind}",
-                        {
-                            "symbol": symbol,
-                            "date": day.strftime("%Y%m%d"),
-                            "max_dte": cfg.max_dte,
-                            "format": "csv",
-                        },
-                    )
+        for kind in ("quote", "trade"):
+            requests_to_make.append(
+                Request(
+                    "quoted_contracts"
+                    if kind == "quote"
+                    else "traded_contracts",
+                    f"/option/list/contracts/{kind}",
+                    {
+                        "symbol": symbol,
+                        "date": day.strftime("%Y%m%d"),
+                        "max_dte": cfg.max_dte,
+                        "format": "csv",
+                    },
                 )
+            )
     return requests_to_make
 
 
@@ -581,17 +591,49 @@ def _cohort_windows(cohort: pd.DataFrame, days) -> tuple:
 
 
 def followup_requests(
-    cfg: config.CollectorConfig, symbol: str, days, cohort: pd.DataFrame
+    cfg: config.CollectorConfig,
+    symbol: str,
+    days,
+    cohort: pd.DataFrame,
+    *,
+    discovery_days=(),
 ) -> list[Request]:
-    """Batch sampled quotes, activity, near-close quotes, and tracked EOD.
+    """Request daily cohort observations, reusing enrollment-day OI.
 
     Entry DTE and moneyness limits apply only when a contract is first chosen.
     Continue requesting it through expiration even when it becomes deep ITM/OTM,
     has no new discovery row, or falls below the entry maturity threshold.
+
+    Args:
+        cfg: Sampling and maturity settings.
+        symbol: Option root.
+        days: Exchange sessions to follow.
+        cohort: Enrolled contracts with their first selection dates.
+        discovery_days: Dates already requested as full OI discovery snapshots.
+            A failed snapshot is retried with that discovery request, not hidden
+            by a narrower follow-up response.
+
+    Returns:
+        Requests retaining only the cohort's tracked date windows.
     """
     requests_to_make = []
+    discovered = set(discovery_days)
+    for day in days:
+        windows = _cohort_windows(cohort, [day])
+        if windows and day not in discovered:
+            # Keep one bulk OI download per day; filtering stored rows avoids
+            # one HTTP request per contract. A skipped enrollment snapshot must
+            # not interrupt OI follow-up for an existing cohort.
+            requests_to_make.append(
+                dataclasses.replace(
+                    history_request(
+                        cfg, "option", "open_interest", symbol, day
+                    ),
+                    retained_contract_windows=windows,
+                )
+            )
     # Keep the efficient bulk EOD request, but save only enrolled identities on
-    # their tracked dates. Daily lists/OI still document the broader universe.
+    # their tracked dates. Weekly discovery documents the broader universe.
     # EOD is a report, so it can span early closes without changing its clock.
     for batch in date_batches(days, cfg, intraday=False):
         windows = _cohort_windows(cohort, batch)

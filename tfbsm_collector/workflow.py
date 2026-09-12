@@ -458,26 +458,19 @@ class Collector:
                 if self.cfg.index_history_start is None
                 else days[days >= pd.Timestamp(self.cfg.index_history_start)]
             )
-        # Before any possible entry, an explicitly unlisted underlying quote
-        # date cannot supply the S/K reference. Avoid downloading broad option
-        # chains for that prefix. Once a cohort can exist, keep following it
-        # even through later underlying-data gaps.
+        # A weekly entry needs the underlying price for S/K selection. Skip
+        # discovery when that reference is known to be unavailable, while
+        # follow-up below keeps existing contracts through underlying-data gaps.
         quote_kind = "price" if symbol.price_asset == "index" else "quote"
         excluded = self.unavailable_dates.get(
             (symbol.underlying, quote_kind), set()
         )
-        possible_entries = [
+        discovery_days = [
             d
             for d in discovery_days
             if planning.is_enrollment_day(d, self.cfg)
             and str(d.date()) not in excluded
         ]
-        if cohort.empty:
-            discovery_days = (
-                discovery_days[discovery_days >= possible_entries[0]]
-                if possible_entries
-                else discovery_days[:0]
-            )
         requests = planning.underlying_requests(
             self.cfg, symbol, days, self.unavailable_dates
         ) + planning.discovery_requests(self.cfg, symbol.symbol, discovery_days)
@@ -488,12 +481,16 @@ class Collector:
         self.store.client.check_running()
         daily = []
         selections, universes = [], []
+        by_day = {day: [] for day in days}
+        for request in requests:
+            for day in planning.request_days(request):
+                by_day[day].append(request)
 
         def matching(dataset, day):
             return [
                 (r, records.get(r.request_id))
-                for r in requests
-                if r.dataset == dataset and day in planning.request_days(r)
+                for r in by_day[day]
+                if r.dataset == dataset
             ]
 
         def frames(dataset, day):
@@ -520,6 +517,12 @@ class Collector:
             }
             universe, source_counts = selection.observed_contract_universe(
                 discovery, symbol.symbol, self.cfg
+            )
+            discovery_complete = day in discovery_days and all(
+                records.get(r.request_id, {}).get("status")
+                in storage.GOOD_REQUEST_STATUSES
+                for r in by_day[day]
+                if r.endpoint.startswith("/option/")
             )
             price_kind = "prices" if symbol.price_asset == "index" else "quotes"
             price_dataset = (
@@ -572,12 +575,25 @@ class Collector:
                     "policy_id": self.cfg.policy_id,
                     "newly_selected_contract_count": len(cohort) - prior_count,
                     "selected_contract_count": len(active),
-                    "universe_contract_count": len(universe),
-                    "quoted_contract_count": source_counts["quote"],
-                    "traded_contract_count": source_counts["trade"],
-                    "oi_reported_contract_count": source_counts[
-                        "open_interest"
-                    ],
+                    # Planned omissions are not empty chains. An incomplete
+                    # discovery attempt also cannot establish universe counts.
+                    "universe_status": "observed"
+                    if discovery_complete
+                    else "incomplete"
+                    if day in discovery_days
+                    else "not_requested",
+                    "universe_contract_count": len(universe)
+                    if discovery_complete
+                    else None,
+                    "quoted_contract_count": source_counts["quote"]
+                    if discovery_complete
+                    else None,
+                    "traded_contract_count": source_counts["trade"]
+                    if discovery_complete
+                    else None,
+                    "oi_reported_contract_count": source_counts["open_interest"]
+                    if discovery_complete
+                    else None,
                     "stock_selection_references": references,
                     "missing_selection_times": missing,
                     "session_open": opened.isoformat(),
@@ -588,14 +604,17 @@ class Collector:
                     ),
                 }
             )
-        quote_requests = planning.followup_requests(
-            self.cfg, symbol.symbol, days, cohort
+        followup = planning.followup_requests(
+            self.cfg, symbol.symbol, days, cohort, discovery_days=discovery_days
         )
         records.update(
             (request.request_id, record)
-            for request, record in self.collect_batch(quote_requests)
+            for request, record in self.collect_batch(followup)
         )
-        requests += quote_requests
+        requests += followup
+        for request in followup:
+            for day in planning.request_days(request):
+                by_day[day].append(request)
         self.store.client.check_running()
         selected_table = pd.concat(selections, ignore_index=True)
         universe_table = pd.concat(universes, ignore_index=True)
@@ -605,11 +624,10 @@ class Collector:
             )
             for request in requests
             if "/list/" not in request.endpoint
-            and not request.endpoint.endswith("/open_interest")
         }
         for manifest, selected in zip(daily, selections):
             day = pd.Timestamp(manifest["trade_day"])
-            required = [r for r in requests if day in planning.request_days(r)]
+            required = by_day[day]
             receipts = [
                 records[r.request_id]
                 for r in required

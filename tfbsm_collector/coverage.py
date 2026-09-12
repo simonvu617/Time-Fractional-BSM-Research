@@ -234,6 +234,8 @@ class CoverageChecker:
                             ],
                             "reason": "missing_activity_bar; zero_activity_not_inferred"
                             if activity
+                            else "missing_oi_report; zero_oi_not_inferred"
+                            if request.endpoint.endswith("/open_interest")
                             else "missing_sample_rows"
                             if sampled
                             else "no_dated_observation",
@@ -269,13 +271,11 @@ class CoverageChecker:
         requests: list[planning.Request],
         observations: dict | None = None,
     ) -> dict:
-        """Summarize price and activity presence for that day's active cohort."""
+        """Summarize prices, activity, and OI for that day's active cohort."""
         by_id = {record["request_id"]: record for record in records}
         checks = []
         for request in requests:
-            if "/list/" in request.endpoint or request.endpoint.endswith(
-                "/open_interest"
-            ):
+            if "/list/" in request.endpoint:
                 continue
             check = self.quote_or_contract_report_coverage(
                 request,
@@ -315,6 +315,14 @@ class CoverageChecker:
                     row["contract_key"]
                     for c in missing
                     if c["dataset"] == "option_eod"
+                    for row in c["missing_observations"]
+                }
+            ),
+            "missing_option_oi_count": len(
+                {
+                    row["contract_key"]
+                    for c in missing
+                    if c["dataset"] == "option_open_interest"
                     for row in c["missing_observations"]
                 }
             ),
@@ -500,12 +508,14 @@ class CoverageChecker:
             "newly_selected_contract_count",
             "selected_contract_count",
             "universe_contract_count",
+            "universe_status",
             "selection_reference_count",
             "missing_selection_times",
             "request_error_count",
             "no_data_request_count",
             "missing_option_quote_count",
             "missing_option_eod_count",
+            "missing_option_oi_count",
             "missing_option_activity_count",
             "missing_stock_dataset_count",
             "unknown_required_request_count",

@@ -540,6 +540,9 @@ class RequestStore:
             if request.retained_contract_keys is None
             else set(request.retained_contract_keys)
         )
+        windows = request.retained_contract_windows
+        starts = {key: start for key, start, _ in windows or ()}
+        ends = {key: end for key, _, end in windows or ()}
         excluded_rows = 0
 
         data_path = directory / f"{attempt_id}.parquet"
@@ -561,40 +564,35 @@ class RequestStore:
                     # malformed unselected row must still invalidate the overall
                     # response.
                     frame = diagnostics.add(raw.astype("string").fillna(""))
-                    if retained is not None and not missing:
+                    if (
+                        retained is not None or windows is not None
+                    ) and not missing:
                         # Filter identities only: keep every timestamp, vendor
                         # field, zero bid, and duplicate belonging to a selected
                         # contract.
-                        keep = planning.option_contract_keys(frame).isin(
-                            retained
-                        )
-                        excluded_rows += int((~keep).sum())
-                        frame = frame.loc[keep]
-                    if (
-                        request.retained_contract_windows is not None
-                        and not missing
-                    ):
-                        windows = {
-                            key: (start, end)
-                            for key, start, end in request.retained_contract_windows
-                        }
                         keys = planning.option_contract_keys(frame)
-                        # An EOD row belongs to its report date. Its last trade
-                        # can be older on a quiet contract, so using last_trade
-                        # would wrongly discard a valid daily observation.
-                        clock = (
-                            "created"
-                            if request.endpoint.endswith("/eod")
-                            else "timestamp"
+                        keep = (
+                            keys.isin(retained)
+                            if retained is not None
+                            else pd.Series(True, index=frame.index)
                         )
-                        dates = (
-                            frame[f"collector_{clock}_utc"]
-                            .dt.tz_convert(self.cfg.exchange_tz)
-                            .dt.strftime("%Y-%m-%d")
-                        )
-                        starts = keys.map({k: v[0] for k, v in windows.items()})
-                        ends = keys.map({k: v[1] for k, v in windows.items()})
-                        keep = (dates.ge(starts) & dates.le(ends)).fillna(False)
+                        if windows is not None:
+                            # Quiet contracts can have an older last_trade.
+                            # EOD retention follows the report's creation date.
+                            clock = (
+                                "created"
+                                if request.endpoint.endswith("/eod")
+                                else "timestamp"
+                            )
+                            dates = (
+                                frame[f"collector_{clock}_utc"]
+                                .dt.tz_convert(self.cfg.exchange_tz)
+                                .dt.strftime("%Y-%m-%d")
+                            )
+                            keep &= (
+                                dates.ge(keys.map(starts))
+                                & dates.le(keys.map(ends))
+                            ).fillna(False)
                         excluded_rows += int((~keep).sum())
                         frame = frame.loc[keep]
 

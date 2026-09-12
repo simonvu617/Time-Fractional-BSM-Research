@@ -17,9 +17,9 @@ import pandas as pd
 
 from tfbsm_collector import provenance
 
-# v7 records weekly enrollment and retains EOD only for tracked contracts.
+# v8 limits discovery to enrollment days and keeps tracked OI between them.
 # Earlier daily cohorts cannot stand in for this different research sample.
-OUTPUT_SCHEMA_VERSION = "2026-09-12-weekly-cohorts-v7"
+OUTPUT_SCHEMA_VERSION = "2026-09-12-weekly-discovery-v8"
 
 # Resolve from the repository root so splitting the package does not move
 # existing caches into a new data directory.
@@ -359,6 +359,8 @@ class CollectorConfig:
         return {
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
             "entry_schedule": "first_exchange_session_of_week_in_entry_window",
+            "discovery_schedule": "enrollment_days_with_underlying_access",
+            "option_oi_retention": "full_discovery_otherwise_tracked_date_windows",
             "contract_followup": "through_expiration",
             "option_eod_retention": "tracked_contract_date_windows",
             **{name: getattr(self, name) for name in names},

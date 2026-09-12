@@ -195,7 +195,7 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
     )
     if panels:
         print(
-            "Monthly date batches: underlying prices/activity and option quotes/activity per tracked expiration; dated discovery and OI"
+            "Monthly date batches: underlying prices/activity and option quotes/activity per tracked expiration; weekly discovery and daily tracked OI"
         )
         print(
             f"Entry: first exchange session of each week within the entry window at {', '.join(cfg.selection_times)} ET; DTE {cfg.min_dte}-{cfg.max_dte}"
