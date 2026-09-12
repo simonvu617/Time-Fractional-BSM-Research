@@ -7,12 +7,14 @@ Run with python -m unittest discover -s tests -p "test_collector.py".
 No test needs Theta Terminal, credentials, or market-data downloads.
 """
 
+import concurrent.futures
 import contextlib
 import dataclasses
 import hashlib
 import io
 import pathlib
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -71,7 +73,13 @@ def _quote(timestamp, midpoint="100", **identity):
 
 def _payload(request):
     """Build one synthetic CSV, including OI-only and unselected contracts."""
-    if request.dataset in {"quoted_contracts", "traded_contracts"}:
+    if "/list/dates" in request.endpoint:
+        rows = [{"date": "2025-01-02"}]
+    elif request.dataset.startswith("corporate_"):
+        return (",".join(request.required_columns) + "\n").encode()
+    elif request.dataset == "interest_rate_eod":
+        rows = [{"created": "2025-01-02", "rate": "4.25"}]
+    elif request.dataset in {"quoted_contracts", "traded_contracts"}:
         rows = [
             contract
             for contract in _contracts()
@@ -148,6 +156,74 @@ def _download_fixture(client, request, payload):
 
 
 class PlanningAndSelectionTest(unittest.TestCase):
+    def test_pro_history_clips_stock_buffer_and_reports_reference_access(self):
+        cfg = config.CollectorConfig()
+        windows = planning.collection_windows(cfg, cfg.start_date, cfg.end_date)
+        self.assertEqual(windows["history_start"], "2012-06-01")
+        self.assertEqual(windows["lookback_dates"], [])
+        self.assertEqual(len(windows["unavailable_lookback_dates"]), 60)
+        requests = list(
+            planning.reference_requests(
+                cfg,
+                [config.UNIVERSE[0]],
+                cfg.start_date,
+                cfg.end_date,
+                ["SOFR", "TREASURY_M3"],
+                include_stock_lookback=True,
+            )
+        )
+        self.assertEqual(len(requests), 4)
+        self.assertFalse(
+            any(r.endpoint.startswith("/index/") for r in requests)
+        )
+        for request in requests:
+            if request.dataset == "interest_rate_eod":
+                self.assertEqual(request.params["start_date"], "2024-01-01")
+            else:
+                self.assertEqual(request.params["start_date"], "2012-06-01")
+        gaps = planning.reference_access_gaps(
+            cfg, windows, ["SOFR", "TREASURY_M3"], include_stock_lookback=True
+        )
+        self.assertEqual(
+            {g["reason"] for g in gaps},
+            {
+                "index_subscription_unavailable",
+                "before_rate_subscription_history_start",
+                "before_stock_pro_history_start",
+            },
+        )
+        rate_gap = next(
+            g for g in gaps if g.get("dataset") == "interest_rate_eod"
+        )
+        self.assertEqual(
+            rate_gap["unrequested_eod_session_dates"][-1], "2023-12-29"
+        )
+        later = planning.collection_windows(cfg, "2013-01-02", "2013-01-03")
+        self.assertEqual(len(later["lookback_dates"]), 60)
+        self.assertEqual(later["unavailable_lookback_dates"], [])
+
+    def test_separate_paid_reference_tiers_use_their_own_history_bounds(self):
+        cfg = dataclasses.replace(
+            config.CollectorConfig(),
+            index_subscription="pro",
+            rate_subscription="value",
+            lookback_sessions=0,
+        )
+        start, end = "2016-12-30", "2017-01-03"
+        requests = list(
+            planning.reference_requests(cfg, [], start, end, ["TREASURY_M3"])
+        )
+        self.assertEqual(len(requests), 4)
+        rates = next(r for r in requests if r.dataset == "interest_rate_eod")
+        index = next(r for r in requests if r.dataset == "index_eod")
+        self.assertEqual(rates.params["start_date"], start)
+        self.assertEqual(index.params["start_date"], "2017-01-01")
+        gaps = planning.reference_access_gaps(
+            cfg, planning.collection_windows(cfg, start, end), ["TREASURY_M3"]
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["unrequested_eod_session_dates"], [start])
+
     def test_early_close_and_supporting_windows(self):
         cfg = config.CollectorConfig()
         day = pd.Timestamp("2024-11-29")
@@ -271,7 +347,13 @@ class SavedCollectionTest(unittest.TestCase):
                 self.assertEqual(meta["raw_schema_version"], 2)
         self.assertTrue(self.collector.resumable("SPY", DAY))
         restarted = workflow.Collector(
-            dataclasses.replace(self.cfg, max_batch_workers=1)
+            dataclasses.replace(
+                self.cfg,
+                max_batch_workers=1,
+                max_inflight_requests=4,
+                start_date="2018-01-01",
+                index_subscription="standard",
+            )
         )
         self.assertTrue(restarted.resumable("SPY", DAY))
         counts = self.collector.write_availability(
@@ -359,6 +441,74 @@ class SavedCollectionTest(unittest.TestCase):
 
 
 class CliAndProvenanceTest(unittest.TestCase):
+    def test_cli_accepts_pro_history_and_later_completed_dates(self):
+        _, cfg, _, anchors = cli.parse_run_scope(["--symbols", "SPY"])
+        self.assertEqual(cfg.start_date, "2012-06-01")
+        self.assertEqual(cfg.end_date, "2025-12-31")
+        self.assertEqual(str(anchors[0].date()), cfg.start_date)
+        self.assertEqual(str(anchors[-1].date()), cfg.end_date)
+        # The fixed default end must not become an artificial access ceiling.
+        yesterday = str(
+            (pd.Timestamp.now("America/New_York") - pd.Timedelta(days=1)).date()
+        )
+        cli.parse_run_scope(["--start", "2025-01-02", "--end", yesterday])
+        for arguments in (
+            ["--start", "2012-05-31"],
+            ["--end", "2999-01-01"],
+            ["--index-subscription", "invalid"],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit):
+                    cli.parse_run_scope(arguments)
+
+    def test_stock_options_only_run_collects_panels_and_records_vix_gap(self):
+        with tempfile.TemporaryDirectory(prefix="tfbsm-pro-run-") as directory:
+            with (
+                mock.patch.object(transport.ThetaClient, "ensure_available"),
+                mock.patch.object(
+                    transport.ThetaClient,
+                    "download",
+                    autospec=True,
+                    side_effect=_download_fixture,
+                ) as download,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = cli.main(
+                    [
+                        "--symbols",
+                        "SPY",
+                        "--start",
+                        "2025-01-02",
+                        "--end",
+                        "2025-01-02",
+                        "--lookback-sessions",
+                        "0",
+                        "--output-dir",
+                        directory,
+                    ]
+                )
+            self.assertEqual(result, 2)
+            self.assertFalse(
+                any(
+                    call.args[1].endpoint.startswith("/index/")
+                    for call in download.call_args_list
+                )
+            )
+            root = pathlib.Path(directory)
+            run = storage.read_json(next(root.glob("collection/*/runs/*.json")))
+            self.assertEqual(run["status"], "coverage_gaps")
+            self.assertEqual(run["processed_days"], 1)
+            self.assertEqual(run["coverage"]["complete"], 1)
+            self.assertEqual(run["reference_failures"], 0)
+            ledger = storage.read_json(root / run["reference_ledger"])
+            self.assertEqual(
+                ledger["subscription_coverage_gaps"][0]["reason"],
+                "index_subscription_unavailable",
+            )
+
     def test_plan_modes_do_not_contact_theta_or_create_output(self):
         with tempfile.TemporaryDirectory(
             prefix="tfbsm-plan-test-"
@@ -406,6 +556,39 @@ class CliAndProvenanceTest(unittest.TestCase):
             config.DEFAULT_OUTPUT_DIR,
             root / "data" / "multi_year_bsm_backtest_output",
         )
+
+
+class ProRequestLimitTest(unittest.TestCase):
+    def test_eight_slots_are_shared_and_ninth_waits(self):
+        cfg = config.CollectorConfig()
+        self.assertEqual(cfg.max_batch_workers, 8)
+        for limit in (0, 9, 4.5):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                dataclasses.replace(cfg, max_inflight_requests=limit)
+        client = transport.ThetaClient(cfg)
+        release = threading.Event()
+        entered = [threading.Event() for _ in range(9)]
+
+        def occupy(index):
+            with client.request_slot():
+                entered[index].set()
+                if not release.wait(5):
+                    raise TimeoutError("Shared request slots did not release")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=9) as pool:
+            futures = [pool.submit(occupy, index) for index in range(8)]
+            try:
+                for event in entered[:8]:
+                    self.assertTrue(
+                        event.wait(2), "Pro did not permit eight requests"
+                    )
+                futures.append(pool.submit(occupy, 8))
+                self.assertFalse(entered[8].wait(0.05))
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=5)
+        self.assertTrue(entered[8].is_set())
 
 
 if __name__ == "__main__":

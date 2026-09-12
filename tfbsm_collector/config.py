@@ -29,9 +29,22 @@ DEFAULT_OUTPUT_DIR = (
     / "multi_year_bsm_backtest_output"
 )
 
-# One minute is the minimum supported stock snapshot interval on Standard;
-# hourly is the current study choice shared by all three asset types.
+# Pro permits finer data, but hourly remains the research sampling choice.
+# Keep the existing minute-or-coarser options instead of adding tick downloads.
 QUOTE_INTERVALS = ("1m", "5m", "10m", "15m", "30m", "1h")
+
+# Pro's concurrency is shared across endpoints, even with mixed asset tiers.
+# Historical access still depends on each separate product subscription.
+# https://docs.thetadata.us/Articles/Data-And-Requests/Concurrent-Requests.html
+PRO_MAX_INFLIGHT_REQUESTS = 8
+PRO_HISTORY_START = "2012-06-01"
+INDEX_HISTORY_STARTS = {
+    "none": None,
+    "value": "2023-01-01",
+    "standard": "2022-01-01",
+    "pro": "2017-01-01",
+}
+RATE_HISTORY_STARTS = {"free": "2024-01-01", "value": "1970-01-01"}
 
 # SOFR is an overnight benchmark. Treasury M/Y suffixes identify months/years.
 # Keep the reported curve; maturity matching and discounting happen later.
@@ -104,9 +117,11 @@ class CollectorConfig:
 
     Attributes:
         base_url: URL of the running Theta Terminal v3 service.
-        start_date: Earliest study date allowed by the CLI, inclusive.
-        end_date: Latest study date allowed by the CLI, inclusive.
-        index_history_start: First accessible index date on Standard.
+        start_date: Default inclusive study start; Pro history begins June 2012.
+        end_date: Default inclusive study end. Use --end for later completed
+            dates without changing this default.
+        index_subscription: Separately purchased index tier, or none.
+        rate_subscription: Separately purchased rate tier; free starts in 2024.
         lookback_sessions: Earlier stock/rate exchange sessions to collect.
         option_rights: Call (right to buy at the strike) and/or put (right to
             sell).
@@ -127,7 +142,7 @@ class CollectorConfig:
             selection time; does not measure the quote event's age.
         max_symbol_day_workers: Concurrent underlying/day tasks.
         max_batch_workers: Concurrent downloads within each batch.
-        max_inflight_requests: Shared HTTP cap, at most four for Standard.
+        max_inflight_requests: Shared HTTP cap, at most eight for Pro.
         max_requests_per_second: Shared request-start limit; zero disables it.
         store_raw_payloads: Whether to keep full successful CSV responses in
             addition to Parquet. Failed response bytes are always retained.
@@ -136,9 +151,10 @@ class CollectorConfig:
     """
 
     base_url: str = "http://127.0.0.1:25503/v3"
-    start_date: str = "2018-01-01"
+    start_date: str = PRO_HISTORY_START
     end_date: str = "2025-12-31"
-    index_history_start: str = "2022-01-01"
+    index_subscription: str = "none"
+    rate_subscription: str = "free"
 
     # The buffer can support a first-day volatility estimate. It does not choose
     # a calibration window or guarantee continuous histories of the same
@@ -178,10 +194,12 @@ class CollectorConfig:
     # The timestamp does not reveal when the underlying quote last changed.
     max_stock_quote_age_seconds: int = 70
     max_symbol_day_workers: int = 4
-    max_batch_workers: int = 4
-    # Standard's four-request limit is account-wide. Lower this if another
-    # process uses the same account; local worker limits cannot coordinate it.
-    max_inflight_requests: int = 4
+    # A single reference batch can now occupy all eight Pro HTTP slots.
+    # Four symbol-day workers already provide enough independent batches.
+    max_batch_workers: int = 8
+    # This account-wide budget is not eight slots per asset or worker. Lower it
+    # when another client uses the same account; local locks cannot track that.
+    max_inflight_requests: int = PRO_MAX_INFLIGHT_REQUESTS
     max_requests_per_second: float = 0.0
     store_raw_payloads: bool = False
     refresh_no_data: bool = False
@@ -197,6 +215,10 @@ class CollectorConfig:
             raise ValueError("option_rights must contain call and/or put")
         if pd.Timestamp(self.start_date) > pd.Timestamp(self.end_date):
             raise ValueError("start_date must not follow end_date")
+        if self.index_subscription not in INDEX_HISTORY_STARTS:
+            raise ValueError("Unsupported index subscription")
+        if self.rate_subscription not in RATE_HISTORY_STARTS:
+            raise ValueError("Unsupported interest-rate subscription")
         if not 0 <= self.min_dte <= self.max_dte or not self.target_dtes:
             raise ValueError(
                 "Provide target_dtes and an ordered, nonnegative DTE range"
@@ -224,9 +246,12 @@ class CollectorConfig:
             raise ValueError(
                 "max_requests_per_second must be nonnegative; 0 disables pacing"
             )
-        if self.max_inflight_requests > 4:
+        if (
+            not isinstance(self.max_inflight_requests, int)
+            or self.max_inflight_requests > PRO_MAX_INFLIGHT_REQUESTS
+        ):
             raise ValueError(
-                "Standard allows at most four simultaneous requests across the account"
+                "Pro requires an integer limit of 1 through 8 shared HTTP requests"
             )
         if (
             not isinstance(self.near_close_minutes, int)
@@ -284,6 +309,16 @@ class CollectorConfig:
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
             **{name: getattr(self, name) for name in names},
         }
+
+    @property
+    def index_history_start(self) -> str | None:
+        """The index access boundary, or None without a subscription."""
+        return INDEX_HISTORY_STARTS[self.index_subscription]
+
+    @property
+    def rate_history_start(self) -> str:
+        """The configured interest-rate access boundary."""
+        return RATE_HISTORY_STARTS[self.rate_subscription]
 
     @property
     def policy_id(self) -> str:

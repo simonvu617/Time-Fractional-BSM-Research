@@ -397,8 +397,7 @@ class Collector:
 
         Returns:
             A ledger of request receipts, coverage, and interpretation limits.
-            Inaccessible Standard VIX dates are recorded without requesting
-            them.
+            Inaccessible reference dates are recorded without requesting them.
         """
         records = []
 
@@ -412,36 +411,19 @@ class Collector:
             else []
         )
         windows = planning.collection_windows(self.cfg, start, end)
-        index_excluded = [
-            date
-            for date in planning.exchange_calendar()
-            .sessions_in_range(windows["history_start"], end)
-            .strftime("%Y-%m-%d")
-            if date < self.cfg.index_history_start
-        ]
-        # Earlier VIX sessions are subscription gaps. Recording them keeps the
-        # requested study window visible without sending inaccessible history
-        # pulls.
-        access_gaps = (
-            [
-                {
-                    "symbol": "VIX",
-                    "reason": "before_standard_index_history_start",
-                    "access_start": self.cfg.index_history_start,
-                    "unrequested_eod_session_dates": index_excluded,
-                    "unrequested_intraday_session_dates": [
-                        date for date in index_excluded if date >= start
-                    ],
-                }
-            ]
-            if index_excluded
-            else []
+        access_gaps = planning.reference_access_gaps(
+            self.cfg,
+            windows,
+            rate_symbols,
+            include_stock_lookback=include_stock_lookback,
         )
         ledger = {
             "vendor": "ThetaData",
             "start": start,
             "end": end,
             "collection_windows": windows,
+            "index_subscription": self.cfg.index_subscription,
+            "rate_subscription": self.cfg.rate_subscription,
             "subscription_coverage_gaps": access_gaps,
             "stock_lookback_requested": bool(lookback_datasets),
             "option_contract_continuity_guaranteed": False,
@@ -496,8 +478,8 @@ class Collector:
                 )
             )
             while not self.store.client.stop_event.is_set():
-                # Bound the scheduled reference queue; do not enqueue eight
-                # years of work at once. Completed batches remain reusable after
+                # Bound the scheduled reference queue instead of enqueuing the
+                # full history. Completed batches remain reusable after
                 # interruption.
                 batch = list(itertools.islice(pending, 32))
                 if not batch:
@@ -545,13 +527,25 @@ class Collector:
             for symbol in symbols
             for kind in ("quote", "trade")
         ]
-        requests_to_make.append(
-            planning.Request(
-                "index_price_dates",
-                "/index/list/dates",
-                {"symbol": "VIX", "format": "csv"},
+        access_gaps = []
+        if self.cfg.index_history_start is not None:
+            requests_to_make.append(
+                planning.Request(
+                    "index_price_dates",
+                    "/index/list/dates",
+                    {"symbol": "VIX", "format": "csv"},
+                )
             )
-        )
+        else:
+            # The catalogue itself requires index access too. Record its
+            # absence even in --coverage-only mode, before reference collection.
+            access_gaps.append(
+                {
+                    "symbol": "VIX",
+                    "dataset": "index_price_dates",
+                    "reason": "index_subscription_unavailable",
+                }
+            )
         expected = set(anchors.strftime("%Y-%m-%d"))
         rows, records = [], []
         try:
@@ -620,6 +614,8 @@ class Collector:
                 "checked_at_utc": provenance.utc_now(),
                 "rows": rows,
                 "requests": records,
+                "index_subscription": self.cfg.index_subscription,
+                "subscription_coverage_gaps": access_gaps,
                 "unfinished_requests": [
                     r.identity() for r in requests_to_make[len(rows) :]
                 ],
@@ -628,7 +624,8 @@ class Collector:
                 ),
                 "series_with_gaps": sum(
                     row["status"] == "coverage_gap" for row in rows
-                ),
+                )
+                + len(access_gaps),
                 "proves_interval_or_subscription_access": False,
                 "proves_complete_intraday_records": False,
                 "scope": "stock quote/trade and VIX date catalogues; option coverage is recorded during collection",

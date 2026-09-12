@@ -104,13 +104,25 @@ def parse_run_scope(argv: list[str] | None = None):
         "--max-inflight-requests",
         type=int,
         default=defaults.max_inflight_requests,
-        help="1 through 4 for Standard; lower this if another client shares the account",
+        help="1 through 8 for Pro; lower this if another client shares the account",
     )
     parser.add_argument(
         "--max-requests-per-second",
         type=float,
         default=defaults.max_requests_per_second,
         help="Optional request-start pacing; default 0 means only the concurrency cap applies",
+    )
+    parser.add_argument(
+        "--index-subscription",
+        choices=config.INDEX_HISTORY_STARTS,
+        default=defaults.index_subscription,
+        help="Your separately purchased index tier (default: none); Stocks/Options Pro does not include VIX",
+    )
+    parser.add_argument(
+        "--rate-subscription",
+        choices=config.RATE_HISTORY_STARTS,
+        default=defaults.rate_subscription,
+        help="Your separate rate tier (default: free, history from 2024); value permits older dates",
     )
     parser.add_argument(
         "--rate-symbols",
@@ -145,17 +157,23 @@ def parse_run_scope(argv: list[str] | None = None):
         ):
             raise ValueError("Dates must use YYYY-MM-DD")
         start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
-        if (
-            not pd.Timestamp(defaults.start_date)
-            <= start
-            <= end
-            <= pd.Timestamp(defaults.end_date)
-        ):
+        if not pd.Timestamp(config.PRO_HISTORY_START) <= start <= end:
             raise ValueError(
-                f"Dates must be ordered and within {defaults.start_date} through {defaults.end_date}"
+                f"Dates must be ordered and start on or after {config.PRO_HISTORY_START}"
             )
+        # EOD reports for an unfinished date cannot be complete. The default
+        # study end is fixed, but later completed dates need no source edit.
+        today = (
+            pd.Timestamp.now(defaults.exchange_tz).normalize().tz_localize(None)
+        )
+        if end >= today:
+            raise ValueError("The end date must be before today in New York")
         cfg = dataclasses.replace(
             defaults,
+            start_date=args.start,
+            end_date=args.end,
+            index_subscription=args.index_subscription,
+            rate_subscription=args.rate_subscription,
             quote_interval=args.quote_interval,
             output_dir=args.output_dir.expanduser().resolve(),
             raw_chunk_rows=args.raw_chunk_rows,
@@ -216,28 +234,45 @@ def main(argv: list[str] | None = None) -> int:
             f"Near-close snapshot: {cfg.near_close_minutes} minutes before the actual close; quote sample age is not event age"
         )
         print(
-            f"Standard: {cfg.max_inflight_requests} simultaneous requests; "
+            f"Stocks/Options Pro: {cfg.max_inflight_requests} shared simultaneous requests; "
             f"request-start cap: {str(cfg.max_requests_per_second) + '/s' if cfg.max_requests_per_second else 'none'}"
         )
     print(f"Output: {cfg.output_dir}")
+    print(
+        f"Separate reference subscriptions: indices={cfg.index_subscription}; "
+        f"rates={cfg.rate_subscription} (from {cfg.rate_history_start})"
+    )
     if args.coverage_only:
         print(
             "Coverage mode: available dates for stock quotes/trades and VIX; no history downloads"
         )
+        if cfg.index_history_start is None:
+            print(
+                "VIX catalogue not requested: no index subscription; recorded as an access gap"
+            )
     else:
         print(
             f"Required references: dividends/splits, {len(set(args.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices"
         )
         print(
-            f"Reference history starts {windows['history_start']}; corporate actions through {windows['corporate_action_end']}"
+            f"Requested reference history starts {windows['requested_history_start']}; corporate actions through {windows['corporate_action_end']}"
         )
-        print(
-            f"Standard VIX history starts {cfg.index_history_start}; earlier requested sessions are reported as access gaps"
-        )
+        for gap in planning.reference_access_gaps(
+            cfg, windows, args.rate_symbols, include_stock_lookback=panels
+        ):
+            count = len(
+                gap.get(
+                    "unrequested_eod_session_dates",
+                    gap.get("unrequested_session_dates", []),
+                )
+            )
+            print(
+                f"Known access gap: {gap['reason']}; {count} exchange sessions"
+            )
         if panels:
             print(
-                f"Stock lookback: {cfg.lookback_sessions} prior sessions; "
-                f"{3 * len(symbols) * cfg.lookback_sessions} additional hourly/near-close/EOD requests"
+                f"Stock lookback: {len(windows['lookback_dates'])} of {cfg.lookback_sessions} prior sessions accessible; "
+                f"{3 * len(symbols) * len(windows['lookback_dates'])} additional hourly/near-close/EOD requests"
             )
     # Preview stops before constructing storage, contacting Theta, or creating
     # output.

@@ -270,7 +270,10 @@ def option_contract_keys(frame: pd.DataFrame) -> pd.Series:
 @functools.lru_cache(maxsize=1)
 def exchange_calendar():
     """Return the cached XNYS calendar covering the study and its buffers."""
-    return xcals.get_calendar("XNYS", start="2012-01-01", end="2026-12-31")
+    next_year = pd.Timestamp.now("America/New_York").year + 1
+    return xcals.get_calendar(
+        "XNYS", start="2012-01-01", end=f"{next_year}-12-31"
+    )
 
 
 def session_bounds(
@@ -503,9 +506,10 @@ def collection_windows(
         end: Inclusive study end in YYYY-MM-DD form.
 
     Returns:
-        A dictionary of study_start, study_end, history_start,
-        corporate_action_end, and lookback_dates. Lookback dates are exchange
-        sessions; the later event window covers possible option expirations.
+        Study and event boundaries, requested_history_start before access
+        limits, history_start for accessible stock history, lookback_dates,
+        and unavailable_lookback_dates. The later event window covers possible
+        option expirations.
 
     Raises:
         ValueError: The lookback exceeds available calendar history.
@@ -522,15 +526,102 @@ def collection_windows(
         if cfg.lookback_sessions
         else before[:0]
     )
+    requested_history_start = (
+        str(lookback[0].date()) if len(lookback) else start
+    )
+    # A study starting at Pro's first date cannot have a full stock buffer.
+    # Record the omitted sessions instead of causing a permission failure or
+    # pretending that fewer observations constitute the requested lookback.
+    accessible = lookback >= pd.Timestamp(config.PRO_HISTORY_START)
     return {
         "study_start": start,
         "study_end": end,
-        "history_start": str(lookback[0].date()) if len(lookback) else start,
+        "requested_history_start": requested_history_start,
+        "history_start": max(requested_history_start, config.PRO_HISTORY_START),
         "corporate_action_end": str(
             (pd.Timestamp(end) + pd.Timedelta(days=cfg.max_dte)).date()
         ),
-        "lookback_dates": list(lookback.strftime("%Y-%m-%d")),
+        "lookback_dates": list(lookback[accessible].strftime("%Y-%m-%d")),
+        "unavailable_lookback_dates": list(
+            lookback[~accessible].strftime("%Y-%m-%d")
+        ),
     }
+
+
+def reference_access_gaps(
+    cfg: config.CollectorConfig,
+    windows: dict,
+    rate_symbols: list[str],
+    *,
+    include_stock_lookback: bool = False,
+) -> list[dict]:
+    """Describe reference sessions excluded by the configured subscriptions.
+
+    Args:
+        cfg: Separate index/rate entitlements and sampling interval.
+        windows: Study and buffer boundaries from collection_windows.
+        rate_symbols: Requested rate identifiers; duplicates are removed.
+        include_stock_lookback: Whether inaccessible stock buffer dates matter
+            for this run.
+
+    Returns:
+        Known access gaps, including dates never requested. These are distinct
+        from missing observations within successful vendor responses.
+    """
+    dates = list(
+        exchange_calendar()
+        .sessions_in_range(
+            windows["requested_history_start"], windows["study_end"]
+        )
+        .strftime("%Y-%m-%d")
+    )
+    gaps = []
+    index_excluded = [
+        date
+        for date in dates
+        if cfg.index_history_start is None or date < cfg.index_history_start
+    ]
+    if index_excluded:
+        gaps.append(
+            {
+                "symbol": "VIX",
+                "reason": "index_subscription_unavailable"
+                if cfg.index_history_start is None
+                else "before_index_subscription_history_start",
+                "subscription": cfg.index_subscription,
+                "access_start": cfg.index_history_start,
+                "unrequested_eod_session_dates": index_excluded,
+                "unrequested_intraday_session_dates": [
+                    date
+                    for date in index_excluded
+                    if date >= windows["study_start"]
+                ],
+            }
+        )
+    rate_excluded = [date for date in dates if date < cfg.rate_history_start]
+    if rate_symbols and rate_excluded:
+        gaps.append(
+            {
+                "dataset": "interest_rate_eod",
+                "symbols": sorted(set(rate_symbols)),
+                "reason": "before_rate_subscription_history_start",
+                "subscription": cfg.rate_subscription,
+                "access_start": cfg.rate_history_start,
+                "unrequested_eod_session_dates": rate_excluded,
+            }
+        )
+    if include_stock_lookback and windows["unavailable_lookback_dates"]:
+        gaps.append(
+            {
+                "dataset": "stock_lookback",
+                "reason": "before_stock_pro_history_start",
+                "access_start": config.PRO_HISTORY_START,
+                "unrequested_session_dates": windows[
+                    "unavailable_lookback_dates"
+                ],
+            }
+        )
+    return gaps
 
 
 def reference_requests(
@@ -545,7 +636,7 @@ def reference_requests(
     """Yield the shared Theta reference bundle and optional stock lookback.
 
     Args:
-        cfg: Collection settings and subscription history limit.
+        cfg: Collection settings and separate subscription history limits.
         symbols: Underlyings needing corporate actions and stock history.
         start: Inclusive study start in YYYY-MM-DD form.
         end: Inclusive study end in YYYY-MM-DD form.
@@ -554,8 +645,8 @@ def reference_requests(
             EOD reports in addition to rates/actions/VIX.
 
     Yields:
-        Request descriptors. Rates and VIX are shared across underlyings;
-        inaccessible pre-Standard VIX history is omitted from these requests.
+        Request descriptors. Rates and VIX are shared across underlyings.
+        Inaccessible dates are omitted and described by reference_access_gaps.
     """
     windows = collection_windows(cfg, start, end)
     window = {
@@ -577,36 +668,40 @@ def reference_requests(
                     "end_date": windows["corporate_action_end"],
                 },
             )
-    for symbol in sorted(set(rate_symbols)):
-        yield Request(
-            "interest_rate_eod",
-            "/interest_rate/history/eod",
-            {"symbol": symbol, **window},
-        )
+    # Rate access is separate from Stocks/Options Pro. Free rates begin in
+    # 2024; a paid rate tier can cover the buffer even before stock history.
+    rate_start = max(windows["requested_history_start"], cfg.rate_history_start)
+    if rate_start <= end:
+        for symbol in sorted(set(rate_symbols)):
+            yield Request(
+                "interest_rate_eod",
+                "/interest_rate/history/eod",
+                {"symbol": symbol, **window, "start_date": rate_start},
+            )
 
-    # Standard's index limit is enforced before scheduling. The reference ledger
-    # records the omitted dates as access gaps rather than silently shortening
-    # scope.
-    index_start = max(windows["history_start"], cfg.index_history_start)
-    if index_start <= end:
-        yield Request(
-            "index_eod",
-            "/index/history/eod",
-            {"symbol": "VIX", **window, "start_date": index_start},
+    # Stocks/Options Pro does not include indices. Skip inaccessible requests
+    # so a missing VIX entitlement cannot stop the stock/option collection.
+    if cfg.index_history_start is not None:
+        index_start = max(
+            windows["requested_history_start"], cfg.index_history_start
         )
-    index_days = (
-        exchange_calendar()
-        .sessions_in_range(max(start, cfg.index_history_start), end)
-        .tz_localize(None)
-        if max(start, cfg.index_history_start) <= end
-        else []
-    )
-    # VIX provides S&P 500 volatility context, not each stock's volatility.
-    # Intraday observations also avoid treating an EOD value as known that
-    # morning.
-    for day in index_days:
-        yield history_request(cfg, "index", "price", "VIX", day)
-        yield near_close_request(cfg, "index", "VIX", day)
+        if index_start <= end:
+            yield Request(
+                "index_eod",
+                "/index/history/eod",
+                {"symbol": "VIX", **window, "start_date": index_start},
+            )
+        intraday_start = max(start, cfg.index_history_start)
+        if intraday_start <= end:
+            # VIX provides S&P 500 volatility context, not each stock's
+            # volatility. Intraday values avoid using EOD data that morning.
+            for day in (
+                exchange_calendar()
+                .sessions_in_range(intraday_start, end)
+                .tz_localize(None)
+            ):
+                yield history_request(cfg, "index", "price", "VIX", day)
+                yield near_close_request(cfg, "index", "VIX", day)
     if include_stock_lookback:
         for date in windows["lookback_dates"]:
             for symbol in symbols:
