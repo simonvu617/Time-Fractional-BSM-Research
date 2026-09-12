@@ -75,8 +75,6 @@ def _payload(request):
     """Build one synthetic CSV, including OI-only and unselected contracts."""
     if "/list/dates" in request.endpoint:
         rows = [{"date": "2025-01-02"}]
-    elif request.dataset.startswith("corporate_"):
-        return (",".join(request.required_columns) + "\n").encode()
     elif request.dataset == "interest_rate_eod":
         rows = [{"created": "2025-01-02", "rate": "4.25"}]
     elif request.dataset in {"quoted_contracts", "traded_contracts"}:
@@ -165,7 +163,7 @@ class PlanningAndSelectionTest(unittest.TestCase):
         self.assertEqual(windows["lookback_dates"], [])
         self.assertEqual(len(windows["unavailable_lookback_dates"]), 60)
         requests = list(planning.reference_requests(cfg))
-        self.assertEqual(len(requests), 4)
+        self.assertEqual(len(requests), 2)
         self.assertFalse(
             any(r.endpoint.startswith("/index/") for r in requests)
         )
@@ -181,6 +179,7 @@ class PlanningAndSelectionTest(unittest.TestCase):
                 "index_subscription_unavailable",
                 "before_rate_subscription_history_start",
                 "before_stock_pro_history_start",
+                "theta_v3_endpoint_unavailable",
             },
         )
         rate_gap = next(
@@ -575,7 +574,9 @@ class CliAndProvenanceTest(unittest.TestCase):
             self.assertEqual(result, 2)
             self.assertFalse(
                 any(
-                    call.args[1].endpoint.startswith("/index/")
+                    call.args[1].endpoint.startswith(
+                        ("/index/", "/corporate_action/")
+                    )
                     for call in download.call_args_list
                 )
             )
@@ -587,9 +588,25 @@ class CliAndProvenanceTest(unittest.TestCase):
             self.assertEqual(run["reference_failures"], 0)
             ledger = storage.read_json(root / run["reference_ledger"])
             self.assertEqual(
-                ledger["subscription_coverage_gaps"][0]["reason"],
+                ledger["access_coverage_gaps"][0]["reason"],
                 "index_subscription_unavailable",
             )
+            action_gaps = {
+                gap["dataset"]: gap
+                for gap in ledger["access_coverage_gaps"]
+                if gap["reason"] == "theta_v3_endpoint_unavailable"
+            }
+            self.assertEqual(
+                set(action_gaps), {"corporate_dividend", "corporate_split"}
+            )
+            self.assertEqual(
+                action_gaps["corporate_dividend"]["symbols"], ["SPY"]
+            )
+            self.assertEqual(
+                action_gaps["corporate_dividend"]["unrequested_end_date"],
+                "2025-07-01",
+            )
+            self.assertEqual(run["reference_gaps"], 3)
 
     def test_plan_modes_do_not_contact_theta_or_create_output(self):
         with tempfile.TemporaryDirectory(

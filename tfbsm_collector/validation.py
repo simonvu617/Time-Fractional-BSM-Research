@@ -162,12 +162,6 @@ def raw_frame_with_diagnostics(
             nonpositive_bid_ask_rows=int((bid.le(0) | ask.le(0)).sum()),
             crossed_quote_rows=int(bid.gt(ask).sum()),
         )
-    if request.dataset == "corporate_dividend" and "amount" in frame:
-        # A blank cash amount remains unknown; zero would invent a dividend
-        # input.
-        diagnostics["unknown_dividend_amount_rows"] = int(
-            frame["amount"].astype("string").str.strip().eq("").sum()
-        )
     if (
         request.endpoint.endswith("/history/quote")
         and "collector_timestamp_utc" in result

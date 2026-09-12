@@ -143,7 +143,7 @@ class Collector:
                     )
                     run["reference_gaps"] = references[
                         "requests_with_observed_gaps"
-                    ] + len(references["subscription_coverage_gaps"])
+                    ] + len(references["access_coverage_gaps"])
                     self.store.client.check_running()
                 if cfg.mode == "panels":
                     self._collect_panels(anchors, run)
@@ -606,7 +606,7 @@ class Collector:
             "collection_windows": windows,
             "index_subscription": self.cfg.index_subscription,
             "rate_subscription": self.cfg.rate_subscription,
-            "subscription_coverage_gaps": access_gaps,
+            "access_coverage_gaps": access_gaps,
             "stock_lookback_requested": bool(lookback_datasets),
             "option_contract_continuity_guaranteed": False,
             "requested_rates": sorted(set(self.cfg.rate_symbols)),
@@ -621,14 +621,8 @@ class Collector:
                 *lookback_datasets,
             ],
             "rate_publication_timestamps_verified": False,
-            "corporate_action_range_filters": {
-                "dividend": "ex_dividend_date",
-                "split": "effective_date",
-            },
             "missing_dividend_amounts": "unknown; not zero",
-            "split_ratio": "before_shares / after_shares",
-            "empty_actions_prove_complete_event_coverage": False,
-            "later_actions_were_known_at_study_time": "not_assumed; retain announcement dates and unknown values",
+            "corporate_actions_available": False,
             "index_unchanged_updates_may_be_omitted": True,
             "adjusted_contract_deliverables": "not_documented_by_Theta; not_inferred",
             "historical_symbol_mappings": "not_verified",

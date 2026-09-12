@@ -35,36 +35,11 @@ CONTRACT_FIELDS = ("symbol", "expiration", "strike", "right")
 REFERENCE_COLUMNS = {
     # Rates remain in reported percent: 4.25 means 4.25%, not 0.0425.
     "interest_rate_eod": ("created", "rate"),
-    # Announcement, ex-dividend, record, and payment dates have different roles.
-    # Component/type fields prevent later work from blindly summing an event's
-    # breakdown as if every row were a separate cash distribution.
-    "corporate_dividend": (
-        "announcement_date",
-        "ex_dividend_date",
-        "record_date",
-        "payment_date",
-        "amount",
-        "event_code",
-        "is_component",
-        "distribution_type",
-    ),
-    # Splits change share counts and prices. These terms do not establish an
-    # adjusted option's deliverable; the collector does not infer one.
-    "corporate_split": (
-        "effective_date",
-        "before_shares",
-        "after_shares",
-        "split_ratio",
-        "event_code",
-    ),
 }
 
-# Validate against each endpoint's filtering date. An announcement or payment
-# date can legitimately lie outside a request filtered on ex-dividend date.
+# Rate reports have a date, not a verified intraday publication timestamp.
 REPORT_DATE_COLUMNS = {
     "interest_rate_eod": "created",
-    "corporate_dividend": "ex_dividend_date",
-    "corporate_split": "effective_date",
 }
 
 
@@ -549,7 +524,7 @@ def reference_access_gaps(
     cfg: config.CollectorConfig,
     windows: dict,
 ) -> list[dict]:
-    """Describe reference sessions excluded by the configured subscriptions.
+    """Describe references excluded by access limits or unavailable endpoints.
 
     Args:
         cfg: Requested rates, separate entitlements, and sampling interval.
@@ -612,6 +587,21 @@ def reference_access_gaps(
                 ],
             }
         )
+    if cfg.symbols:
+        # The September 2026 live check returned 404 for both corporate-action
+        # routes. Theta's v3 migration guide marks them as coming soon. Keep the
+        # missing event window visible; absent dividends must never imply zero.
+        # An option can expire after the study end, so the gap includes max_dte.
+        for dataset in ("corporate_dividend", "corporate_split"):
+            gaps.append(
+                {
+                    "dataset": dataset,
+                    "symbols": [symbol.symbol for symbol in cfg.symbols],
+                    "reason": "theta_v3_endpoint_unavailable",
+                    "unrequested_start_date": windows["history_start"],
+                    "unrequested_end_date": windows["corporate_action_end"],
+                }
+            )
     return gaps
 
 
@@ -632,20 +622,6 @@ def reference_requests(cfg: config.CollectorConfig):
         "end_date": end,
         "format": "csv",
     }
-    for symbol in cfg.symbols:
-        for kind in ("dividend", "split"):
-            # An option selected in December may expire after a January
-            # dividend. Keep that event and its announcement date without
-            # assuming it was known earlier.
-            yield Request(
-                f"corporate_{kind}",
-                f"/corporate_action/{kind}",
-                {
-                    "symbol": symbol.symbol,
-                    **window,
-                    "end_date": windows["corporate_action_end"],
-                },
-            )
     # Rate access is separate from Stocks/Options Pro. Free rates begin in
     # 2024; a paid rate tier can cover the buffer even before stock history.
     rate_start = max(windows["requested_history_start"], cfg.rate_history_start)

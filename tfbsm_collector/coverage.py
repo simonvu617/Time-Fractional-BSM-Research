@@ -46,7 +46,7 @@ class CoverageChecker:
 
         Returns:
             Coverage metadata with status observations_present, gaps_observed,
-            unknown, or not_assessed. Empty event/OI reports are not
+            unknown, or not_assessed. Empty OI reports are not
             automatically missing prices, and publisher schedules remain
             unverified.
         """
@@ -59,12 +59,9 @@ class CoverageChecker:
                 "reason": "request_not_completed_successfully",
             }
 
-        # Event reports can legitimately be empty. Missing cash events or OI are
-        # not automatically failed price collection and are never filled with
-        # zero.
-        if request.dataset.startswith(
-            "corporate_"
-        ) or request.endpoint.endswith("/open_interest"):
+        # An empty OI report does not mean zero open contracts and does not
+        # establish a missing price observation.
+        if request.endpoint.endswith("/open_interest"):
             return {
                 "status": "not_assessed",
                 "reason": "empty_event_reports_can_be_valid",

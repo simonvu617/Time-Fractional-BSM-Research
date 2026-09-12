@@ -129,7 +129,7 @@ def parse_run_scope(
         action="store_const",
         dest="mode",
         const="references",
-        help="Collect dividends, splits, rates, and VIX without stock/option panels",
+        help="Collect accessible rates/VIX and report missing references without stock/option panels",
     )
     modes.add_argument(
         "--coverage-only",
@@ -222,6 +222,12 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
             f"Requested reference history starts {windows['requested_history_start']}; corporate actions through {windows['corporate_action_end']}"
         )
         for gap in planning.reference_access_gaps(cfg, windows):
+            if "unrequested_start_date" in gap:
+                print(
+                    f"Known access gap: {gap['dataset']}; {gap['reason']}; "
+                    f"{gap['unrequested_start_date']} to {gap['unrequested_end_date']}"
+                )
+                continue
             count = len(
                 gap.get(
                     "unrequested_eod_session_dates",
