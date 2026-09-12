@@ -9,7 +9,6 @@ instead of storing another copy of each response.
 """
 
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -200,6 +199,7 @@ class RequestStore:
     Attributes:
         cfg: Parsing, retention, and cache settings.
         root: Output root for relative artifact receipts.
+        collection_dir: Session manifests and tables for the sampling policy.
         client: Shared Theta transport and cancellation signal.
         code_files: Repository-relative source paths and their SHA-256 hashes.
         code_sha256: Digest of code_files, captured when the store is created.
@@ -210,6 +210,7 @@ class RequestStore:
         """Initialize transport and provenance without creating output."""
         self.cfg = cfg
         self.root = cfg.output_dir
+        self.collection_dir = self.root / "collection" / cfg.policy_id
         self.client = transport.ThetaClient(cfg)
 
         # Capture all package sources once. Hashing only this storage module
@@ -238,6 +239,32 @@ class RequestStore:
             / f"request={request.request_id}"
         )
 
+    def session_path(self, symbol: str, day: pd.Timestamp) -> pathlib.Path:
+        """Return the manifest path for an underlying and exchange session."""
+        return (
+            self.collection_dir
+            / "sessions"
+            / f"symbol={symbol}__date={day.date()}.json"
+        )
+
+    def reusable(self, record: dict) -> bool:
+        """Check a response receipt for both cache and session resume.
+
+        A successful status alone is insufficient: every referenced artifact
+        must exist, and the requested raw-payload/empty-refresh policy applies.
+        """
+        if record["status"] not in GOOD_REQUEST_STATUSES:
+            return False
+        if self.cfg.refresh_no_data and record["status"] == "no_data":
+            return False
+        if self.cfg.store_raw_payloads and not record.get("payload"):
+            return False
+        return all(
+            artifact_valid(record.get(name), self.root)
+            for name in ("data", "metadata", "payload")
+            if name != "payload" or record.get(name)
+        )
+
     def cached(self, request: planning.Request) -> dict | None:
         """Return a reusable request receipt, or None when collection is needed.
 
@@ -264,21 +291,11 @@ class RequestStore:
             if (
                 meta["request"] != request.identity()
                 or meta["raw_schema_version"] != RAW_SCHEMA_VERSION
-                or meta["status"] not in GOOD_REQUEST_STATUSES
                 or meta.get("timestamp_timezone") != self.cfg.exchange_tz
             ):
                 return None
-            if self.cfg.refresh_no_data and meta["status"] == "no_data":
-                return None
-            if not artifact_valid(meta["data"], self.root):
-                return None
-            if meta.get("payload") and not artifact_valid(
-                meta["payload"], self.root
-            ):
-                return None
-            if self.cfg.store_raw_payloads and not meta.get("payload"):
-                return None
-            return self.record(request, meta, path)
+            record = self.record(request, meta, path)
+            return record if self.reusable(record) else None
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
@@ -334,10 +351,6 @@ class RequestStore:
             cached = None if refresh else self.cached(request)
             if cached:
                 return cached
-            legacy = self.legacy_response(request)
-            if legacy is not None:
-                frame, response_meta, payload = legacy
-                return self.save(request, frame, response_meta, payload)
             self.root.mkdir(parents=True, exist_ok=True)
 
             # Bulk responses need only one on-disk staging file, even when exact
@@ -564,102 +577,6 @@ class RequestStore:
                 {"metadata": record["metadata"]},
             )
         return record
-
-    def legacy_response(self, request: planning.Request):
-        """Read an exact, verified legacy CSV without changing its old files.
-
-        Args:
-            request: Descriptor to match against the older collector layout.
-
-        Returns:
-            A tuple (frame, response_metadata, payload_bytes), or None if the
-            legacy cache is absent/incompatible. Parsed Parquet alone is not
-            accepted: the original CSV must pass hashing and strict
-                revalidation.
-        """
-        if "*" in (
-            request.params.get("expiration"),
-            request.params.get("strike"),
-        ) or request.dataset not in {
-            "quoted_contracts",
-            "option_open_interest",
-            "stock_quotes_" + self.cfg.quote_interval,
-            "option_quotes_" + self.cfg.quote_interval,
-        }:
-            return None
-        params = request.params
-        day = pd.Timestamp(params["date"]).strftime("%Y-%m-%d")
-        directory = (
-            self.root
-            / "raw_cache"
-            / request.dataset
-            / f"symbol={params['symbol']}"
-            / f"date={day}"
-        )
-        if "expiration" in params:
-            directory /= f"expiration={params['expiration']}"
-            directory /= f"strike={planning.format_strike(params['strike'])}"
-            directory /= f"right={params['right']}"
-        try:
-            old = read_json(directory / "meta.json")
-            path = directory / "data.parquet"
-            if (
-                old["dataset"] != request.dataset
-                or old["endpoint"] != request.endpoint
-                or old["params"] != params
-                or old["cache_status"] not in {"ok", "no_data"}
-                or provenance.file_hash(path) != old["cache_data_sha256"]
-            ):
-                return None
-            if self.cfg.refresh_no_data and old["cache_status"] == "no_data":
-                return None
-            payload_path = directory / "raw_response.csv"
-            payload = (
-                payload_path.read_bytes() if payload_path.exists() else None
-            )
-            # A legacy Parquet checksum does not prove strict CSV parsing.
-            # Require verified original bytes before importing an older
-            # response.
-            if payload is None or hashlib.sha256(
-                payload
-            ).hexdigest() != old.get("payload_sha256"):
-                return None
-            if old.get("status_code") == 200:
-                frames = list(
-                    validation.csv_frames(
-                        io.BytesIO(payload), self.cfg.raw_chunk_rows
-                    )
-                )
-                frame = (
-                    pd.concat(frames, ignore_index=True)
-                    if frames
-                    else pd.DataFrame(columns=request.required_columns)
-                )
-            elif old.get("status_code") == 472:
-                frame = pd.DataFrame(columns=request.required_columns)
-            else:
-                return None
-            if set(request.required_columns) - set(frame.columns):
-                return None
-            meta = {
-                name: old[name]
-                for name in (
-                    "request_url",
-                    "status_code",
-                    "response_headers",
-                    "payload_sha256",
-                    "payload_bytes",
-                    "fetched_at_utc",
-                )
-                if name in old
-            }
-            meta.update(
-                legacy_source=path.relative_to(self.root).as_posix(),
-                legacy_csv_revalidated=True,
-            )
-            return frame, meta, payload
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
 
     def read(self, record: dict) -> pd.DataFrame:
         """Return a successful saved table, or an empty table for a failed pull.

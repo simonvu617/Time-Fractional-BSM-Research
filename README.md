@@ -67,7 +67,7 @@ These flags declare subscriptions already held; they do not activate access. Wit
 
 Normal runs request 60 earlier trading sessions of stock hourly/near-close quotes and EOD records. `--lookback-sessions` changes this collection buffer; `0` disables it. Stock requests are bounded by June 1, 2012, so the earliest study start has no accessible stock buffer. `collection_windows` records both the requested history start and inaccessible lookback dates. Rates and VIX EOD use the requested buffer subject to their separate access limits. Corporate-action requests extend through the study's end date plus the maximum selected DTE, so events before an option's expiration are not cut off at the study boundary. Announcement dates and unknown amounts are preserved; later events are not assumed to have been known at an earlier observation. The lookback does not define a calibration window or guarantee continuous histories for the same option contracts.
 
-Responses download to disk and convert to Parquet in batches. Strict CSV checks reject extra/missing fields and malformed records at every batch boundary. Quality diagnostics run before the quote storage filter, so excluded rows cannot hide a malformed or misrouted response. Retained observations keep raw values, conditions, row order, duplicates, and separate clock meanings. Session coverage checks every selected contract, including absent hourly samples, near-close snapshots, and daily EOD reports. A nonempty bulk response containing only unselected contracts still produces a selected-sample coverage gap. Quote cache identities include the exact retained contracts; changing the selection can require another bulk download. Existing full-response files are not rewritten. The explicit `--store-raw-payloads` option retains complete CSV responses, including excluded quotes, at additional storage cost; failed responses retain their original bytes for inspection. Daily rate/index reports list exchange sessions without a dated observation, including possible differences in publisher holidays. Empty OI and corporate-action responses are not automatically treated as failures. Older parsed caches that lack strict CSV validation require new downloads, and pre-refactor caches with verified CSV bytes can be revalidated.
+Responses download to disk and convert to Parquet in batches. Strict CSV checks reject extra/missing fields and malformed records at every batch boundary. Quality diagnostics run before the quote storage filter, so excluded rows cannot hide a malformed or misrouted response. Retained observations keep raw values, conditions, row order, duplicates, and separate clock meanings. Session coverage checks every selected contract, including absent hourly samples, near-close snapshots, and daily EOD reports. A nonempty bulk response containing only unselected contracts still produces a selected-sample coverage gap. Quote cache identities include the exact retained contracts; changing the selection can require another bulk download. Existing full-response files are not rewritten. The explicit `--store-raw-payloads` option retains complete CSV responses, including excluded quotes, at additional storage cost; failed responses retain their original bytes for inspection. Daily rate/index reports list exchange sessions without a dated observation, including possible differences in publisher holidays. Empty OI and corporate-action responses are not automatically treated as failures. Older parsed caches that lack strict CSV validation require new downloads.
 
 Stock references at 10:30, 13:30, and 15:30 New York time select the research contracts; these times align with the hourly grid. References outside an early-close session are omitted. The combined universe remains an observed list, not proof of complete historical listings. Evaluation samples, regimes, and pricing inputs are left to later work. The current collection supports hourly/daily comparisons; directly studying exact trade gaps would require a separate collection design.
 
@@ -90,24 +90,28 @@ python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
 
 To preview the full default Pro history, run `python collector.py --plan`. Keep the default reference tiers for Stocks Pro and Options Pro alone. If the account later also has Indices Pro and Interest Rates Value, declare them with `--index-subscription pro --rate-subscription value`; the preview shows any remaining access gaps before downloading.
 
-The implementation is organized by responsibility. Start with settings, then follow one session through the workflow:
+The implementation has ten modules with distinct jobs. Start with `config.py`, then `Collector.run()` in `workflow.py`: it checks date coverage, collects references, and collects stock/option sessions. `Collector.collect_day()` shows the work for one underlying and date.
+
+One `CollectorConfig` holds the requested symbols, dates, mode, rate series, and collection settings. The CLI parses and previews this configuration; it does not manage collection workers or saved run status. Request builders read the same configuration instead of receiving repeated copies of the run scope. Storage owns output paths and the response-reuse check shared by cache lookup and session resume. Coverage owns both observation checks and the resulting reports.
 
 | File | What to read it for |
 | --- | --- |
 | [`config.py`](tfbsm_collector/config.py) | Study universe, DTE and S/K targets, sampling times, subscription limits, and download settings. |
-| [`workflow.py`](tfbsm_collector/workflow.py) | `Collector.collect_day`, reference collection, session manifests, resume checks, and availability summaries. |
+| [`workflow.py`](tfbsm_collector/workflow.py) | `Collector.run` and `collect_day`: run order, reference/session collection, cancellation, and final run status. |
 | [`planning.py`](tfbsm_collector/planning.py) | Exact Theta request identities, required fields, clock meanings, and calendar-aware request construction. |
 | [`selection.py`](tfbsm_collector/selection.py) | Dated contract discovery, stock selection references, and the maturity/moneyness grid. |
 | [`transport.py`](tfbsm_collector/transport.py) | HTTP streaming, shared request limits, retry behavior, and cancellation. |
 | [`validation.py`](tfbsm_collector/validation.py) | Strict CSV parsing, UTC clock columns, response identity checks, and raw quality diagnostics. |
-| [`storage.py`](tfbsm_collector/storage.py) | Atomic writes, immutable response attempts, selected-contract retention, cache reuse, and output locking. |
-| [`coverage.py`](tfbsm_collector/coverage.py) | Missing selected contracts, absent sample times, daily report presence, and unknown coverage. |
+| [`storage.py`](tfbsm_collector/storage.py) | Output paths, atomic files, response retention, shared resume checks, and output locking. |
+| [`coverage.py`](tfbsm_collector/coverage.py) | Date catalogues, missing contracts/sample times, daily report presence, and the final availability CSV. |
 | [`provenance.py`](tfbsm_collector/provenance.py) | Source fingerprints, file hashes, collection times, and dependency versions. |
-| [`cli.py`](tfbsm_collector/cli.py) | Command-line options, run order, progress reporting, and exit codes. |
+| [`cli.py`](tfbsm_collector/cli.py) | Command-line options, scope preview, and entry into the collection workflow. |
 
 Docstrings and comments follow the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html): docstrings describe each interface with `Args`, `Returns`/`Yields`, and `Raises` where useful; nearby comments explain financial and collection decisions. Module imports make it clear which file owns an operation. Ruff checks the Google docstring convention and keeps formatting consistent through `pyproject.toml`.
 
 The module split preserves request IDs, sampling-policy IDs, output schemas, and existing cache paths. New run records include `code_files`, a mapping from repository-relative Python source paths to SHA-256 hashes; `code_sha256` hashes that mapping. Response metadata stores the same information as `collector_code_files` and `collector_code_sha256`. This covers the launcher and the whole package. Older records retain their original single-file fingerprint and can still be read. A source-layout change alone does not require a new data schema version.
+
+The unused importer for the older pre-PR cache layout has been removed. This does not remove data files or change resume support for the request-keyed caches and session manifests already produced by this PR. Date parsing is shared between response identity checks and diagnostic summaries; vendor text and stored observation schemas stay unchanged.
 
 Run the maintained offline checks without Theta credentials or a running terminal:
 
@@ -122,7 +126,7 @@ ruff check collector.py tfbsm_collector tests/test_collector.py
 ruff format --check collector.py tfbsm_collector tests/test_collector.py
 ```
 
-These checks cover synthetic collection, selected-row retention, malformed responses, coverage gaps, resume, Pro concurrency, and separate reference access. They do not establish live vendor access or historical completeness.
+These checks cover synthetic collection, selected-row retention, malformed responses, dates across parsing batches, coverage gaps, resume, interruption cleanup, Pro concurrency, and separate reference access. They do not establish live vendor access or historical completeness.
 
 ## License, citation, and data
 

@@ -134,8 +134,7 @@ def raw_frame_with_diagnostics(
         ):
             continue
         parsed = parse_vendor_clock(frame[name], cfg.exchange_tz)
-        if f"collector_{name}_utc" not in result:
-            result[f"collector_{name}_utc"] = parsed
+        result[f"collector_{name}_utc"] = parsed
         valid = parsed.dropna()
         diagnostics["clocks"][name] = {
             "unparseable_or_missing": int(parsed.isna().sum()),
@@ -163,24 +162,6 @@ def raw_frame_with_diagnostics(
             nonpositive_bid_ask_rows=int((bid.le(0) | ask.le(0)).sum()),
             crossed_quote_rows=int(bid.gt(ask).sum()),
         )
-    report_date = request.report_date_column
-
-    # A date-only report does not reveal when its value first became available.
-    # Do not invent a publication timestamp for rates or corporate actions.
-    if report_date and report_date in frame:
-        dates = pd.to_datetime(
-            frame[report_date].astype("string").str.strip(),
-            format="mixed",
-            errors="coerce",
-        )
-        diagnostics["report_dates"] = {
-            "column": report_date,
-            "unparseable_or_missing": int(dates.isna().sum()),
-            "first": str(dates.min().date()) if dates.notna().any() else None,
-            "last": str(dates.max().date()) if dates.notna().any() else None,
-            "unique_count": int(dates.nunique()),
-            "publication_time_verified": False,
-        }
     if request.dataset == "corporate_dividend" and "amount" in frame:
         # A blank cash amount remains unknown; zero would invent a dividend
         # input.
@@ -214,15 +195,19 @@ def raw_frame_with_diagnostics(
     return result, diagnostics
 
 
-def response_identity_issues(
-    frame: pd.DataFrame, request: planning.Request, cfg: config.CollectorConfig
+def _response_identity_issues(
+    frame: pd.DataFrame,
+    request: planning.Request,
+    cfg: config.CollectorConfig,
+    report_dates: pd.Series | None,
 ) -> list[str]:
     """Return response identity/date problems without rewriting records.
 
     Args:
-        frame: Vendor fields stored as strings.
+        frame: Vendor fields with the already parsed collector_*_utc clocks.
         request: Expected symbol, contract scope, and date range.
         cfg: Exchange time zone used to compare market-record dates.
+        report_dates: Parsed date-only values, or None for market timestamps.
 
     Returns:
         Issue identifiers, or an empty list. Wildcard contract requests are
@@ -291,14 +276,12 @@ def response_identity_issues(
     )
     if primary and primary in frame:
         if report_date:
-            dates = pd.to_datetime(
-                frame[primary].str.strip(), format="mixed", errors="coerce"
-            )
+            dates = report_dates
         else:
             # Market dates must be compared in exchange time, not by their UTC
             # date.
             dates = (
-                parse_vendor_clock(frame[primary], cfg.exchange_tz)
+                frame[f"collector_{primary}_utc"]
                 .dt.tz_convert(cfg.exchange_tz)
                 .dt.tz_localize(None)
                 .dt.normalize()
@@ -356,22 +339,32 @@ class RawDiagnostics:
         frame, quality = raw_frame_with_diagnostics(raw, self.request, self.cfg)
         self.rows += len(frame)
         self.chunks += 1
+        column = self.request.report_date_column
+        dates = None
+        if column and column in raw:
+            # Parse date-only reports once for both identity checks and the
+            # whole-response summary. A report date is not a publication time.
+            dates = pd.to_datetime(
+                raw[column].str.strip(), format="mixed", errors="coerce"
+            )
+            self.report_dates.update(dates.dropna().dt.strftime("%Y-%m-%d"))
+            self.report_missing += int(dates.isna().sum())
 
         # A batch with blank clocks is not proof the whole response lacks dates.
         # Defer that global check until finish(), after all batches have
         # arrived.
         self.issues.update(
             issue
-            for issue in response_identity_issues(raw, self.request, self.cfg)
+            for issue in _response_identity_issues(
+                frame, self.request, self.cfg, dates
+            )
             if issue != "no_parseable_report_dates"
         )
         for name, value in quality.items():
-            if name not in {"clocks", "report_dates"}:
+            if name != "clocks":
                 self.quality[name] = self.quality.get(name, 0) + value
         for name, info in quality["clocks"].items():
             parsed = frame[f"collector_{name}_utc"]
-            if not isinstance(parsed.dtype, pd.DatetimeTZDtype):
-                parsed = parse_vendor_clock(raw[name], self.cfg.exchange_tz)
             valid = parsed.dropna()
             target = self.quality["clocks"].setdefault(
                 name,
@@ -413,13 +406,6 @@ class RawDiagnostics:
                     (v for v in (target[key], info[key]) if v is not None),
                     key=pd.Timestamp,
                 )
-        column = self.request.report_date_column
-        if column and column in raw:
-            dates = pd.to_datetime(
-                raw[column].str.strip(), format="mixed", errors="coerce"
-            )
-            self.report_dates.update(dates.dropna().dt.strftime("%Y-%m-%d"))
-            self.report_missing += int(dates.isna().sum())
         return frame
 
     def finish(self) -> dict:

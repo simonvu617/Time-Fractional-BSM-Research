@@ -1,16 +1,25 @@
 # Copyright 2026 Simon Vu
 # SPDX-License-Identifier: MIT
 
-"""Check selected observations separately from request and storage success.
+"""Check observations and publish date/session coverage reports.
 
 A successful bulk request can omit a selected contract or sampled timestamp.
-CoverageChecker reports those gaps without filling data, dropping quotes, or
-deciding whether an observation is suitable for pricing.
+CoverageChecker owns date-catalogue checks, per-response presence checks, and
+the final availability CSV. It reports gaps without filling data, dropping
+quotes, or deciding whether an observation is suitable for pricing.
 """
+
+import csv
 
 import pandas as pd
 
-from tfbsm_collector import planning, storage, validation
+from tfbsm_collector import (
+    planning,
+    provenance,
+    storage,
+    transport,
+    validation,
+)
 
 
 class CoverageChecker:
@@ -317,3 +326,293 @@ class CoverageChecker:
             "complete_intraday_history_verified": False,
             "research_sample_usability_verified": False,
         }
+
+    def collect_catalogue(
+        self,
+        anchors: pd.DatetimeIndex,
+        run_id: str,
+    ) -> dict:
+        """Refresh stock/VIX date catalogues and record advertised date gaps.
+
+        Args:
+            anchors: Exchange session dates in the requested coverage window.
+            run_id: Identifier naming the coverage report.
+
+        Returns:
+            Catalogue outcomes, missing requested dates, and unfinished
+            requests. Listed dates do not establish subscription access or
+            complete history.
+        """
+        requests_to_make = [
+            planning.Request(
+                f"stock_{kind}_dates",
+                f"/stock/list/dates/{kind}",
+                {"symbol": symbol.symbol, "format": "csv"},
+            )
+            for symbol in self.cfg.symbols
+            for kind in ("quote", "trade")
+        ]
+        access_gaps = []
+        if self.cfg.index_history_start is not None:
+            requests_to_make.append(
+                planning.Request(
+                    "index_price_dates",
+                    "/index/list/dates",
+                    {"symbol": "VIX", "format": "csv"},
+                )
+            )
+        else:
+            # The catalogue itself requires index access too. Record its
+            # absence even in --coverage-only mode, before reference collection.
+            access_gaps.append(
+                {
+                    "symbol": "VIX",
+                    "dataset": "index_price_dates",
+                    "reason": "index_subscription_unavailable",
+                }
+            )
+        expected = set(anchors.strftime("%Y-%m-%d"))
+        rows, records = [], []
+        try:
+            for request in requests_to_make:
+                if self.store.client.stop_event.is_set():
+                    break
+                try:
+                    # Small date catalogues can expand after vendor backfills.
+                    # Refresh them without invalidating independently cached
+                    # historical responses.
+                    record = self.store.collect(request, refresh=True)
+                    frame = self.store.read(record)
+                except transport.CollectionStopped:
+                    break
+                except Exception as exc:
+                    frame = pd.DataFrame()
+                    record = {
+                        "request_id": request.request_id,
+                        "dataset": request.dataset,
+                        "params": request.params,
+                        "status": "request_error",
+                        "error": repr(exc),
+                    }
+                records.append(record)
+                dates = (
+                    pd.to_datetime(
+                        frame["date"].astype("string").str.strip(),
+                        format="mixed",
+                        errors="coerce",
+                    ).dropna()
+                    if "date" in frame
+                    else pd.Series(dtype="datetime64[ns]")
+                )
+                known = record["status"] in storage.GOOD_REQUEST_STATUSES
+                available = set(dates.dt.strftime("%Y-%m-%d"))
+
+                # None means the catalogue failed and coverage is unknown. An
+                # empty list means the catalogue listed all requested dates, not
+                # all observations.
+                missing = sorted(expected - available) if known else None
+                row = {
+                    "symbol": request.params["symbol"],
+                    "dataset": request.dataset,
+                    "status": ("listed" if not missing else "coverage_gap")
+                    if known
+                    else "request_error",
+                    "first_available": str(dates.min().date())
+                    if len(dates)
+                    else None,
+                    "last_available": str(dates.max().date())
+                    if len(dates)
+                    else None,
+                    "requested_sessions": len(expected),
+                    "listed_requested_sessions": len(expected & available)
+                    if known
+                    else None,
+                    "missing_requested_dates": missing,
+                    "error": record.get("error", ""),
+                }
+                rows.append(row)
+                print(
+                    f"Coverage {row['symbol']} {row['dataset']}: {row['status']}"
+                )
+        finally:
+            report = {
+                "vendor": "ThetaData",
+                "checked_at_utc": provenance.utc_now(),
+                "rows": rows,
+                "requests": records,
+                "index_subscription": self.cfg.index_subscription,
+                "subscription_coverage_gaps": access_gaps,
+                "unfinished_requests": [
+                    r.identity() for r in requests_to_make[len(rows) :]
+                ],
+                "request_errors": sum(
+                    row["status"] == "request_error" for row in rows
+                ),
+                "series_with_gaps": sum(
+                    row["status"] == "coverage_gap" for row in rows
+                )
+                + len(access_gaps),
+                "proves_interval_or_subscription_access": False,
+                "proves_complete_intraday_records": False,
+                "scope": "stock quote/trade and VIX date catalogues; option coverage is recorded during collection",
+                "documented_limits": {
+                    "SPY_underlying_history_before_2020": "unavailable per Theta documentation",
+                    "other_CTA_only_symbols": "pre-2020 underlying history may be unavailable",
+                    "reference_and_adjusted_contract_completeness": "not established by date catalogues",
+                },
+                "documentation": "https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html",
+            }
+            storage.write_json(
+                self.cfg.output_dir / "coverage" / f"{run_id}.json", report
+            )
+        return report
+
+    def write_availability(self, anchors: pd.DatetimeIndex) -> dict:
+        """Write one coverage-summary CSV row per requested underlying/session.
+
+        Args:
+            anchors: Exchange session dates to include, even if never attempted.
+
+        Returns:
+            Counts by collection status and observed/unknown coverage. Damaged
+            manifests become explicit failure rows rather than aborting the CSV.
+        """
+        path = self.store.collection_dir / "availability.csv"
+        # Rows and bytes below describe stored records, not distinct market
+        # events. Overlapping snapshots and EOD reports must not be interpreted
+        # as trade counts.
+        columns = (
+            "symbol",
+            "trade_day",
+            "status",
+            "coverage_status",
+            "reason",
+            "quoted_contract_count",
+            "traded_contract_count",
+            "oi_reported_contract_count",
+            "universe_contract_count",
+            "selected_contract_count",
+            "selection_reference_count",
+            "missing_selection_times",
+            "request_count",
+            "request_error_count",
+            "no_data_request_count",
+            "missing_option_quote_count",
+            "missing_option_eod_count",
+            "missing_stock_dataset_count",
+            "unknown_required_request_count",
+            "stored_rows",
+            "excluded_quote_rows",
+            "stored_parquet_bytes",
+            "error",
+        )
+        counts = dict.fromkeys(
+            ("complete", "unavailable", "request_error", "not_attempted"), 0
+        )
+        counts.update(days_with_observed_gaps=0, days_with_unknown_coverage=0)
+        with storage.atomic_output(path) as temp:
+            with temp.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns)
+                writer.writeheader()
+                for day in anchors:
+                    for symbol in self.cfg.symbols:
+                        row = {
+                            "symbol": symbol.symbol,
+                            "trade_day": str(day.date()),
+                            "status": "not_attempted",
+                            "coverage_status": "not_checked",
+                        }
+                        try:
+                            manifest = storage.read_json(
+                                self.store.session_path(symbol.symbol, day)
+                            )
+                            if (
+                                manifest["symbol"] != symbol.symbol
+                                or manifest["trade_day"] != str(day.date())
+                                or manifest["status"]
+                                not in {
+                                    "complete",
+                                    "unavailable",
+                                    "request_error",
+                                }
+                            ):
+                                raise ValueError(
+                                    "Session identity or status does not match the requested day"
+                                )
+                            row.update(
+                                {
+                                    key: manifest.get(key, "")
+                                    for key in columns
+                                    if key in manifest
+                                }
+                            )
+                            records = manifest["requests"]
+                            coverage = manifest["coverage"]
+                            if coverage["status"] not in {
+                                "observations_present",
+                                "gaps_observed",
+                                "unknown",
+                            }:
+                                raise ValueError(
+                                    "Unknown session coverage status"
+                                )
+                            row.update(
+                                coverage_status=coverage["status"],
+                                **{
+                                    name: coverage[name]
+                                    for name in (
+                                        "missing_option_quote_count",
+                                        "missing_option_eod_count",
+                                        "missing_stock_dataset_count",
+                                        "unknown_required_request_count",
+                                    )
+                                },
+                            )
+                            row.update(
+                                selection_reference_count=len(
+                                    manifest["stock_selection_references"]
+                                ),
+                                missing_selection_times="|".join(
+                                    manifest["missing_selection_times"]
+                                ),
+                                request_count=len(records),
+                                no_data_request_count=sum(
+                                    r["status"] == "no_data" for r in records
+                                ),
+                                stored_rows=sum(
+                                    r.get("row_count", 0) for r in records
+                                ),
+                                excluded_quote_rows=sum(
+                                    r.get("retention", {}).get(
+                                        "excluded_rows", 0
+                                    )
+                                    for r in records
+                                ),
+                                stored_parquet_bytes=sum(
+                                    (r.get("data") or {}).get("size", 0)
+                                    for r in records
+                                ),
+                            )
+                        except FileNotFoundError:
+                            pass
+                        except (
+                            OSError,
+                            ValueError,
+                            KeyError,
+                            TypeError,
+                            AttributeError,
+                        ) as exc:
+                            row.update(
+                                status="request_error",
+                                coverage_status="unknown",
+                                error=repr(exc),
+                            )
+                        counts[row["status"]] += 1
+                        counts["days_with_observed_gaps"] += (
+                            row["coverage_status"] == "gaps_observed"
+                        )
+                        counts["days_with_unknown_coverage"] += (
+                            row["coverage_status"] == "unknown"
+                        )
+                        writer.writerow(row)
+        return counts

@@ -157,21 +157,14 @@ def _download_fixture(client, request, payload):
 
 class PlanningAndSelectionTest(unittest.TestCase):
     def test_pro_history_clips_stock_buffer_and_reports_reference_access(self):
-        cfg = config.CollectorConfig()
-        windows = planning.collection_windows(cfg, cfg.start_date, cfg.end_date)
+        cfg = config.CollectorConfig(
+            symbols=(config.UNIVERSE[0],), rate_symbols=("SOFR", "TREASURY_M3")
+        )
+        windows = planning.collection_windows(cfg)
         self.assertEqual(windows["history_start"], "2012-06-01")
         self.assertEqual(windows["lookback_dates"], [])
         self.assertEqual(len(windows["unavailable_lookback_dates"]), 60)
-        requests = list(
-            planning.reference_requests(
-                cfg,
-                [config.UNIVERSE[0]],
-                cfg.start_date,
-                cfg.end_date,
-                ["SOFR", "TREASURY_M3"],
-                include_stock_lookback=True,
-            )
-        )
+        requests = list(planning.reference_requests(cfg))
         self.assertEqual(len(requests), 4)
         self.assertFalse(
             any(r.endpoint.startswith("/index/") for r in requests)
@@ -181,9 +174,7 @@ class PlanningAndSelectionTest(unittest.TestCase):
                 self.assertEqual(request.params["start_date"], "2024-01-01")
             else:
                 self.assertEqual(request.params["start_date"], "2012-06-01")
-        gaps = planning.reference_access_gaps(
-            cfg, windows, ["SOFR", "TREASURY_M3"], include_stock_lookback=True
-        )
+        gaps = planning.reference_access_gaps(cfg, windows)
         self.assertEqual(
             {g["reason"] for g in gaps},
             {
@@ -198,7 +189,11 @@ class PlanningAndSelectionTest(unittest.TestCase):
         self.assertEqual(
             rate_gap["unrequested_eod_session_dates"][-1], "2023-12-29"
         )
-        later = planning.collection_windows(cfg, "2013-01-02", "2013-01-03")
+        later = planning.collection_windows(
+            dataclasses.replace(
+                cfg, start_date="2013-01-02", end_date="2013-01-03"
+            )
+        )
         self.assertEqual(len(later["lookback_dates"]), 60)
         self.assertEqual(later["unavailable_lookback_dates"], [])
 
@@ -208,21 +203,24 @@ class PlanningAndSelectionTest(unittest.TestCase):
             index_subscription="pro",
             rate_subscription="value",
             lookback_sessions=0,
+            start_date="2016-12-30",
+            end_date="2017-01-03",
+            symbols=(),
+            rate_symbols=("TREASURY_M3",),
         )
-        start, end = "2016-12-30", "2017-01-03"
-        requests = list(
-            planning.reference_requests(cfg, [], start, end, ["TREASURY_M3"])
-        )
+        requests = list(planning.reference_requests(cfg))
         self.assertEqual(len(requests), 4)
         rates = next(r for r in requests if r.dataset == "interest_rate_eod")
         index = next(r for r in requests if r.dataset == "index_eod")
-        self.assertEqual(rates.params["start_date"], start)
+        self.assertEqual(rates.params["start_date"], cfg.start_date)
         self.assertEqual(index.params["start_date"], "2017-01-01")
         gaps = planning.reference_access_gaps(
-            cfg, planning.collection_windows(cfg, start, end), ["TREASURY_M3"]
+            cfg, planning.collection_windows(cfg)
         )
         self.assertEqual(len(gaps), 1)
-        self.assertEqual(gaps[0]["unrequested_eod_session_dates"], [start])
+        self.assertEqual(
+            gaps[0]["unrequested_eod_session_dates"], [cfg.start_date]
+        )
 
     def test_early_close_and_supporting_windows(self):
         cfg = config.CollectorConfig()
@@ -234,7 +232,11 @@ class PlanningAndSelectionTest(unittest.TestCase):
         )
         request = planning.near_close_request(cfg, "stock", "SPY", day)
         self.assertEqual(request.params["time_of_day"], "12:55:00.000")
-        windows = planning.collection_windows(cfg, "2025-01-02", "2025-01-03")
+        windows = planning.collection_windows(
+            dataclasses.replace(
+                cfg, start_date="2025-01-02", end_date="2025-01-03"
+            )
+        )
         self.assertEqual(len(windows["lookback_dates"]), 60)
         self.assertEqual(windows["history_start"], "2024-10-07")
         self.assertEqual(windows["corporate_action_end"], "2025-07-02")
@@ -286,6 +288,7 @@ class SavedCollectionTest(unittest.TestCase):
             config.CollectorConfig(),
             output_dir=self.root,
             raw_chunk_rows=3,
+            symbols=(config.UNIVERSE[0],),
         )
         self.collector = workflow.Collector(self.cfg)
         self.store = self.collector.store
@@ -356,12 +359,12 @@ class SavedCollectionTest(unittest.TestCase):
             )
         )
         self.assertTrue(restarted.resumable("SPY", DAY))
-        counts = self.collector.write_availability(
-            [config.UNIVERSE[0]], pd.DatetimeIndex([DAY])
+        counts = self.collector.coverage.write_availability(
+            pd.DatetimeIndex([DAY])
         )
         self.assertEqual(counts["complete"], 1)
         availability = pd.read_csv(
-            self.collector.directory / "availability.csv"
+            self.store.collection_dir / "availability.csv"
         )
         self.assertEqual(availability.loc[0, "excluded_quote_rows"], 40)
         self.assertFalse(list(self.root.rglob("raw_response.csv")))
@@ -439,14 +442,93 @@ class SavedCollectionTest(unittest.TestCase):
             len(result["missing_observations"][0]["missing_sample_times"]), 7
         )
 
+    def test_report_dates_are_checked_across_batches(self):
+        request = planning.Request(
+            "interest_rate_eod",
+            "/interest_rate/history/eod",
+            {
+                "symbol": "SOFR",
+                "start_date": "2025-01-02",
+                "end_date": "2025-01-03",
+                "format": "csv",
+            },
+        )
+        # An empty first batch must not conceal a later out-of-range report.
+        rows = pd.DataFrame(
+            {"created": ["", "", "", "2025-01-10"], "rate": ["4.25"] * 4}
+        )
+        record = self.save_bytes(request, rows.to_csv(index=False).encode())
+        self.assertEqual(record["status"], "invalid_response")
+        quality = storage.read_json(self.root / record["metadata"]["path"])[
+            "quality"
+        ]
+        self.assertEqual(quality["report_dates"]["unparseable_or_missing"], 3)
+        self.assertEqual(quality["report_dates"]["first"], "2025-01-10")
+        self.assertEqual(
+            quality["response_identity_issues"],
+            ["invalid_report_dates", "timestamps_outside_requested_dates"],
+        )
+
 
 class CliAndProvenanceTest(unittest.TestCase):
+    def test_failed_run_records_outcome_and_releases_output_lock(self):
+        for error, expected in (
+            (transport.CollectionStopped("Test stop"), "partial_failure"),
+            (KeyboardInterrupt(), "interrupted"),
+        ):
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory(
+                    prefix="tfbsm-stop-test-"
+                ) as directory,
+            ):
+                with (
+                    mock.patch.object(
+                        transport.ThetaClient, "ensure_available"
+                    ),
+                    mock.patch.object(
+                        transport.ThetaClient,
+                        "download",
+                        autospec=True,
+                        side_effect=_download_fixture,
+                    ),
+                    mock.patch.object(
+                        workflow.Collector, "_collect_panels", side_effect=error
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    result = cli.main(
+                        [
+                            "--symbols",
+                            "SPY",
+                            "--start",
+                            "2025-01-02",
+                            "--end",
+                            "2025-01-02",
+                            "--lookback-sessions",
+                            "0",
+                            "--output-dir",
+                            directory,
+                        ]
+                    )
+                root = pathlib.Path(directory)
+                run = storage.read_json(
+                    next(root.glob("collection/*/runs/*.json"))
+                )
+                self.assertEqual(result, 1)
+                self.assertEqual(run["status"], expected)
+                self.assertIn("finished_at_utc", run)
+                self.assertEqual(run["coverage"]["not_attempted"], 1)
+                with storage.output_lock(root):
+                    pass
+
     def test_cli_accepts_pro_history_and_later_completed_dates(self):
-        _, cfg, _, anchors = cli.parse_run_scope(["--symbols", "SPY"])
+        cfg, preview = cli.parse_run_scope(["--symbols", "SPY"])
         self.assertEqual(cfg.start_date, "2012-06-01")
         self.assertEqual(cfg.end_date, "2025-12-31")
-        self.assertEqual(str(anchors[0].date()), cfg.start_date)
-        self.assertEqual(str(anchors[-1].date()), cfg.end_date)
+        self.assertEqual(cfg.symbols, (config.UNIVERSE[0],))
+        self.assertFalse(preview)
         # The fixed default end must not become an artificial access ceiling.
         yesterday = str(
             (pd.Timestamp.now("America/New_York") - pd.Timedelta(days=1)).date()

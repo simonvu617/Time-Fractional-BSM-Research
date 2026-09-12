@@ -16,35 +16,24 @@ and response metadata. Pricing and calibration are separate research work.
 """
 
 import argparse
-import concurrent.futures
 import dataclasses
 import pathlib
-import platform
-import re
 import sys
-import uuid
 
-import pandas as pd
-
-from tfbsm_collector import (
-    config,
-    planning,
-    provenance,
-    storage,
-    transport,
-    workflow,
-)
+from tfbsm_collector import config, planning, workflow
 
 
-def parse_run_scope(argv: list[str] | None = None):
+def parse_run_scope(
+    argv: list[str] | None = None,
+) -> tuple[config.CollectorConfig, bool]:
     """Parse and validate command-line scope without downloading or writing.
 
     Args:
         argv: Arguments after the program name, or None to use sys.argv.
 
     Returns:
-        A tuple (args, cfg, symbols, anchors): parsed options, configuration,
-        underlying labels, and timezone-naive exchange session dates.
+        The validated configuration and whether this is a preview. The same
+        configuration owns CLI choices and runtime scope.
 
     Raises:
         SystemExit: Help was requested or an argument is invalid.
@@ -132,16 +121,21 @@ def parse_run_scope(argv: list[str] | None = None):
         choices=config.RATE_SYMBOLS,
         help="Theta rate series to collect; defaults to SOFR and all documented Treasury tenors",
     )
+    parser.set_defaults(mode=defaults.mode)
     modes = parser.add_mutually_exclusive_group()
 
     modes.add_argument(
         "--references-only",
-        action="store_true",
+        action="store_const",
+        dest="mode",
+        const="references",
         help="Collect dividends, splits, rates, and VIX without stock/option panels",
     )
     modes.add_argument(
         "--coverage-only",
-        action="store_true",
+        action="store_const",
+        dest="mode",
+        const="coverage",
         help="Refresh stock/VIX available-date lists and report missing sessions",
     )
     parser.add_argument(
@@ -151,25 +145,15 @@ def parse_run_scope(argv: list[str] | None = None):
     )
     args = parser.parse_args(argv)
     try:
-        if not all(
-            re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
-            for value in (args.start, args.end)
-        ):
-            raise ValueError("Dates must use YYYY-MM-DD")
-        start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
-        if not pd.Timestamp(config.PRO_HISTORY_START) <= start <= end:
-            raise ValueError(
-                f"Dates must be ordered and start on or after {config.PRO_HISTORY_START}"
-            )
-        # EOD reports for an unfinished date cannot be complete. The default
-        # study end is fixed, but later completed dates need no source edit.
-        today = (
-            pd.Timestamp.now(defaults.exchange_tz).normalize().tz_localize(None)
-        )
-        if end >= today:
-            raise ValueError("The end date must be before today in New York")
         cfg = dataclasses.replace(
             defaults,
+            mode=args.mode,
+            symbols=tuple(
+                symbol
+                for symbol in config.UNIVERSE
+                if args.symbols is None or symbol.symbol in args.symbols
+            ),
+            rate_symbols=tuple(sorted(set(args.rate_symbols))),
             start_date=args.start,
             end_date=args.end,
             index_subscription=args.index_subscription,
@@ -183,42 +167,22 @@ def parse_run_scope(argv: list[str] | None = None):
             max_inflight_requests=args.max_inflight_requests,
             max_requests_per_second=args.max_requests_per_second,
         )
-        planning.collection_windows(cfg, args.start, args.end)
+        planning.collection_windows(cfg)
     except ValueError as exc:
         parser.error(str(exc))
-    # Anchors are session labels, not midnight market observations. Holidays and
-    # weekends are excluded; intraday requests use timezone-aware boundaries.
-    anchors = (
-        planning.exchange_calendar()
-        .sessions_in_range(start, end)
-        .tz_localize(None)
+    return cfg, args.plan
+
+
+def _print_scope(cfg: config.CollectorConfig) -> None:
+    """Describe requested work and known access gaps before a run or preview."""
+    anchors = planning.exchange_calendar().sessions_in_range(
+        cfg.start_date, cfg.end_date
     )
-
-    symbols = [
-        cfg
-        for cfg in config.UNIVERSE
-        if args.symbols is None or cfg.symbol in args.symbols
-    ]
-    return args, cfg, symbols, anchors
-
-
-def main(argv: list[str] | None = None) -> int:
-    """Run the requested preview, coverage check, or collection workflow.
-
-    Args:
-        argv: Arguments after the program name, or None to use sys.argv.
-
-    Returns:
-        Exit code 0 for a preview or completed work without reported gaps, 1 for
-        failure/interruption, or 2 for completed work with observed coverage
-        gaps. None of these codes validates a pricing model.
-    """
-    args, cfg, symbols, anchors = parse_run_scope(argv)
-    windows = planning.collection_windows(cfg, args.start, args.end)
-    panels = not (args.references_only or args.coverage_only)
-    total = len(symbols) * len(anchors) if panels else 0
+    windows = planning.collection_windows(cfg)
+    panels = cfg.mode == "panels"
+    total = len(cfg.symbols) * len(anchors) if panels else 0
     print(
-        f"Scope: {', '.join(s.symbol for s in symbols)}; {args.start} to {args.end}; {total} symbol-days"
+        f"Scope: {', '.join(s.symbol for s in cfg.symbols)}; {cfg.start_date} to {cfg.end_date}; {total} symbol-days"
     )
     print(
         f"Vendor: ThetaData; quotes: {cfg.quote_interval} plus near-close; daily volume/count from EOD; stock venue: {cfg.stock_venue}"
@@ -242,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Separate reference subscriptions: indices={cfg.index_subscription}; "
         f"rates={cfg.rate_subscription} (from {cfg.rate_history_start})"
     )
-    if args.coverage_only:
+    if cfg.mode == "coverage":
         print(
             "Coverage mode: available dates for stock quotes/trades and VIX; no history downloads"
         )
@@ -252,14 +216,12 @@ def main(argv: list[str] | None = None) -> int:
             )
     else:
         print(
-            f"Required references: dividends/splits, {len(set(args.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices"
+            f"Required references: dividends/splits, {len(set(cfg.rate_symbols))} rate series, VIX EOD and {cfg.quote_interval} prices"
         )
         print(
             f"Requested reference history starts {windows['requested_history_start']}; corporate actions through {windows['corporate_action_end']}"
         )
-        for gap in planning.reference_access_gaps(
-            cfg, windows, args.rate_symbols, include_stock_lookback=panels
-        ):
+        for gap in planning.reference_access_gaps(cfg, windows):
             count = len(
                 gap.get(
                     "unrequested_eod_session_dates",
@@ -272,216 +234,26 @@ def main(argv: list[str] | None = None) -> int:
         if panels:
             print(
                 f"Stock lookback: {len(windows['lookback_dates'])} of {cfg.lookback_sessions} prior sessions accessible; "
-                f"{3 * len(symbols) * len(windows['lookback_dates'])} additional hourly/near-close/EOD requests"
+                f"{3 * len(cfg.symbols) * len(windows['lookback_dates'])} additional hourly/near-close/EOD requests"
             )
-    # Preview stops before constructing storage, contacting Theta, or creating
-    # output.
-    if args.plan:
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse options, preview the scope, and hand collection to the workflow.
+
+    Args:
+        argv: Arguments after the program name, or None to use sys.argv.
+
+    Returns:
+        Exit code 0 for a preview or completed work without reported gaps,
+        1 for failure/interruption, or 2 for completed work with coverage gaps.
+    """
+    cfg, preview = parse_run_scope(argv)
+    _print_scope(cfg)
+    if preview:
         return 0
-    collector = workflow.Collector(cfg)
-    # A run ID identifies this invocation. Policy and request IDs identify
-    # reusable selection rules and data pulls across multiple invocations.
-    run_id = (
-        pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%S")
-        + "-"
-        + uuid.uuid4().hex[:8]
-    )
-
-    run_path = collector.directory / "runs" / f"{run_id}.json"
-    run = {
-        "run_id": run_id,
-        "started_at_utc": provenance.utc_now(),
-        "status": "running",
-        "data_vendor": "ThetaData",
-        "policy_id": cfg.policy_id,
-        "policy": cfg.policy(),
-        "config": {
-            **dataclasses.asdict(cfg),
-            "output_dir": str(cfg.output_dir),
-        },
-        "scope": {
-            "symbols": [s.symbol for s in symbols],
-            "start": args.start,
-            "end": args.end,
-            "collection_windows": windows,
-            "references_only": args.references_only,
-            "coverage_only": args.coverage_only,
-            "rate_symbols": args.rate_symbols,
-        },
-        "code_sha256": collector.store.code_sha256,
-        "code_files": collector.store.code_files,
-        "python": sys.version,
-        "platform": platform.platform(),
-        "packages": provenance.package_versions(),
-        "resumed_days": 0,
-        "processed_days": 0,
-    }
-    failed = reference_failures = reference_gaps = catalogue_errors = (
-        catalogue_gaps
-    ) = 0
-    exit_code = 0
     try:
-        collector.store.client.ensure_available()
-
-        # Hold the process lock through references, panels, and final reports.
-        with storage.output_lock(cfg.output_dir):
-            storage.write_json(run_path, run)
-            try:
-                if not args.references_only:
-                    run["date_catalogue"] = f"coverage/{run_id}.json"
-                    # Report catalogue gaps without silently shortening the
-                    # requested date range.
-                    catalogue_dates = (
-                        planning.exchange_calendar()
-                        .sessions_in_range(windows["history_start"], args.end)
-                        .tz_localize(None)
-                    )
-                    catalogue = collector.collect_coverage(
-                        symbols, catalogue_dates, run_id
-                    )
-                    catalogue_errors, catalogue_gaps = (
-                        catalogue["request_errors"],
-                        catalogue["series_with_gaps"],
-                    )
-                    collector.store.client.check_running()
-                if not args.coverage_only:
-                    run["reference_ledger"] = f"references/{run_id}.json"
-                    references = collector.collect_references(
-                        symbols,
-                        args.start,
-                        args.end,
-                        args.rate_symbols,
-                        run_id,
-                        include_stock_lookback=panels,
-                    )
-                    reference_failures = sum(
-                        r["status"] not in storage.GOOD_REQUEST_STATUSES
-                        or r["coverage"]["status"] == "unknown"
-                        for r in references["requests"]
-                    )
-
-                    reference_gaps = references[
-                        "requests_with_observed_gaps"
-                    ] + len(references["subscription_coverage_gaps"])
-                    collector.store.client.check_running()
-                if panels:
-                    # Advance by trading day and overlap its underlyings. Each
-                    # day can reuse completed request receipts even when its
-                    # previous manifest was incomplete.
-                    for day in anchors:
-                        pending = []
-                        for symbol in symbols:
-                            if collector.resumable(symbol.symbol, day):
-                                run["resumed_days"] += 1
-                            else:
-                                pending.append(symbol)
-                        with collector.workers(
-                            cfg.max_symbol_day_workers
-                        ) as pool:
-                            futures = {
-                                pool.submit(
-                                    collector.collect_day, symbol, day
-                                ): symbol
-                                for symbol in pending
-                            }
-                            for future in concurrent.futures.as_completed(
-                                futures
-                            ):
-                                symbol = futures[future]
-                                run["processed_days"] += 1
-                                try:
-                                    manifest = future.result()
-                                    failed += (
-                                        manifest["status"] == "request_error"
-                                    )
-                                    print(
-                                        f"{symbol.symbol} {day.date()}: {manifest['status']}; "
-                                        f"coverage: {manifest['coverage']['status']}; "
-                                        f"{manifest['selected_contract_count']} contracts, "
-                                        f"{manifest['request_error_count']} failed requests"
-                                    )
-                                except transport.CollectionStopped:
-                                    raise
-                                except Exception as exc:
-                                    failed += 1
-                                    print(
-                                        f"FAILED {symbol.symbol} {day.date()}: {exc!r}"
-                                    )
-            except BaseException as exc:
-                collector.store.client.stop(
-                    str(exc) or "Collection interrupted by the user."
-                )
-                run.update(
-                    status="interrupted"
-                    if isinstance(exc, KeyboardInterrupt)
-                    else "partial_failure",
-                    error=repr(exc),
-                )
-                raise
-            finally:
-                try:
-                    run["coverage"] = (
-                        collector.write_availability(symbols, anchors)
-                        if panels
-                        else {}
-                    )
-                except Exception as exc:
-                    run["coverage_error"] = repr(exc)
-                    exit_code = 1
-                coverage = run.get("coverage", {})
-
-                if run["status"] == "running":
-                    # A failure takes priority over a known coverage gap.
-                    # Success here says nothing about pricing, calibration, or
-                    # research model performance.
-                    if (
-                        exit_code
-                        or failed
-                        or reference_failures
-                        or catalogue_errors
-                        or coverage.get("request_error", 0)
-                        or coverage.get("not_attempted", 0)
-                        or coverage.get("days_with_unknown_coverage", 0)
-                    ):
-                        exit_code = 1
-                    elif (
-                        reference_gaps
-                        or catalogue_gaps
-                        or coverage.get("unavailable", 0)
-                        or coverage.get("days_with_observed_gaps", 0)
-                    ):
-                        exit_code = 2
-                    run["status"] = {
-                        0: "complete",
-                        1: "partial_failure",
-                        2: "coverage_gaps",
-                    }[exit_code]
-                run.update(
-                    finished_at_utc=provenance.utc_now(),
-                    failed_days=max(
-                        int(failed), coverage.get("request_error", 0)
-                    ),
-                    reference_failures=reference_failures,
-                    reference_gaps=reference_gaps,
-                    catalogue_errors=catalogue_errors,
-                    catalogue_series_with_gaps=catalogue_gaps,
-                )
-                storage.write_json(run_path, run)
+        return workflow.Collector(cfg).run()
     except (RuntimeError, OSError, KeyboardInterrupt) as exc:
         print(f"Collector stopped: {exc}", file=sys.stderr)
-        if run_path.exists():
-            print(f"Run record: {run_path}", file=sys.stderr)
         return 1
-    print(
-        f"Finished: {run['processed_days']} processed, {run['resumed_days']} resumed, "
-        f"{failed} failed days, {reference_failures} failed reference requests, "
-        f"{reference_gaps + catalogue_gaps} reference/catalogue gaps"
-    )
-    print(f"Run record: {run_path}")
-    if run.get("date_catalogue"):
-        print(f"Date coverage: {cfg.output_dir / run['date_catalogue']}")
-    if run.get("reference_ledger"):
-        print(f"Theta references: {cfg.output_dir / run['reference_ledger']}")
-    if panels:
-        print(f"Panel coverage: {collector.directory / 'availability.csv'}")
-    return exit_code

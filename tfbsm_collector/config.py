@@ -120,6 +120,9 @@ class CollectorConfig:
         start_date: Default inclusive study start; Pro history begins June 2012.
         end_date: Default inclusive study end. Use --end for later completed
             dates without changing this default.
+        symbols: Underlyings selected from the fixed research universe.
+        rate_symbols: Theta rate series shared across the underlyings.
+        mode: Collect panels, references only, or date coverage only.
         index_subscription: Separately purchased index tier, or none.
         rate_subscription: Separately purchased rate tier; free starts in 2024.
         lookback_sessions: Earlier stock/rate exchange sessions to collect.
@@ -153,6 +156,9 @@ class CollectorConfig:
     base_url: str = "http://127.0.0.1:25503/v3"
     start_date: str = PRO_HISTORY_START
     end_date: str = "2025-12-31"
+    symbols: tuple[SymbolConfig, ...] = tuple(UNIVERSE)
+    rate_symbols: tuple[str, ...] = RATE_SYMBOLS
+    mode: str = "panels"
     index_subscription: str = "none"
     rate_subscription: str = "free"
 
@@ -209,12 +215,28 @@ class CollectorConfig:
         """Reject inconsistent settings before a run creates files.
 
         Raises:
-            ValueError: A sampling, interval, or resource limit is unsupported.
+            ValueError: A date, subscription, sampling, or resource setting is
+                unsupported.
         """
         if not self.option_rights or set(self.option_rights) - {"call", "put"}:
             raise ValueError("option_rights must contain call and/or put")
-        if pd.Timestamp(self.start_date) > pd.Timestamp(self.end_date):
-            raise ValueError("start_date must not follow end_date")
+        if not all(
+            re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+            for value in (self.start_date, self.end_date)
+        ):
+            raise ValueError("Dates must use YYYY-MM-DD")
+        start, end = pd.Timestamp(self.start_date), pd.Timestamp(self.end_date)
+        if not pd.Timestamp(PRO_HISTORY_START) <= start <= end:
+            raise ValueError(
+                f"Dates must be ordered and start on or after {PRO_HISTORY_START}"
+            )
+        # A completed historical date can have an EOD report. Keep this check
+        # here so CLI and direct Python runs follow the same rule.
+        today = pd.Timestamp.now(self.exchange_tz).normalize().tz_localize(None)
+        if end >= today:
+            raise ValueError("The end date must be before today in New York")
+        if self.mode not in {"panels", "references", "coverage"}:
+            raise ValueError("Unsupported collection mode")
         if self.index_subscription not in INDEX_HISTORY_STARTS:
             raise ValueError("Unsupported index subscription")
         if self.rate_subscription not in RATE_HISTORY_STARTS:

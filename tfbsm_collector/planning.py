@@ -495,15 +495,11 @@ def option_quote_requests(
     return requests_to_make
 
 
-def collection_windows(
-    cfg: config.CollectorConfig, start: str, end: str
-) -> dict:
+def collection_windows(cfg: config.CollectorConfig) -> dict:
     """Return the study dates and supporting history/event windows.
 
     Args:
-        cfg: Earlier session count and maximum option maturity.
-        start: Inclusive study start in YYYY-MM-DD form.
-        end: Inclusive study end in YYYY-MM-DD form.
+        cfg: Study dates, earlier session count, and maximum option maturity.
 
     Returns:
         Study and event boundaries, requested_history_start before access
@@ -514,6 +510,7 @@ def collection_windows(
     Raises:
         ValueError: The lookback exceeds available calendar history.
     """
+    start, end = cfg.start_date, cfg.end_date
     sessions = exchange_calendar().sessions.tz_localize(None)
     before = sessions[sessions < pd.Timestamp(start)]
     if cfg.lookback_sessions > len(before):
@@ -551,18 +548,12 @@ def collection_windows(
 def reference_access_gaps(
     cfg: config.CollectorConfig,
     windows: dict,
-    rate_symbols: list[str],
-    *,
-    include_stock_lookback: bool = False,
 ) -> list[dict]:
     """Describe reference sessions excluded by the configured subscriptions.
 
     Args:
-        cfg: Separate index/rate entitlements and sampling interval.
+        cfg: Requested rates, separate entitlements, and sampling interval.
         windows: Study and buffer boundaries from collection_windows.
-        rate_symbols: Requested rate identifiers; duplicates are removed.
-        include_stock_lookback: Whether inaccessible stock buffer dates matter
-            for this run.
 
     Returns:
         Known access gaps, including dates never requested. These are distinct
@@ -599,18 +590,18 @@ def reference_access_gaps(
             }
         )
     rate_excluded = [date for date in dates if date < cfg.rate_history_start]
-    if rate_symbols and rate_excluded:
+    if cfg.rate_symbols and rate_excluded:
         gaps.append(
             {
                 "dataset": "interest_rate_eod",
-                "symbols": sorted(set(rate_symbols)),
+                "symbols": sorted(set(cfg.rate_symbols)),
                 "reason": "before_rate_subscription_history_start",
                 "subscription": cfg.rate_subscription,
                 "access_start": cfg.rate_history_start,
                 "unrequested_eod_session_dates": rate_excluded,
             }
         )
-    if include_stock_lookback and windows["unavailable_lookback_dates"]:
+    if cfg.mode == "panels" and windows["unavailable_lookback_dates"]:
         gaps.append(
             {
                 "dataset": "stock_lookback",
@@ -624,37 +615,24 @@ def reference_access_gaps(
     return gaps
 
 
-def reference_requests(
-    cfg: config.CollectorConfig,
-    symbols: list[config.SymbolConfig],
-    start: str,
-    end: str,
-    rate_symbols: list[str],
-    *,
-    include_stock_lookback: bool = False,
-):
+def reference_requests(cfg: config.CollectorConfig):
     """Yield the shared Theta reference bundle and optional stock lookback.
 
     Args:
-        cfg: Collection settings and separate subscription history limits.
-        symbols: Underlyings needing corporate actions and stock history.
-        start: Inclusive study start in YYYY-MM-DD form.
-        end: Inclusive study end in YYYY-MM-DD form.
-        rate_symbols: Theta rate series identifiers; duplicates are removed.
-        include_stock_lookback: Whether to request earlier stock snapshots and
-            EOD reports in addition to rates/actions/VIX.
+        cfg: Requested symbols/dates, sampling, and subscription history limits.
 
     Yields:
         Request descriptors. Rates and VIX are shared across underlyings.
         Inaccessible dates are omitted and described by reference_access_gaps.
     """
-    windows = collection_windows(cfg, start, end)
+    start, end = cfg.start_date, cfg.end_date
+    windows = collection_windows(cfg)
     window = {
         "start_date": windows["history_start"],
         "end_date": end,
         "format": "csv",
     }
-    for symbol in symbols:
+    for symbol in cfg.symbols:
         for kind in ("dividend", "split"):
             # An option selected in December may expire after a January
             # dividend. Keep that event and its announcement date without
@@ -672,7 +650,7 @@ def reference_requests(
     # 2024; a paid rate tier can cover the buffer even before stock history.
     rate_start = max(windows["requested_history_start"], cfg.rate_history_start)
     if rate_start <= end:
-        for symbol in sorted(set(rate_symbols)):
+        for symbol in sorted(set(cfg.rate_symbols)):
             yield Request(
                 "interest_rate_eod",
                 "/interest_rate/history/eod",
@@ -702,9 +680,9 @@ def reference_requests(
             ):
                 yield history_request(cfg, "index", "price", "VIX", day)
                 yield near_close_request(cfg, "index", "VIX", day)
-    if include_stock_lookback:
+    if cfg.mode == "panels":
         for date in windows["lookback_dates"]:
-            for symbol in symbols:
+            for symbol in cfg.symbols:
                 for kind in ("quote", "eod"):
                     yield history_request(
                         cfg, "stock", kind, symbol.symbol, pd.Timestamp(date)

@@ -1,19 +1,20 @@
 # Copyright 2026 Simon Vu
 # SPDX-License-Identifier: MIT
 
-"""Coordinate symbol-day collection, shared references, and coverage reports.
+"""Own run order, session collection, shared references, and cancellation.
 
-Collector connects request planning, storage, and contract selection. A session
-manifest records the selected sample and request receipts; coverage describes
-missing observations separately from download success.
+Start at Collector.run: date coverage, reference inputs, then stock/option
+sessions. Storage owns files and cache reuse; CoverageChecker owns coverage
+reports. Session manifests connect the selected sample to request receipts.
 """
 
 import concurrent.futures
 import contextlib
-import csv
 import dataclasses
 import itertools
-import pathlib
+import platform
+import sys
+import uuid
 from typing import Iterable
 
 import pandas as pd
@@ -36,7 +37,6 @@ class Collector:
         cfg: Study and resource settings.
         store: Shared transport, response validation, and cache access.
         coverage: Checks required observations in successfully saved responses.
-        directory: Collection output directory for this sampling policy.
     """
 
     def __init__(self, cfg: config.CollectorConfig):
@@ -44,7 +44,227 @@ class Collector:
         self.cfg = cfg
         self.store = storage.RequestStore(cfg)
         self.coverage = coverage.CoverageChecker(self.store)
-        self.directory = cfg.output_dir / "collection" / cfg.policy_id
+
+    def run(self) -> int:
+        """Collect the configured scope and publish a run record, even on failure.
+
+        Returns:
+            Zero when no gaps were reported, or two when collection finished
+            with coverage gaps. Download success does not validate a model.
+
+        Raises:
+            RuntimeError: The terminal is unavailable, access fails, or another
+                collector owns the output directory.
+            OSError: Run artifacts could not be written.
+        """
+        cfg = self.cfg
+        windows = planning.collection_windows(cfg)
+        # Session labels exclude weekends/holidays; requests obtain their
+        # timezone-aware market boundaries from the same exchange calendar.
+        anchors = (
+            planning.exchange_calendar()
+            .sessions_in_range(cfg.start_date, cfg.end_date)
+            .tz_localize(None)
+        )
+        run_id = (
+            pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+        path = self.store.collection_dir / "runs" / f"{run_id}.json"
+        run = {
+            "run_id": run_id,
+            "started_at_utc": provenance.utc_now(),
+            "status": "running",
+            "data_vendor": "ThetaData",
+            "policy_id": cfg.policy_id,
+            "policy": cfg.policy(),
+            "config": {
+                **dataclasses.asdict(cfg),
+                "output_dir": str(cfg.output_dir),
+            },
+            "scope": {
+                "symbols": [s.symbol for s in cfg.symbols],
+                "start": cfg.start_date,
+                "end": cfg.end_date,
+                "collection_windows": windows,
+                "references_only": cfg.mode == "references",
+                "coverage_only": cfg.mode == "coverage",
+                "rate_symbols": list(cfg.rate_symbols),
+            },
+            "code_sha256": self.store.code_sha256,
+            "code_files": self.store.code_files,
+            "python": sys.version,
+            "platform": platform.platform(),
+            "packages": provenance.package_versions(),
+            **dict.fromkeys(
+                (
+                    "resumed_days",
+                    "processed_days",
+                    "failed_days",
+                    "reference_failures",
+                    "reference_gaps",
+                    "catalogue_errors",
+                    "catalogue_series_with_gaps",
+                ),
+                0,
+            ),
+        }
+        self.store.client.ensure_available()
+        # Keep one owner for run order, cancellation, and final status. The CLI
+        # only parses options; it does not start its own collection workers.
+        with storage.output_lock(cfg.output_dir):
+            storage.write_json(path, run)
+            try:
+                if cfg.mode != "references":
+                    run["date_catalogue"] = f"coverage/{run_id}.json"
+                    catalogue_dates = (
+                        planning.exchange_calendar()
+                        .sessions_in_range(
+                            windows["history_start"], cfg.end_date
+                        )
+                        .tz_localize(None)
+                    )
+                    catalogue = self.coverage.collect_catalogue(
+                        catalogue_dates, run_id
+                    )
+                    run["catalogue_errors"] = catalogue["request_errors"]
+                    run["catalogue_series_with_gaps"] = catalogue[
+                        "series_with_gaps"
+                    ]
+                    self.store.client.check_running()
+                if cfg.mode != "coverage":
+                    run["reference_ledger"] = f"references/{run_id}.json"
+                    references = self.collect_references(run_id)
+                    run["reference_failures"] = sum(
+                        r["status"] not in storage.GOOD_REQUEST_STATUSES
+                        or r["coverage"]["status"] == "unknown"
+                        for r in references["requests"]
+                    )
+                    run["reference_gaps"] = references[
+                        "requests_with_observed_gaps"
+                    ] + len(references["subscription_coverage_gaps"])
+                    self.store.client.check_running()
+                if cfg.mode == "panels":
+                    self._collect_panels(anchors, run)
+            except BaseException as exc:
+                self.store.client.stop(
+                    str(exc) or "Collection interrupted by the user."
+                )
+                run.update(
+                    status="interrupted"
+                    if isinstance(exc, KeyboardInterrupt)
+                    else "partial_failure",
+                    error=repr(exc),
+                )
+                raise
+            finally:
+                exit_code = self._finish_run(run, anchors)
+                storage.write_json(path, run)
+                print(f"Run record: {path}")
+        print(
+            f"Finished: {run['processed_days']} processed, {run['resumed_days']} resumed, "
+            f"{run['failed_days']} failed days, {run['reference_failures']} failed reference requests, "
+            f"{run['reference_gaps'] + run['catalogue_series_with_gaps']} reference/catalogue gaps"
+        )
+        for name in ("date_catalogue", "reference_ledger"):
+            if name in run:
+                print(f"{name}: {cfg.output_dir / run[name]}")
+        if cfg.mode == "panels":
+            print(
+                f"Panel coverage: {self.store.collection_dir / 'availability.csv'}"
+            )
+        return exit_code
+
+    def _collect_panels(self, anchors: pd.DatetimeIndex, run: dict) -> None:
+        """Collect pending underlyings one session at a time and update counts."""
+        for day in anchors:
+            pending = []
+            for symbol in self.cfg.symbols:
+                if self.resumable(symbol.symbol, day):
+                    run["resumed_days"] += 1
+                else:
+                    pending.append(symbol)
+            with self.workers(self.cfg.max_symbol_day_workers) as pool:
+                futures = {
+                    pool.submit(self.collect_day, symbol, day): symbol
+                    for symbol in pending
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    symbol = futures[future]
+                    run["processed_days"] += 1
+                    try:
+                        manifest = future.result()
+                        run["failed_days"] += (
+                            manifest["status"] == "request_error"
+                        )
+                        print(
+                            f"{symbol.symbol} {day.date()}: {manifest['status']}; "
+                            f"coverage: {manifest['coverage']['status']}; "
+                            f"{manifest['selected_contract_count']} contracts, "
+                            f"{manifest['request_error_count']} failed requests"
+                        )
+                    except transport.CollectionStopped:
+                        raise
+                    except Exception as exc:
+                        run["failed_days"] += 1
+                        print(f"FAILED {symbol.symbol} {day.date()}: {exc!r}")
+
+    def _finish_run(self, run: dict, anchors: pd.DatetimeIndex) -> int:
+        """Summarize saved coverage and choose the run outcome in one place."""
+        try:
+            run["coverage"] = (
+                self.coverage.write_availability(anchors)
+                if self.cfg.mode == "panels"
+                else {}
+            )
+        except Exception as exc:
+            run["coverage_error"] = repr(exc)
+        observed = run.get("coverage", {})
+        if run["status"] == "running":
+            # Failure takes priority over missing observations. A successful
+            # download can still leave a research coverage gap.
+            failed = (
+                "coverage_error" in run
+                or any(
+                    run[name]
+                    for name in (
+                        "failed_days",
+                        "reference_failures",
+                        "catalogue_errors",
+                    )
+                )
+                or any(
+                    observed.get(name, 0)
+                    for name in (
+                        "request_error",
+                        "not_attempted",
+                        "days_with_unknown_coverage",
+                    )
+                )
+            )
+            gaps = (
+                run["reference_gaps"]
+                or run["catalogue_series_with_gaps"]
+                or any(
+                    observed.get(name, 0)
+                    for name in ("unavailable", "days_with_observed_gaps")
+                )
+            )
+            run["status"] = (
+                "partial_failure"
+                if failed
+                else "coverage_gaps"
+                if gaps
+                else "complete"
+            )
+        run.update(
+            finished_at_utc=provenance.utc_now(),
+            failed_days=max(
+                run["failed_days"], observed.get("request_error", 0)
+            ),
+        )
+        return {"complete": 0, "coverage_gaps": 2}.get(run["status"], 1)
 
     @contextlib.contextmanager
     def workers(self, count: int):
@@ -70,14 +290,6 @@ class Collector:
             raise
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
-
-    def session_path(self, symbol: str, day: pd.Timestamp) -> pathlib.Path:
-        """Return the manifest path for one underlying and exchange session."""
-        return (
-            self.directory
-            / "sessions"
-            / f"symbol={symbol}__date={day.date()}.json"
-        )
 
     def collect_batch(
         self, requests_to_make: list[planning.Request]
@@ -164,20 +376,7 @@ class Collector:
                 r["request_id"] for r in records
             } != {r.request_id for r in expected}:
                 return False
-            for record in records:
-                if record["status"] not in storage.GOOD_REQUEST_STATUSES:
-                    return False
-                if self.cfg.refresh_no_data and record["status"] == "no_data":
-                    return False
-                if self.cfg.store_raw_payloads and not record.get("payload"):
-                    return False
-                for name in ("data", "metadata", "payload"):
-                    if name != "payload" or record.get(name):
-                        if not storage.artifact_valid(
-                            record[name], self.cfg.output_dir
-                        ):
-                            return False
-            return True
+            return all(self.store.reusable(record) for record in records)
         except (KeyError, TypeError, ValueError):
             return False
 
@@ -187,7 +386,7 @@ class Collector:
         A nonresumable day can still reuse individually valid response caches.
         """
         try:
-            manifest = storage.read_json(self.session_path(symbol, day))
+            manifest = storage.read_json(self.store.session_path(symbol, day))
             return (
                 manifest.get("symbol") == symbol
                 and manifest.get("trade_day") == str(day.date())
@@ -294,12 +493,12 @@ class Collector:
             else ("unavailable" if selected.empty else "complete")
         )
         contract_path = (
-            self.directory
+            self.store.collection_dir
             / "contracts"
             / f"symbol={symbol}__date={day.date()}.parquet"
         )
         universe_path = (
-            self.directory
+            self.store.collection_dir
             / "universes"
             / f"symbol={symbol}__date={day.date()}.parquet"
         )
@@ -370,37 +569,25 @@ class Collector:
         }
 
         # Publish the session manifest after every referenced artifact exists.
-        storage.write_json(self.session_path(symbol, day), manifest)
+        storage.write_json(self.store.session_path(symbol, day), manifest)
         self.store.client.check_running()
         return manifest
 
     def collect_references(
         self,
-        symbols: list[config.SymbolConfig],
-        start: str,
-        end: str,
-        rate_symbols: list[str],
         run_id: str,
-        *,
-        include_stock_lookback: bool = False,
     ) -> dict:
         """Collect the shared reference bundle, publishing progress by batch.
 
         Args:
-            symbols: Underlyings needing corporate actions and optional
-                lookback.
-            start: Inclusive study start in YYYY-MM-DD form.
-            end: Inclusive study end in YYYY-MM-DD form.
-            rate_symbols: Theta rate series identifiers.
             run_id: Identifier naming this run's reference ledger.
-            include_stock_lookback: Whether to add earlier stock quotes and EOD.
 
         Returns:
             A ledger of request receipts, coverage, and interpretation limits.
             Inaccessible reference dates are recorded without requesting them.
         """
         records = []
-
+        include_stock_lookback = self.cfg.mode == "panels"
         lookback_datasets = (
             [
                 f"stock_quotes_{self.cfg.quote_interval}",
@@ -410,24 +597,19 @@ class Collector:
             if include_stock_lookback and self.cfg.lookback_sessions
             else []
         )
-        windows = planning.collection_windows(self.cfg, start, end)
-        access_gaps = planning.reference_access_gaps(
-            self.cfg,
-            windows,
-            rate_symbols,
-            include_stock_lookback=include_stock_lookback,
-        )
+        windows = planning.collection_windows(self.cfg)
+        access_gaps = planning.reference_access_gaps(self.cfg, windows)
         ledger = {
             "vendor": "ThetaData",
-            "start": start,
-            "end": end,
+            "start": self.cfg.start_date,
+            "end": self.cfg.end_date,
             "collection_windows": windows,
             "index_subscription": self.cfg.index_subscription,
             "rate_subscription": self.cfg.rate_subscription,
             "subscription_coverage_gaps": access_gaps,
             "stock_lookback_requested": bool(lookback_datasets),
             "option_contract_continuity_guaranteed": False,
-            "requested_rates": sorted(set(rate_symbols)),
+            "requested_rates": sorted(set(self.cfg.rate_symbols)),
             "rate_units": "percent",
             "required_datasets": [
                 "corporate_dividend",
@@ -467,16 +649,7 @@ class Collector:
             storage.write_json(path, ledger)
 
         try:
-            pending = iter(
-                planning.reference_requests(
-                    self.cfg,
-                    symbols,
-                    start,
-                    end,
-                    rate_symbols,
-                    include_stock_lookback=include_stock_lookback,
-                )
-            )
+            pending = planning.reference_requests(self.cfg)
             while not self.store.client.stop_event.is_set():
                 # Bound the scheduled reference queue instead of enqueuing the
                 # full history. Completed batches remain reusable after
@@ -488,7 +661,6 @@ class Collector:
                     records.append(
                         {
                             **record,
-                            "params": request.params,
                             "coverage": self.coverage.request_coverage(
                                 request, record
                             ),
@@ -499,297 +671,3 @@ class Collector:
         finally:
             publish()
         return ledger
-
-    def collect_coverage(
-        self,
-        symbols: list[config.SymbolConfig],
-        anchors: pd.DatetimeIndex,
-        run_id: str,
-    ) -> dict:
-        """Refresh stock/VIX date catalogues and record advertised date gaps.
-
-        Args:
-            symbols: Underlyings to check for stock quote/trade availability.
-            anchors: Exchange session dates in the requested coverage window.
-            run_id: Identifier naming the coverage report.
-
-        Returns:
-            Catalogue outcomes, missing requested dates, and unfinished
-            requests. Listed dates do not establish subscription access or
-            complete history.
-        """
-        requests_to_make = [
-            planning.Request(
-                f"stock_{kind}_dates",
-                f"/stock/list/dates/{kind}",
-                {"symbol": symbol.symbol, "format": "csv"},
-            )
-            for symbol in symbols
-            for kind in ("quote", "trade")
-        ]
-        access_gaps = []
-        if self.cfg.index_history_start is not None:
-            requests_to_make.append(
-                planning.Request(
-                    "index_price_dates",
-                    "/index/list/dates",
-                    {"symbol": "VIX", "format": "csv"},
-                )
-            )
-        else:
-            # The catalogue itself requires index access too. Record its
-            # absence even in --coverage-only mode, before reference collection.
-            access_gaps.append(
-                {
-                    "symbol": "VIX",
-                    "dataset": "index_price_dates",
-                    "reason": "index_subscription_unavailable",
-                }
-            )
-        expected = set(anchors.strftime("%Y-%m-%d"))
-        rows, records = [], []
-        try:
-            for request in requests_to_make:
-                if self.store.client.stop_event.is_set():
-                    break
-                try:
-                    # Small date catalogues can expand after vendor backfills.
-                    # Refresh them without invalidating independently cached
-                    # historical responses.
-                    record = self.store.collect(request, refresh=True)
-                    frame = self.store.read(record)
-                except transport.CollectionStopped:
-                    break
-                except Exception as exc:
-                    frame = pd.DataFrame()
-                    record = {
-                        "request_id": request.request_id,
-                        "dataset": request.dataset,
-                        "status": "request_error",
-                        "error": repr(exc),
-                    }
-                records.append({**record, "params": request.params})
-                dates = (
-                    pd.to_datetime(
-                        frame["date"].astype("string").str.strip(),
-                        format="mixed",
-                        errors="coerce",
-                    ).dropna()
-                    if "date" in frame
-                    else pd.Series(dtype="datetime64[ns]")
-                )
-                known = record["status"] in storage.GOOD_REQUEST_STATUSES
-                available = set(dates.dt.strftime("%Y-%m-%d"))
-
-                # None means the catalogue failed and coverage is unknown. An
-                # empty list means the catalogue listed all requested dates, not
-                # all observations.
-                missing = sorted(expected - available) if known else None
-                row = {
-                    "symbol": request.params["symbol"],
-                    "dataset": request.dataset,
-                    "status": ("listed" if not missing else "coverage_gap")
-                    if known
-                    else "request_error",
-                    "first_available": str(dates.min().date())
-                    if len(dates)
-                    else None,
-                    "last_available": str(dates.max().date())
-                    if len(dates)
-                    else None,
-                    "requested_sessions": len(expected),
-                    "listed_requested_sessions": len(expected & available)
-                    if known
-                    else None,
-                    "missing_requested_dates": missing,
-                    "error": record.get("error", ""),
-                }
-                rows.append(row)
-                print(
-                    f"Coverage {row['symbol']} {row['dataset']}: {row['status']}"
-                )
-        finally:
-            report = {
-                "vendor": "ThetaData",
-                "checked_at_utc": provenance.utc_now(),
-                "rows": rows,
-                "requests": records,
-                "index_subscription": self.cfg.index_subscription,
-                "subscription_coverage_gaps": access_gaps,
-                "unfinished_requests": [
-                    r.identity() for r in requests_to_make[len(rows) :]
-                ],
-                "request_errors": sum(
-                    row["status"] == "request_error" for row in rows
-                ),
-                "series_with_gaps": sum(
-                    row["status"] == "coverage_gap" for row in rows
-                )
-                + len(access_gaps),
-                "proves_interval_or_subscription_access": False,
-                "proves_complete_intraday_records": False,
-                "scope": "stock quote/trade and VIX date catalogues; option coverage is recorded during collection",
-                "documented_limits": {
-                    "SPY_underlying_history_before_2020": "unavailable per Theta documentation",
-                    "other_CTA_only_symbols": "pre-2020 underlying history may be unavailable",
-                    "reference_and_adjusted_contract_completeness": "not established by date catalogues",
-                },
-                "documentation": "https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html",
-            }
-            storage.write_json(
-                self.cfg.output_dir / "coverage" / f"{run_id}.json", report
-            )
-        return report
-
-    def write_availability(
-        self, symbols: list[config.SymbolConfig], anchors: pd.DatetimeIndex
-    ) -> dict:
-        """Write one coverage-summary CSV row per requested underlying/session.
-
-        Args:
-            symbols: Underlyings in the requested run scope.
-            anchors: Exchange session dates to include, even if never attempted.
-
-        Returns:
-            Counts by collection status and observed/unknown coverage. Damaged
-            manifests become explicit failure rows rather than aborting the CSV.
-        """
-        path = self.directory / "availability.csv"
-        # Rows and bytes below describe stored records, not distinct market
-        # events. Overlapping snapshots and EOD reports must not be interpreted
-        # as trade counts.
-        columns = (
-            "symbol",
-            "trade_day",
-            "status",
-            "coverage_status",
-            "reason",
-            "quoted_contract_count",
-            "traded_contract_count",
-            "oi_reported_contract_count",
-            "universe_contract_count",
-            "selected_contract_count",
-            "selection_reference_count",
-            "missing_selection_times",
-            "request_count",
-            "request_error_count",
-            "no_data_request_count",
-            "missing_option_quote_count",
-            "missing_option_eod_count",
-            "missing_stock_dataset_count",
-            "unknown_required_request_count",
-            "stored_rows",
-            "excluded_quote_rows",
-            "stored_parquet_bytes",
-            "error",
-        )
-        counts = dict.fromkeys(
-            ("complete", "unavailable", "request_error", "not_attempted"), 0
-        )
-        counts.update(days_with_observed_gaps=0, days_with_unknown_coverage=0)
-        with storage.atomic_output(path) as temp:
-            with temp.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=columns)
-                writer.writeheader()
-                for day in anchors:
-                    for symbol in symbols:
-                        row = {
-                            "symbol": symbol.symbol,
-                            "trade_day": str(day.date()),
-                            "status": "not_attempted",
-                            "coverage_status": "not_checked",
-                        }
-                        try:
-                            manifest = storage.read_json(
-                                self.session_path(symbol.symbol, day)
-                            )
-                            if (
-                                manifest["symbol"] != symbol.symbol
-                                or manifest["trade_day"] != str(day.date())
-                                or manifest["status"]
-                                not in {
-                                    "complete",
-                                    "unavailable",
-                                    "request_error",
-                                }
-                            ):
-                                raise ValueError(
-                                    "Session identity or status does not match the requested day"
-                                )
-                            row.update(
-                                {
-                                    key: manifest.get(key, "")
-                                    for key in columns
-                                    if key in manifest
-                                }
-                            )
-                            records = manifest["requests"]
-                            coverage = manifest["coverage"]
-                            if coverage["status"] not in {
-                                "observations_present",
-                                "gaps_observed",
-                                "unknown",
-                            }:
-                                raise ValueError(
-                                    "Unknown session coverage status"
-                                )
-                            row.update(
-                                coverage_status=coverage["status"],
-                                **{
-                                    name: coverage[name]
-                                    for name in (
-                                        "missing_option_quote_count",
-                                        "missing_option_eod_count",
-                                        "missing_stock_dataset_count",
-                                        "unknown_required_request_count",
-                                    )
-                                },
-                            )
-                            row.update(
-                                selection_reference_count=len(
-                                    manifest["stock_selection_references"]
-                                ),
-                                missing_selection_times="|".join(
-                                    manifest["missing_selection_times"]
-                                ),
-                                request_count=len(records),
-                                no_data_request_count=sum(
-                                    r["status"] == "no_data" for r in records
-                                ),
-                                stored_rows=sum(
-                                    r.get("row_count", 0) for r in records
-                                ),
-                                excluded_quote_rows=sum(
-                                    r.get("retention", {}).get(
-                                        "excluded_rows", 0
-                                    )
-                                    for r in records
-                                ),
-                                stored_parquet_bytes=sum(
-                                    (r.get("data") or {}).get("size", 0)
-                                    for r in records
-                                ),
-                            )
-                        except FileNotFoundError:
-                            pass
-                        except (
-                            OSError,
-                            ValueError,
-                            KeyError,
-                            TypeError,
-                            AttributeError,
-                        ) as exc:
-                            row.update(
-                                status="request_error",
-                                coverage_status="unknown",
-                                error=repr(exc),
-                            )
-                        counts[row["status"]] += 1
-                        counts["days_with_observed_gaps"] += (
-                            row["coverage_status"] == "gaps_observed"
-                        )
-                        counts["days_with_unknown_coverage"] += (
-                            row["coverage_status"] == "unknown"
-                        )
-                        writer.writerow(row)
-        return counts
