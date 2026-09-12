@@ -1,7 +1,7 @@
 # Copyright 2026 Simon Vu
 # SPDX-License-Identifier: MIT
 
-"""Run the ThetaData collector; use --help for collection options."""
+"""Run the collector with python -m tfbsm_collector."""
 
 import sys
 

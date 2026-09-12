@@ -48,7 +48,7 @@ The mathematical specification, parameter units and time normalization, volatili
 
 ## Project status
 
-`collector.py` uses ThetaData exclusively, with hourly stock and option bid/ask snapshots for the hourly-versus-daily pricing study. Normal sessions request the 09:30–15:30 hourly grid and a separate snapshot at 15:55 New York time. The daily comparison snapshot is always five minutes before the actual close, including 12:55 on a 13:00 early close. Daily stock and option EOD reports preserve volume and trade counts; their later report-time quotes are not substituted for the near-close snapshot. Individual trades are not downloaded. Sampled observations cannot reconstruct intervening quote updates or exact trade gaps.
+The collector uses ThetaData exclusively, with hourly stock and option bid/ask snapshots for the hourly-versus-daily pricing study. Normal sessions request the 09:30–15:30 hourly grid and a separate snapshot at 15:55 New York time. The daily comparison snapshot is always five minutes before the actual close, including 12:55 on a 13:00 early close. Daily stock and option EOD reports preserve volume and trade counts; their later report-time quotes are not substituted for the near-close snapshot. Individual trades are not downloaded. Sampled observations cannot reconstruct intervening quote updates or exact trade gaps.
 
 Discovery combines dated quoted/traded contract lists with one bulk OI report per underlying-day, so OI-only contracts remain eligible. Those lists, OI, and option EOD requests are capped at the study's maximum maturity, 180 days by default. The selected expiration, strike, and call/put grid is preserved. Quotes download in batches across all strikes and both rights for each selected expiration: seven shared requests plus two per selected expiration, at most 17 per underlying-day with the five-expiration cap. Only quotes for the exact selected contracts are written to Parquet; all their observations and vendor fields remain intact. Metadata records the retained keys and parsed/excluded row counts, and `availability.csv` totals excluded quote rows per underlying-day. Four simultaneous HTTP requests are shared across all workers for Standard, references run in bounded concurrent batches, and the previous artificial request-start delay is disabled by default. Actual download time and storage savings still need a representative live benchmark.
 
@@ -63,6 +63,51 @@ Stock references at 10:30, 13:30, and 15:30 New York time select the research co
 Run `python collector.py --symbols SPY AAPL --start 2018-01-01 --end 2025-12-31 --coverage-only` with Theta Terminal v3 running to check the vendor's available stock and VIX dates before downloading history. `--references-only` collects the reference bundle without stock/option panels. The [current Theta API specification](https://docs.thetadata.us/openapiv3.yaml) documents dividend and split endpoints, but [Theta's history limits](https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html) exclude SPY underlying data before 2020. Adjusted option deliverables, historical symbol mappings, and reference-data vintages remain unverified. The collector reports observed gaps without filling them from another vendor; completed requests do not establish complete research coverage.
 
 No validated BSM or TFBSM pricer, calibration routine, frequency-comparison experiment, or empirical result is included yet. Implementation is being reviewed in pull requests before inclusion on `main`.
+
+## Running and reading the collector
+
+Use Python 3.11 or newer and install the runtime dependencies:
+
+```sh
+python -m pip install -r requirements.txt
+python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
+```
+
+`collector.py` is the launcher. The same arguments work with `python -m tfbsm_collector`. `--plan` previews the scope without downloading or creating output. Downloads require Theta Terminal v3. The default output remains `data/multi_year_bsm_backtest_output` under the repository root, including when the launcher is called from another directory.
+
+The implementation is organized by responsibility. Start with settings, then follow one session through the workflow:
+
+| File | What to read it for |
+| --- | --- |
+| [`config.py`](tfbsm_collector/config.py) | Study universe, DTE and S/K targets, sampling times, subscription limits, and download settings. |
+| [`workflow.py`](tfbsm_collector/workflow.py) | `Collector.collect_day`, reference collection, session manifests, resume checks, and availability summaries. |
+| [`planning.py`](tfbsm_collector/planning.py) | Exact Theta request identities, required fields, clock meanings, and calendar-aware request construction. |
+| [`selection.py`](tfbsm_collector/selection.py) | Dated contract discovery, stock selection references, and the maturity/moneyness grid. |
+| [`transport.py`](tfbsm_collector/transport.py) | HTTP streaming, shared request limits, retry behavior, and cancellation. |
+| [`validation.py`](tfbsm_collector/validation.py) | Strict CSV parsing, UTC clock columns, response identity checks, and raw quality diagnostics. |
+| [`storage.py`](tfbsm_collector/storage.py) | Atomic writes, immutable response attempts, selected-contract retention, cache reuse, and output locking. |
+| [`coverage.py`](tfbsm_collector/coverage.py) | Missing selected contracts, absent sample times, daily report presence, and unknown coverage. |
+| [`provenance.py`](tfbsm_collector/provenance.py) | Source fingerprints, file hashes, collection times, and dependency versions. |
+| [`cli.py`](tfbsm_collector/cli.py) | Command-line options, run order, progress reporting, and exit codes. |
+
+Docstrings and comments follow the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html): docstrings describe each interface with `Args`, `Returns`/`Yields`, and `Raises` where useful; nearby comments explain financial and collection decisions. Module imports make it clear which file owns an operation. Ruff checks the Google docstring convention and keeps formatting consistent through `pyproject.toml`.
+
+The module split preserves request IDs, sampling-policy IDs, output schemas, and existing cache paths. New run records include `code_files`, a mapping from repository-relative Python source paths to SHA-256 hashes; `code_sha256` hashes that mapping. Response metadata stores the same information as `collector_code_files` and `collector_code_sha256`. This covers the launcher and the whole package. Older records retain their original single-file fingerprint and can still be read. A source-layout change alone does not require a new data schema version.
+
+Run the maintained offline checks without Theta credentials or a running terminal:
+
+```sh
+python -m unittest discover -s tests -p "test_collector.py"
+```
+
+For formatting and documentation checks, install Ruff with `python -m pip install ruff`, then run:
+
+```sh
+ruff check collector.py tfbsm_collector tests/test_collector.py
+ruff format --check collector.py tfbsm_collector tests/test_collector.py
+```
+
+These checks cover synthetic collection, selected-row retention, malformed responses, coverage gaps, and resume. They do not establish live vendor access or historical completeness.
 
 ## License, citation, and data
 

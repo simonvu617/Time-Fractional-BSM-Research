@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 80
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "I", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Google section 3.8.2.1 allows unittest classes/methods to rely on clear names.
+"tests/test_collector.py" = ["D101", "D102"]
