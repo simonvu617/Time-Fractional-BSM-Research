@@ -579,8 +579,16 @@ class RequestStore:
                             for key, start, end in request.retained_contract_windows
                         }
                         keys = planning.option_contract_keys(frame)
+                        # An EOD row belongs to its report date. Its last trade
+                        # can be older on a quiet contract, so using last_trade
+                        # would wrongly discard a valid daily observation.
+                        clock = (
+                            "created"
+                            if request.endpoint.endswith("/eod")
+                            else "timestamp"
+                        )
                         dates = (
-                            frame["collector_timestamp_utc"]
+                            frame[f"collector_{clock}_utc"]
                             .dt.tz_convert(self.cfg.exchange_tz)
                             .dt.strftime("%Y-%m-%d")
                         )

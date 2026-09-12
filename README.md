@@ -48,14 +48,14 @@ The mathematical specification, parameter units and time normalization, volatili
 
 ## Project status
 
-The collector uses **ThetaData only** with Stocks Pro and Options Pro. It collects hourly observations for the 21 stock/ETF underlyings in `config.py`. The default **contract-entry window is June 1, 2012 through December 31, 2025**. Each selected option is then followed through expiration, including after the entry window ends. Only completed dates are requested; a run records contracts whose expiration is still in the future. No full-history run has been completed.
+The collector currently downloads from **ThetaData** with Stocks Pro and Options Pro. It collects hourly observations for the 21 stock/ETF underlyings in `config.py`. The default **contract-entry window is January 1, 2017 through December 31, 2025**, with weekly enrollment. Each selected option is then followed through expiration, including after the entry window ends. Only completed dates are requested; a run records contracts whose expiration is still in the future. No full-history run has been completed. Separate dividend/split sources are under review below; no external reference feed is connected yet.
 
 | Collected input | Purpose and interpretation |
 | --- | --- |
 | Hourly underlying and selected-option bid/ask, sizes, conditions, exchanges | Matched pricing observations and quote-quality research. Preserve raw values, duplicates, and vendor fields. |
 | Near-close quotes, five minutes before the actual close | A daily comparison observation: normally 15:55 ET, or 12:55 on a 13:00 close. |
 | Hourly underlying and selected-option OHLC, VWAP, volume, trade count | Activity within bars under Theta's SIP aggregation rules. Missing bars stay missing; reported zero activity stays zero. |
-| Daily underlying and broad option EOD reports | Daily OHLC, volume/count, and available report fields. An EOD quote is not the near-close quote. |
+| Daily underlying and tracked-option EOD reports | Daily OHLC, volume/count, and available report fields. Retain option rows only during each selected contract's tracked dates. An EOD quote is not the near-close quote. |
 | Dated quoted/traded contract lists and daily open interest | Historical candidate membership, including quiet OI-only contracts. OI describes the previous trading session's close. |
 | Cohort and daily membership tables | First selection date/time, discovery evidence, entry DTE, current DTE, and which contracts remain tracked. |
 | SOFR and 11 Treasury tenors within the account's access | Raw reported percent rates for later maturity matching; no invented earlier SOFR observations. |
@@ -64,11 +64,13 @@ Individual trades and tick-by-tick quote histories are not downloaded. Hourly ac
 
 ### Selection and following contracts
 
-Stock midpoint references at 10:30, 13:30, and 15:30 ET choose listed strikes around target S/K ratios and calendar-day maturities. Selection times outside a half-day session are omitted. The maturity targets remain 7, 14, 30, 60, and 120 calendar days, with entry DTE between 7 and 180. The S/K grid is denser near one: 0.95, 0.975, 0.99, 1, 1.01, 1.025, 1.05, alongside the wider original targets. Nearby targets can select the same listed strike.
+New contracts are selected at **10:30 ET on the first exchange session of each week within the entry window**. A Monday holiday moves selection to Tuesday; a partial first study week starts on its first included exchange session. Month boundaries and resumes do not restart a week. Missing reference data leave a gap on the scheduled day, rather than selecting later after seeing more prices. Daily manifests record `enrollment_scheduled` and the number of genuinely new contract identities.
+
+The stock midpoint chooses listed strikes around target S/K ratios and calendar-day maturities. The maturity targets remain 7, 14, 30, 60, and 120 calendar days, with entry DTE between 7 and 180. The S/K grid is denser near one: 0.95, 0.975, 0.99, 1, 1.01, 1.025, 1.05, plus 0.90 and 1.10 for farther-out comparisons. The former 0.80, 0.85, and 1.20 targets are removed. Nearby targets can select the same listed strike. Quotes, activity, membership evidence, and OI remain daily even between enrollment days; this is weekly selection, not weekly observation.
 
 Entry limits apply **once, when a contract joins the cohort**. A contract stays tracked when it moves away from the target moneyness, falls below seven days to expiration, or disappears from a later discovery list. An absent observation produces a coverage gap, not removal from the sample. No option-volume, spread, or OI threshold censors quiet contracts.
 
-The first selection day's full requested observations are retained for retrospective research. `first_selected_date` and `first_selected_time` expose the selection timing; an afternoon-selected contract was not necessarily known to be in the sample that morning. Dated lists do not establish exact intraday listing times. The fixed modern ticker universe also does not reconstruct historical market membership.
+The first selection day's full requested observations are retained for retrospective research. `first_selected_date` and `first_selected_time` expose the selection timing; default enrollment at 10:30 was not known at 09:30. Dated lists do not establish exact intraday listing times. The fixed modern ticker universe also does not reconstruct historical market membership. Its sector overlap can support ETF-versus-stock comparisons, but low/medium/high activity groups still need to be established from data rather than ticker labels.
 
 ### Access and inputs still missing
 
@@ -88,7 +90,7 @@ SPX/SPXW form an opt-in benchmark using the **SPX index level**, with the option
 
 ### Batching, storage, and resume
 
-Each option root advances chronologically in monthly checkpoints. Four roots run concurrently without waiting at a global end-of-day barrier; all requests share the **eight-slot Pro limit**. Quotes, prices, activity, EOD, and near-close requests use date ranges where supported. Batches split at month boundaries, early closes, and excluded dates. Quote/trade discovery lists and OI remain dated. Selected-option requests specify one expiration with all strikes/both rights, then retain only each enrolled contract's date window. Request identities include those windows. See [monthly quote limits](https://docs.thetadata.us/operations/option_history_quote.html) and [account-wide concurrency](https://docs.thetadata.us/Articles/Data-And-Requests/Concurrent-Requests.html).
+Each option root advances chronologically in monthly checkpoints. Four roots run concurrently without waiting at a global end-of-day barrier; all requests share the **eight-slot Pro limit**. Quotes, prices, activity, EOD, and near-close requests use date ranges where supported. Intraday batches split at month boundaries, early closes, and excluded dates. Quote/trade discovery lists and OI remain dated. Selected-option intraday requests specify one expiration with all strikes/both rights, then retain only each enrolled contract's date window. EOD keeps the bulk monthly request across expirations and applies the same retention rule after selection. This saves stored rows without multiplying EOD requests; it does not reduce the bulk EOD response's download size. Request identities include retained date windows. See [monthly quote limits](https://docs.thetadata.us/operations/option_history_quote.html) and [account-wide concurrency](https://docs.thetadata.us/Articles/Data-And-Requests/Concurrent-Requests.html).
 
 Before a cohort can exist, dates explicitly absent from the underlying quote catalogue do not trigger broad option-chain downloads. They remain reported gaps. Later underlying-data gaps do not stop requests for an already enrolled cohort. A failed or unavailable catalogue never supplies evidence for skipping.
 
@@ -111,13 +113,29 @@ references/                        # downloaded references and explicit missing-
 
 Response metadata is readable through `RequestStore.metadata(receipt)`. Its `data.path` and `data.row_groups` locate the response inside a shared Parquet file; `RequestStore.read(receipt)` resolves this automatically. The SQLite `responses.meta` column is plain JSON, and `sessions.manifest` contains each day's coverage and selection references. The `code` table maps a code digest to the full package source hashes.
 
-Schema v6 changes the sample and checkpoint layout. Existing caches and smoke-test outputs remain untouched and readable; identical compatible raw requests can be reused. Old daily manifests cannot satisfy cohort collection. Both entry-window dates are part of the policy identity because they determine which contracts can enter; changing worker counts does not change that identity. A failed discovery month must be retried before advancing that root's cohort. Resume checks completed requests and artifacts even when coverage gaps were recorded.
+Schema v7 records weekly enrollment and tracked-only EOD retention. Existing caches and smoke-test outputs remain untouched and readable; identical compatible raw requests can be reused. Earlier daily-enrollment manifests cannot satisfy the weekly sample. Entry-window dates and enrollment/retention rules are part of the policy identity; changing worker counts does not change that identity. A failed discovery month must be retried before advancing that root's cohort. Resume checks completed requests and artifacts even when coverage gaps were recorded.
 
 A 60-session underlying lookback remains separate from contract enrollment. Reference rates extend over the possible follow-up tail, subject to access; missing corporate events are reported through the study end plus maximum entry DTE. Neither that buffer nor requested follow-through guarantees continuous observations or chooses a calibration window. Runs with known missing inputs return `2`; request/processing failures return `1`.
 
 No validated pricer, calibration routine, or empirical result is included. These changes remain under review before inclusion on `main`.
 
-The September 12 live check of this layout used a fresh collector cache for SPY/AAPL on June 2–3, 2025: **61 successful requests, 70,532 saved rows, 24.07 seconds, 33 files, 1.63 MB**. Selected quotes/EOD observations were present; absent option activity bars remained explicit gaps. A recovery check reused saved responses with no downloads, and monthly resume checks passed. This bounded check excluded catalogues, references, and the expiration tail. The broader cohort sample and extra activity fields differ from the earlier smoke test, so neither timing nor storage is a full-history forecast. Data and measurement reports stay local.
+The September 12 live check of the earlier v6 daily-enrollment policy used a fresh collector cache for SPY/AAPL on June 2–3, 2025: **61 successful requests, 70,532 saved rows, 24.07 seconds, 33 files, 1.63 MB**. Selected quotes/EOD observations were present; absent option activity bars remained explicit gaps. A recovery check reused saved responses with no downloads, and monthly resume checks passed. This bounded check excluded catalogues, references, and the expiration tail. It does not measure the current weekly policy or forecast full-history runtime/storage. Offline fixtures cover the new schedule and EOD retention. Data and measurement reports stay local.
+
+### Supplemental dividend and split sources
+
+Reviewed September 12, 2026. Keeping Theta prices and adding a separately identified corporate-action source preserves a consistent pricing feed. It does not require replacing Theta or inferring events from price jumps. Candidate access is documented, not validated across our 21 tickers:
+
+| Source | Documented access | Remaining check |
+| --- | --- | --- |
+| [Alpha Vantage corporate actions](https://www.alphavantage.co/documentation/#dividends) | Historical/declared dividends and historical splits; endpoints link to free keys. [Free service](https://www.alphavantage.co/support/) permits 25 requests/day for most datasets. | Test a personal key for all selected stocks/ETFs and the full study window. Public demo calls returned only an API-key notice, so event coverage and historical amount conventions remain unverified. |
+| Massive Stocks Starter: [dividends](https://massive.com/docs/rest/stocks/corporate-actions/dividends), [splits](https://massive.com/docs/rest/stocks/corporate-actions/splits) | $29/month; endpoint tables advertise all available history, with dividend records dating to 2000 and split records to 1978. Free Basic is limited to two years. | Confirm per-ticker/ETF coverage and research-use terms with an authenticated sample. Dataset start dates do not guarantee complete records for each ticker. |
+| [OCC information memos](https://infomemo.theocc.com/infomemo/search-memo) | Authoritative contract-adjustment notices, including changes to symbols and deliverables. | Link relevant notices to actual held contracts. A stock split ratio alone does not describe every option adjustment. |
+
+A free Alpha Vantage coverage check is a reasonable first step; Massive offers a clearly documented paid historical alternative. No account, purchase, credential, or third-party downloader is added by this review. Theta gaps remain explicit until actual reference records are collected.
+
+Preserve each event's source, identifier, retrieval date, raw amount/ratio, currency, effective/ex-date, and available declaration, record, and payment dates. For example, Massive distinguishes historical `cash_amount` from today's-share-basis `split_adjusted_cash_amount`: keep both as reported rather than mixing adjusted dividends with unadjusted Theta spot prices and option strikes. A dividend eventually paid is not automatically information known at an earlier option observation. Declaration dates help, but do not establish intraday availability or a complete history of vendor revisions. Future undeclared dividends still require an explicit expectation method; realized payouts must not silently supply it.
+
+Corporate-action records support event identification and adjustment handling. They do not themselves provide an American-option exercise model, certify historical deliverables, or supply SPX dividend carry and settlement values. Those research inputs remain separate requirements.
 
 ## Running and reading the collector
 

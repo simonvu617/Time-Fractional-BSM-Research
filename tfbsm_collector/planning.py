@@ -303,6 +303,23 @@ def session_bounds(
     )
 
 
+def is_enrollment_day(day: pd.Timestamp, cfg: config.CollectorConfig) -> bool:
+    """Select once per exchange week, including a partial first study week.
+
+    Calendar closures move Monday's selection to the next exchange session.
+    Missing vendor data do not move selection: that would make entry depend on
+    later observations. Month boundaries and resume points do not reset a week.
+    """
+    if not pd.Timestamp(cfg.start_date) <= day <= pd.Timestamp(cfg.end_date):
+        return False
+    week_start = max(
+        pd.Timestamp(cfg.start_date), day - pd.Timedelta(days=day.weekday())
+    )
+    return day == exchange_calendar().date_to_session(
+        week_start, direction="next"
+    )
+
+
 def history_request(
     cfg: config.CollectorConfig,
     asset: str,
@@ -515,7 +532,7 @@ def underlying_requests(
 def discovery_requests(
     cfg: config.CollectorConfig, symbol: str, days
 ) -> list[Request]:
-    """Collect dated membership lists and monthly bulk OI/EOD reports.
+    """Collect dated membership lists and daily bulk open-interest reports.
 
     Listing requests remain dated even though their small responses are packed
     together on disk. An expiration observed later must not enter an earlier
@@ -544,25 +561,50 @@ def discovery_requests(
                         },
                     )
                 )
-    for batch in date_batches(days, cfg, intraday=False):
-        requests_to_make.append(
-            ranged(
-                history_request(cfg, "option", "eod", symbol, batch[0]), batch
-            )
-        )
     return requests_to_make
+
+
+def _cohort_windows(cohort: pd.DataFrame, days) -> tuple:
+    """Clip each contract's retained dates to a request's actual date range."""
+    first, last = str(days[0].date()), str(days[-1].date())
+    return tuple(
+        sorted(
+            (
+                row.contract_key,
+                max(row.first_selected_date, first),
+                min(row.expiration, last),
+            )
+            for row in cohort.itertuples(index=False)
+            if row.first_selected_date <= last and row.expiration >= first
+        )
+    )
 
 
 def followup_requests(
     cfg: config.CollectorConfig, symbol: str, days, cohort: pd.DataFrame
 ) -> list[Request]:
-    """Batch hourly quotes/activity and near-close quotes for active cohorts.
+    """Batch sampled quotes, activity, near-close quotes, and tracked EOD.
 
     Entry DTE and moneyness limits apply only when a contract is first chosen.
     Continue requesting it through expiration even when it becomes deep ITM/OTM,
     has no new discovery row, or falls below the entry maturity threshold.
     """
     requests_to_make = []
+    # Keep the efficient bulk EOD request, but save only enrolled identities on
+    # their tracked dates. Daily lists/OI still document the broader universe.
+    # EOD is a report, so it can span early closes without changing its clock.
+    for batch in date_batches(days, cfg, intraday=False):
+        windows = _cohort_windows(cohort, batch)
+        if windows:
+            requests_to_make.append(
+                dataclasses.replace(
+                    ranged(
+                        history_request(cfg, "option", "eod", symbol, batch[0]),
+                        batch,
+                    ),
+                    retained_contract_windows=windows,
+                )
+            )
     for expiration, family in cohort.groupby("expiration", sort=True):
         active = [
             d
@@ -572,17 +614,7 @@ def followup_requests(
             <= expiration
         ]
         for batch in date_batches(active, cfg):
-            windows = tuple(
-                sorted(
-                    (
-                        row.contract_key,
-                        max(row.first_selected_date, str(batch[0].date())),
-                        min(row.expiration, str(batch[-1].date())),
-                    )
-                    for row in family.itertuples(index=False)
-                    if row.first_selected_date <= str(batch[-1].date())
-                )
-            )
+            windows = _cohort_windows(family, batch)
             contract = {
                 "expiration": expiration,
                 "strike": "*",

@@ -202,6 +202,41 @@ def _download_fixture(client, request, payload):
 
 
 class PlanningAndSelectionTest(unittest.TestCase):
+    def test_weekly_enrollment_uses_exchange_weeks_not_month_or_data_boundaries(
+        self,
+    ):
+        cfg = config.CollectorConfig(
+            start_date="2025-01-02", end_date="2025-02-04"
+        )
+        days = planning.exchange_calendar().sessions_in_range(
+            cfg.start_date, cfg.end_date
+        )
+        selected = [
+            str(d.date()) for d in days if planning.is_enrollment_day(d, cfg)
+        ]
+        self.assertEqual(
+            selected,
+            [
+                "2025-01-02",
+                "2025-01-06",
+                "2025-01-13",
+                "2025-01-21",
+                "2025-01-27",
+                "2025-02-03",
+            ],
+        )
+        # August begins on Friday; a monthly restart must wait until Monday.
+        full = dataclasses.replace(cfg, end_date="2025-08-04")
+        self.assertFalse(
+            planning.is_enrollment_day(pd.Timestamp("2025-08-01"), full)
+        )
+        self.assertTrue(
+            planning.is_enrollment_day(pd.Timestamp("2025-08-04"), full)
+        )
+        self.assertFalse(
+            planning.is_enrollment_day(pd.Timestamp("2025-02-05"), cfg)
+        )
+
     def test_followup_keeps_contracts_below_entry_cutoff_and_after_entry_end(
         self,
     ):
@@ -292,7 +327,9 @@ class PlanningAndSelectionTest(unittest.TestCase):
 
     def test_pro_history_clips_stock_buffer_and_reports_reference_access(self):
         cfg = config.CollectorConfig(
-            symbols=(config.UNIVERSE[0],), rate_symbols=("SOFR", "TREASURY_M3")
+            start_date=config.PRO_HISTORY_START,
+            symbols=(config.UNIVERSE[0],),
+            rate_symbols=("SOFR", "TREASURY_M3"),
         )
         windows = planning.collection_windows(cfg)
         self.assertEqual(windows["history_start"], "2012-06-01")
@@ -532,6 +569,7 @@ class SavedCollectionTest(unittest.TestCase):
         self.root = pathlib.Path(temporary.name)
         self.cfg = dataclasses.replace(
             config.CollectorConfig(),
+            start_date=str(DAY.date()),
             output_dir=self.root,
             raw_chunk_rows=3,
             symbols=(config.UNIVERSE[0],),
@@ -626,6 +664,78 @@ class SavedCollectionTest(unittest.TestCase):
             ),
             1,
         )
+
+    def test_weekly_entries_keep_daily_followup_and_only_tracked_eod(self):
+        cfg = dataclasses.replace(
+            self.cfg, end_date="2025-01-06", moneyness_targets=(1.0,)
+        )
+        collector = workflow.Collector(cfg)
+        days = planning.exchange_calendar().sessions_in_range(
+            cfg.start_date, cfg.end_date
+        )
+
+        def shifted_prices(client, request, payload):
+            data = _payload(request)
+            if request.dataset == "option_eod":
+                frame = pd.read_csv(io.BytesIO(data), dtype="string")
+                # A quiet option's last trade can predate selection. Retention
+                # must use the report's created date instead.
+                frame["last_trade"] = "2024-12-31T15:59:00"
+                data = frame.to_csv(index=False).encode()
+            if request.dataset == "stock_quotes_1h":
+                frame = pd.read_csv(io.BytesIO(data), dtype="string")
+                # Friday's large move must not enroll new contracts. Monday's
+                # new strikes enter then, without acquiring earlier EOD rows.
+                for date, price in (
+                    ("2025-01-03", "200"),
+                    ("2025-01-06", "105"),
+                ):
+                    frame.loc[
+                        frame["timestamp"].str.startswith(date), ["bid", "ask"]
+                    ] = price
+                data = frame.to_csv(index=False).encode()
+            payload.write(data)
+            payload.seek(0)
+            return {"status_code": 200, "payload_bytes": len(data)}
+
+        with mock.patch.object(
+            transport.ThetaClient,
+            "download",
+            autospec=True,
+            side_effect=shifted_prices,
+        ):
+            manifest = collector.collect_month(
+                config.UNIVERSE[0],
+                days,
+                pd.DataFrame(columns=selection.COHORT_COLUMNS),
+                {},
+            )
+        self.assertEqual(manifest["request_error_count"], 0)
+        sessions = [collector.store.session("SPY", d) for d in days]
+        self.assertEqual(
+            [s["enrollment_scheduled"] for s in sessions], [True, False, True]
+        )
+        # Jan 10 is now below the entry cutoff: its old contracts stay, but
+        # new strikes can enter only the four later expirations.
+        self.assertEqual(
+            [s["newly_selected_contract_count"] for s in sessions], [10, 0, 8]
+        )
+        self.assertEqual(
+            [s["selected_contract_count"] for s in sessions], [10, 10, 18]
+        )
+        self.assertEqual(sessions[1]["missing_selection_times"], [])
+        self.assertEqual(sessions[1]["universe_contract_count"], 20)
+        eod = next(
+            r for r in manifest["requests"] if r["dataset"] == "option_eod"
+        )
+        saved = collector.store.read(eod)
+        self.assertEqual(len(saved), 38)
+        self.assertEqual(eod["retention"]["excluded_rows"], 22)
+        self.assertEqual(
+            set(saved.loc[saved["strike"].eq("105"), "created"].str[:10]),
+            {"2025-01-06"},
+        )
+        self.assertTrue(collector.store.reusable(eod))
 
     def test_excluded_misroute_fails_refresh_and_preserves_previous_cache(self):
         request = self.option_request()
@@ -781,10 +891,12 @@ class CliAndProvenanceTest(unittest.TestCase):
 
     def test_cli_accepts_pro_history_and_later_completed_dates(self):
         cfg, preview = cli.parse_run_scope(["--symbols", "SPY"])
-        self.assertEqual(cfg.start_date, "2012-06-01")
+        self.assertEqual(cfg.start_date, "2017-01-01")
         self.assertEqual(cfg.end_date, "2025-12-31")
         self.assertEqual(cfg.symbols, (config.UNIVERSE[0],))
         self.assertFalse(preview)
+        earlier, _ = cli.parse_run_scope(["--start", config.PRO_HISTORY_START])
+        self.assertEqual(earlier.start_date, config.PRO_HISTORY_START)
         # The fixed default end must not become an artificial access ceiling.
         yesterday = str(
             (pd.Timestamp.now("America/New_York") - pd.Timedelta(days=1)).date()

@@ -469,7 +469,7 @@ class Collector:
         possible_entries = [
             d
             for d in discovery_days
-            if str(d.date()) <= self.cfg.end_date
+            if planning.is_enrollment_day(d, self.cfg)
             and str(d.date()) not in excluded
         ]
         if cohort.empty:
@@ -509,6 +509,7 @@ class Collector:
 
         for day in days:
             entry_day = str(day.date()) <= self.cfg.end_date
+            enroll = planning.is_enrollment_day(day, self.cfg)
             discovery = {
                 kind: table(dataset, day)
                 for kind, dataset in (
@@ -529,14 +530,17 @@ class Collector:
                 if symbol.price_asset == "index"
                 else selection.stock_selection_references
             )
-            references = reference_builder(
-                frames(price_dataset, day), day, self.cfg
+            references = (
+                reference_builder(frames(price_dataset, day), day, self.cfg)
+                if enroll
+                else []
             )
             chosen = (
                 selection.select_contracts(universe, day, references, self.cfg)
-                if entry_day
+                if enroll
                 else pd.DataFrame(columns=selection.SELECTION_COLUMNS)
             )
+            prior_count = len(cohort)
             cohort = selection.extend_cohort(cohort, chosen, day, symbol)
             active = cohort.loc[cohort["expiration"].ge(str(day.date()))].copy()
             active["dte_days"] = (
@@ -547,7 +551,7 @@ class Collector:
             opened, closed = planning.session_bounds(day, self.cfg)
             scheduled = [
                 at
-                for at in self.cfg.selection_times
+                for at in (self.cfg.selection_times if enroll else ())
                 if opened
                 <= pd.Timestamp(f"{day.date()} {at}", tz=self.cfg.exchange_tz)
                 < closed
@@ -564,8 +568,9 @@ class Collector:
                     "underlying_symbol": symbol.underlying,
                     "trade_day": str(day.date()),
                     "entry_window": entry_day,
+                    "enrollment_scheduled": enroll,
                     "policy_id": self.cfg.policy_id,
-                    "newly_selected_contract_count": len(chosen),
+                    "newly_selected_contract_count": len(cohort) - prior_count,
                     "selected_contract_count": len(active),
                     "universe_contract_count": len(universe),
                     "quoted_contract_count": source_counts["quote"],

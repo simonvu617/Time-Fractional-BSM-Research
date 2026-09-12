@@ -17,9 +17,9 @@ import pandas as pd
 
 from tfbsm_collector import provenance
 
-# v6 introduces cohorts and monthly checkpoints. Old request caches remain
-# readable, but old daily selections cannot stand in for this different sample.
-OUTPUT_SCHEMA_VERSION = "2026-09-12-expiry-cohorts-v6"
+# v7 records weekly enrollment and retains EOD only for tracked contracts.
+# Earlier daily cohorts cannot stand in for this different research sample.
+OUTPUT_SCHEMA_VERSION = "2026-09-12-weekly-cohorts-v7"
 
 # Resolve from the repository root so splitting the package does not move
 # existing caches into a new data directory.
@@ -137,7 +137,7 @@ class CollectorConfig:
 
     Attributes:
         base_url: URL of the running Theta Terminal v3 service.
-        start_date: Default inclusive study start; Pro history begins June 2012.
+        start_date: Inclusive entry-window start; defaults to January 2017.
         end_date: Last date for selecting new contracts. Follow-up extends
             through their expirations, limited to completed historical dates.
         symbols: Underlyings selected from the fixed research universe.
@@ -175,7 +175,7 @@ class CollectorConfig:
     """
 
     base_url: str = "http://127.0.0.1:25503/v3"
-    start_date: str = PRO_HISTORY_START
+    start_date: str = "2017-01-01"
     end_date: str = "2025-12-31"
     symbols: tuple[SymbolConfig, ...] = tuple(UNIVERSE)
     rate_symbols: tuple[str, ...] = RATE_SYMBOLS
@@ -195,11 +195,10 @@ class CollectorConfig:
     # The denser central grid retains nearby strikes around S/K=1. This helps
     # comparisons within the narrow near-money bins used in An et al.; it does
     # not assert that every target has a distinct listed strike.
-    # Moneyness is S/K: at S=$100, target 0.80 seeks K=$125. Values above one
-    # are in the money for calls and out of the money for puts.
+    # Moneyness is S/K: at S=$100, target 0.90 seeks K=$111.11. The 0.90/1.10
+    # wings retain farther-out calls and puts for comparison without filling
+    # the outer chain. Values above one are out of the money for puts.
     moneyness_targets: tuple[float, ...] = (
-        0.80,
-        0.85,
         0.90,
         0.95,
         0.975,
@@ -209,7 +208,6 @@ class CollectorConfig:
         1.025,
         1.05,
         1.10,
-        1.20,
     )
     strikes_per_moneyness_target: int = 1
     min_dte: int = 7
@@ -220,9 +218,9 @@ class CollectorConfig:
     raw_chunk_rows: int = 100_000
     stock_venue: str = "utp_cta"
 
-    # These times align with hourly samples starting at 09:30. References after
-    # an early close are omitted instead of borrowing a different day's price.
-    selection_times: tuple[str, ...] = ("10:30:00", "13:30:00", "15:30:00")
+    # One clock limits overlapping enrollment as prices move intraday. 10:30
+    # aligns with the hourly grid and precedes scheduled early closes.
+    selection_times: tuple[str, ...] = ("10:30:00",)
 
     # A 12:30 sample cannot supply the 13:30 reference under this tolerance.
     # The timestamp does not reveal when the underlying quote last changed.
@@ -360,7 +358,9 @@ class CollectorConfig:
         )
         return {
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
+            "entry_schedule": "first_exchange_session_of_week_in_entry_window",
             "contract_followup": "through_expiration",
+            "option_eod_retention": "tracked_contract_date_windows",
             **{name: getattr(self, name) for name in names},
         }
 

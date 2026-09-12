@@ -198,7 +198,10 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
             "Monthly date batches: underlying prices/activity and option quotes/activity per tracked expiration; dated discovery and OI"
         )
         print(
-            f"Entry: DTE {cfg.min_dte}-{cfg.max_dte}; track selected contracts through expiration, including below the entry cutoff"
+            f"Entry: first exchange session of each week within the entry window at {', '.join(cfg.selection_times)} ET; DTE {cfg.min_dte}-{cfg.max_dte}"
+        )
+        print(
+            f"Follow selected contracts at {cfg.quote_interval} intervals through expiration; retain option EOD only for tracked contract dates"
         )
         print(
             f"Follow-up tail: through actual selected expirations, bounded by {windows['followup_end_bound']}; completed dates only"
