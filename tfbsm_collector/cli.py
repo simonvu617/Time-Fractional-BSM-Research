@@ -11,8 +11,8 @@ Preview a small run without downloading or creating output:
 
 Start reading in config.py for study settings and workflow.py for collection.
 Under --output-dir, collection/<policy-id>/availability.csv summarizes coverage;
-contracts/ and universes/ record selection, and raw_cache/ holds observations
-and response metadata. Pricing and calibration are separate research work.
+tables/ records monthly selection and cohorts. parquet/ holds observations;
+index.sqlite3 holds response metadata and session coverage. Pricing and calibration are separate research work.
 """
 
 import argparse
@@ -47,7 +47,9 @@ def parse_run_scope(
         "--symbols",
         nargs="+",
         type=str.upper,
-        choices=[cfg.symbol for cfg in config.UNIVERSE],
+        choices=[
+            cfg.symbol for cfg in (*config.UNIVERSE, *config.INDEX_BENCHMARK)
+        ],
     )
     parser.add_argument(
         "--start",
@@ -57,7 +59,7 @@ def parse_run_scope(
     parser.add_argument(
         "--end",
         default=defaults.end_date,
-        help="Inclusive last date (YYYY-MM-DD)",
+        help="Last date for selecting new contracts; existing cohorts are followed through expiration",
     )
     parser.add_argument(
         "--lookback-sessions",
@@ -150,8 +152,12 @@ def parse_run_scope(
             mode=args.mode,
             symbols=tuple(
                 symbol
-                for symbol in config.UNIVERSE
-                if args.symbols is None or symbol.symbol in args.symbols
+                for symbol in (*config.UNIVERSE, *config.INDEX_BENCHMARK)
+                if (
+                    symbol in config.UNIVERSE
+                    if args.symbols is None
+                    else symbol.symbol in args.symbols
+                )
             ),
             rate_symbols=tuple(sorted(set(args.rate_symbols))),
             start_date=args.start,
@@ -185,14 +191,20 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
         f"Scope: {', '.join(s.symbol for s in cfg.symbols)}; {cfg.start_date} to {cfg.end_date}; {total} symbol-days"
     )
     print(
-        f"Vendor: ThetaData; quotes: {cfg.quote_interval} plus near-close; daily volume/count from EOD; stock venue: {cfg.stock_venue}"
+        f"Vendor: ThetaData; quotes and activity bars: {cfg.quote_interval}, plus near-close quotes and daily EOD; stock venue: {cfg.stock_venue}"
     )
     if panels:
         print(
-            f"Bulk collection: 7 shared requests + 2 per selected expiration/day (at most {7 + 2 * cfg.max_expirations_per_day})"
+            "Monthly date batches: underlying prices/activity and option quotes/activity per tracked expiration; dated discovery and OI"
         )
         print(
-            f"Storage: selected option contracts only; broad option reports/lists capped at {cfg.max_dte} days to expiration"
+            f"Entry: DTE {cfg.min_dte}-{cfg.max_dte}; track selected contracts through expiration, including below the entry cutoff"
+        )
+        print(
+            f"Follow-up tail: through actual selected expirations, bounded by {windows['followup_end_bound']}; completed dates only"
+        )
+        print(
+            "Storage: shared Parquet files plus index.sqlite3 for request/session metadata"
         )
         print(
             f"Near-close snapshot: {cfg.near_close_minutes} minutes before the actual close; quote sample age is not event age"
@@ -222,6 +234,12 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
             f"Requested reference history starts {windows['requested_history_start']}; corporate actions through {windows['corporate_action_end']}"
         )
         for gap in planning.reference_access_gaps(cfg, windows):
+            if "missing_fields" in gap:
+                print(
+                    f"Known input gap: {gap['dataset']}; "
+                    f"{', '.join(gap['missing_fields'])}"
+                )
+                continue
             if "unrequested_start_date" in gap:
                 print(
                     f"Known access gap: {gap['dataset']}; {gap['reason']}; "
@@ -240,7 +258,7 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
         if panels:
             print(
                 f"Stock lookback: {len(windows['lookback_dates'])} of {cfg.lookback_sessions} prior sessions accessible; "
-                f"{3 * len(cfg.symbols) * len(windows['lookback_dates'])} additional hourly/near-close/EOD requests"
+                "batched underlying prices, activity, and EOD reports"
             )
 
 

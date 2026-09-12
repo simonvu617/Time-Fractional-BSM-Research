@@ -72,73 +72,121 @@ def _quote(timestamp, midpoint="100", **identity):
 
 
 def _payload(request):
-    """Build one synthetic CSV, including OI-only and unselected contracts."""
+    """Build date-aware CSV fixtures with quiet contracts and raw duplicates."""
     if "/list/dates" in request.endpoint:
-        rows = [{"date": "2025-01-02"}]
-    elif request.dataset == "interest_rate_eod":
-        rows = [{"created": "2025-01-02", "rate": "4.25"}]
-    elif request.dataset in {"quoted_contracts", "traded_contracts"}:
-        rows = [
-            contract
-            for contract in _contracts()
-            if not (contract["strike"] == "105" and contract["right"] == "put")
-        ]
-    elif request.dataset == "option_open_interest":
-        rows = [
-            {
-                **contract,
-                "timestamp": "2025-01-02T09:00:00",
-                "open_interest": "12",
-            }
-            for contract in _contracts()
-        ]
-    elif request.endpoint.endswith("/eod"):
-        identities = (
-            _contracts() if request.endpoint.startswith("/option/") else [{}]
+        return (
+            pd.DataFrame(
+                {
+                    "date": planning.exchange_calendar()
+                    .sessions_in_range("2025-01-02", "2025-05-02")
+                    .strftime("%Y-%m-%d")
+                }
+            )
+            .to_csv(index=False)
+            .encode()
         )
-        rows = [
-            {
-                **contract,
-                "created": "2025-01-02T17:15:00",
-                "last_trade": "2025-01-02T15:59:00",
-                "open": "1.2",
-                "high": "1.4",
-                "low": "1.1",
-                "close": "1.3",
-                "volume": "20",
-                "count": "3",
-            }
-            for contract in identities
+    rows = []
+    for day in planning.request_days(request):
+        date = str(day.date())
+        contracts = [
+            c
+            for c in _contracts()
+            if pd.Timestamp(c["expiration"]) >= day
+            and (
+                "max_dte" not in request.params
+                or (pd.Timestamp(c["expiration"]) - day).days
+                <= request.params["max_dte"]
+            )
         ]
-    else:
-        sampled = "/history/" in request.endpoint
-        clocks = (
-            [f"{hour:02}:30:00" for hour in range(9, 16)]
-            if sampled
-            else ["15:55:00"]
-        )
-        if request.endpoint.startswith("/option/"):
-            identities = _contracts((request.params["expiration"],))
-            # The bulk response includes a valid strike outside the selected universe.
-            identities.append({**identities[0], "strike": "999"})
-            rows = [
-                _quote(f"2025-01-02T{clock}", "1.230000", **contract)
-                for contract in identities
-                for clock in clocks
-            ]
-            if sampled:
-                rows.append(
-                    rows[0].copy()
-                )  # Raw duplicates must survive storage.
+        if request.dataset == "interest_rate_eod":
+            rows.append({"created": date, "rate": "4.25"})
+        elif request.dataset in {"quoted_contracts", "traded_contracts"}:
+            rows.extend(
+                c
+                for c in contracts
+                if not (c["strike"] == "105" and c["right"] == "put")
+            )
+        elif request.dataset == "option_open_interest":
+            rows.extend(
+                {**c, "timestamp": f"{date}T09:00:00", "open_interest": "12"}
+                for c in contracts
+            )
+        elif request.endpoint.endswith("/eod"):
+            identities = (
+                contracts if request.endpoint.startswith("/option/") else [{}]
+            )
+            rows.extend(
+                {
+                    **c,
+                    "created": f"{date}T17:15:00",
+                    "last_trade": f"{date}T15:59:00",
+                    "open": "1.2",
+                    "high": "1.4",
+                    "low": "1.1",
+                    "close": "1.3",
+                    "volume": "20",
+                    "count": "3",
+                }
+                for c in identities
+            )
         else:
-            rows = [
-                _quote(
-                    f"2025-01-02T{clock}",
-                    "100" if clock < "13:00:00" else "105",
-                )
-                for clock in clocks
-            ]
-    return pd.DataFrame(rows).to_csv(index=False).encode()
+            sampled = "/history/" in request.endpoint
+            clocks = (
+                pd.date_range(
+                    f"{date} {request.params['start_time']}",
+                    f"{date} {request.params['end_time']}",
+                    freq="1h",
+                ).strftime("%H:%M:%S")
+                if sampled
+                else [request.params["time_of_day"]]
+            )
+            identities = [{}]
+            if request.endpoint.startswith("/option/"):
+                identities = _contracts((request.params["expiration"],))
+                identities.append({**identities[0], "strike": "999"})
+            for contract in identities:
+                for clock in clocks:
+                    if request.endpoint.endswith("/ohlc"):
+                        rows.append(
+                            {
+                                **contract,
+                                "timestamp": f"{date}T{clock}",
+                                "open": "1.2",
+                                "high": "1.4",
+                                "low": "1.1",
+                                "close": "1.3",
+                                "volume": "0",
+                                "count": "0",
+                                "vwap": "0",
+                            }
+                        )
+                    elif request.endpoint.endswith("/price"):
+                        rows.append(
+                            {"timestamp": f"{date}T{clock}", "price": "100"}
+                        )
+                    else:
+                        rows.append(
+                            _quote(
+                                f"{date}T{clock}",
+                                "1.230000"
+                                if contract
+                                else "100"
+                                if clock < "13:00:00"
+                                else "105",
+                                **contract,
+                            )
+                        )
+            if (
+                sampled
+                and request.endpoint.endswith("/quote")
+                and identities != [{}]
+            ):
+                rows.append(rows[-len(identities) * len(clocks)].copy())
+    return (
+        pd.DataFrame(rows, columns=None if rows else request.required_columns)
+        .to_csv(index=False)
+        .encode()
+    )
 
 
 def _download_fixture(client, request, payload):
@@ -154,6 +202,94 @@ def _download_fixture(client, request, payload):
 
 
 class PlanningAndSelectionTest(unittest.TestCase):
+    def test_followup_keeps_contracts_below_entry_cutoff_and_after_entry_end(
+        self,
+    ):
+        cfg = config.CollectorConfig(
+            start_date="2025-01-02", end_date="2025-01-02"
+        )
+        chain = selection.normalize_chain(
+            pd.DataFrame(_contracts()), "SPY", cfg
+        )
+        chosen = selection.select_contracts(
+            chain,
+            DAY,
+            [{"stock_mid": 100.0, "selection_time": "13:30:00"}],
+            cfg,
+        )
+        cohort = selection.extend_cohort(
+            pd.DataFrame(columns=selection.COHORT_COLUMNS),
+            chosen,
+            DAY,
+            config.UNIVERSE[0],
+        )
+        later = pd.Timestamp("2025-01-08")
+        retained = selection.extend_cohort(
+            cohort, chosen, later, config.UNIVERSE[0]
+        )
+        self.assertEqual(len(retained), len(cohort))
+        self.assertEqual(set(retained["first_selected_date"]), {"2025-01-02"})
+        requests = planning.followup_requests(
+            cfg, "SPY", pd.DatetimeIndex([later]), retained
+        )
+        nearest = [
+            r for r in requests if r.params["expiration"] == "2025-01-10"
+        ]
+        self.assertEqual(len(nearest), 3)
+        self.assertTrue(all(r.retained_contract_windows for r in nearest))
+        self.assertEqual(set(cohort["contract_multiplier"]), {""})
+        self.assertNotEqual(
+            cfg.policy_id,
+            dataclasses.replace(cfg, start_date="2024-12-30").policy_id,
+        )
+
+    def test_month_batches_split_early_closes_and_unlisted_dates(self):
+        cfg = config.CollectorConfig()
+        days = (
+            planning.exchange_calendar()
+            .sessions_in_range("2024-11-25", "2024-12-02")
+            .tz_localize(None)
+        )
+        requests = planning.underlying_requests(
+            cfg, config.UNIVERSE[0], days, {("SPY", "quote"): {"2024-11-26"}}
+        )
+        near = [r for r in requests if r.dataset == "stock_quotes_near_close"]
+        half_day = next(
+            r
+            for r in near
+            if pd.Timestamp("2024-11-29") in planning.request_days(r)
+        )
+        self.assertEqual(half_day.params["time_of_day"], "12:55:00.000")
+        self.assertTrue(
+            all(
+                pd.Timestamp("2024-11-26") not in planning.request_days(r)
+                for r in near
+            )
+        )
+        self.assertTrue(
+            all(
+                len(set(planning.request_days(r).strftime("%Y-%m"))) == 1
+                for r in requests
+            )
+        )
+
+    def test_spxw_uses_spx_index_prices_and_keeps_missing_access_explicit(self):
+        symbol = config.INDEX_BENCHMARK[1]
+        cfg = config.CollectorConfig(symbols=(symbol,), lookback_sessions=0)
+        self.assertEqual(planning.underlying_requests(cfg, symbol, [DAY]), [])
+        paid = dataclasses.replace(cfg, index_subscription="pro")
+        requests = planning.underlying_requests(paid, symbol, [DAY])
+        self.assertEqual({r.params["symbol"] for r in requests}, {"SPX"})
+        self.assertTrue(all(r.endpoint.startswith("/index/") for r in requests))
+        frame = pd.DataFrame(
+            {"timestamp": ["2025-01-02T10:30:00"], "price": ["6000"]}
+        )
+        references = selection.index_selection_references([frame], DAY, paid)
+        self.assertEqual(references[0]["stock_mid"], 6000.0)
+        self.assertEqual(
+            references[0]["underlying_price_source"], "index_price"
+        )
+
     def test_pro_history_clips_stock_buffer_and_reports_reference_access(self):
         cfg = config.CollectorConfig(
             symbols=(config.UNIVERSE[0],), rate_symbols=("SOFR", "TREASURY_M3")
@@ -180,6 +316,7 @@ class PlanningAndSelectionTest(unittest.TestCase):
                 "before_rate_subscription_history_start",
                 "before_stock_pro_history_start",
                 "theta_v3_endpoint_unavailable",
+                "historical_contract_terms_not_supplied_by_current_Theta_API",
             },
         )
         rate_gap = next(
@@ -206,6 +343,7 @@ class PlanningAndSelectionTest(unittest.TestCase):
             end_date="2017-01-03",
             symbols=(),
             rate_symbols=("TREASURY_M3",),
+            mode="references",
         )
         requests = list(planning.reference_requests(cfg))
         self.assertEqual(len(requests), 4)
@@ -279,6 +417,115 @@ class PlanningAndSelectionTest(unittest.TestCase):
 
 
 class SavedCollectionTest(unittest.TestCase):
+    def test_unlisted_underlying_prefix_skips_new_chains_but_not_existing_cohort(
+        self,
+    ):
+        self.collector.unavailable_dates = {("SPY", "quote"): {str(DAY.date())}}
+        scope = {"dates": [str(DAY.date())], "symbol": {"symbol": "SPY"}}
+        empty = pd.DataFrame(columns=selection.COHORT_COLUMNS)
+        with mock.patch.object(
+            transport.ThetaClient,
+            "download",
+            autospec=True,
+            side_effect=_download_fixture,
+        ) as download:
+            self.collector.collect_month(
+                config.UNIVERSE[0], pd.DatetimeIndex([DAY]), empty, scope
+            )
+            self.assertFalse(
+                any(
+                    c.args[1].endpoint.startswith("/option/")
+                    for c in download.call_args_list
+                )
+            )
+        chosen = selection.select_contracts(
+            selection.normalize_chain(
+                pd.DataFrame(_contracts()), "SPY", self.cfg
+            ),
+            DAY,
+            [{"stock_mid": 100.0, "selection_time": "10:30:00"}],
+            self.cfg,
+        )
+        cohort = selection.extend_cohort(empty, chosen, DAY, config.UNIVERSE[0])
+        with mock.patch.object(
+            transport.ThetaClient,
+            "download",
+            autospec=True,
+            side_effect=_download_fixture,
+        ) as download:
+            self.collector.collect_month(
+                config.UNIVERSE[0], pd.DatetimeIndex([DAY]), cohort, scope
+            )
+            self.assertTrue(
+                any(
+                    c.args[1].dataset == "option_quotes_1h"
+                    for c in download.call_args_list
+                )
+            )
+        self.assertGreater(
+            self.store.session("SPY", DAY)["selected_contract_count"], 0
+        )
+
+    def test_monthly_retention_obeys_each_entry_date_and_survives_compaction(
+        self,
+    ):
+        request = planning.ranged(
+            self.option_request(),
+            pd.DatetimeIndex([DAY, DAY + pd.Timedelta(days=1)]),
+        )
+        key = "SPY|2025-01-10|100|call"
+        request = dataclasses.replace(
+            request,
+            retained_contract_keys=None,
+            retained_contract_windows=((key, "2025-01-03", "2025-01-10"),),
+        )
+        record = self.save_bytes(request, _payload(request))
+        before = self.store.read(record)
+        self.assertEqual(set(before["timestamp"].str[:10]), {"2025-01-03"})
+        self.assertEqual(len(before), 8)
+        self.store.compact([record], "test")
+        pd.testing.assert_frame_equal(self.store.read(record), before)
+        self.assertTrue(self.store.reusable(record))
+        self.assertTrue(self.store.cached(request))
+        # Failed refresh remains separate even after the good receipt was packed.
+        bad = self.save_bytes(request, b"wrong,header\n1,2\n")
+        self.assertEqual(bad["status"], "invalid_response")
+        pd.testing.assert_frame_equal(
+            self.store.read(self.store.cached(request)), before
+        )
+
+    def test_missing_activity_bar_is_not_zero_and_overnight_is_not_a_quote_gap(
+        self,
+    ):
+        request = planning.history_request(
+            self.cfg, "stock", "ohlc", "SPY", DAY
+        )
+        frame = pd.read_csv(io.BytesIO(_payload(request)), dtype="string")
+        record = self.save_bytes(request, frame.to_csv(index=False).encode())
+        check = self.collector.coverage.quote_or_contract_report_coverage(
+            request, record
+        )
+        self.assertEqual(check["status"], "observations_present")
+        shortened = self.save_bytes(
+            request, frame.iloc[1:].to_csv(index=False).encode()
+        )
+        check = self.collector.coverage.quote_or_contract_report_coverage(
+            request, shortened
+        )
+        self.assertEqual(check["status"], "gaps_observed")
+        self.assertFalse(check["missing_bars_mean_zero"])
+        quote = planning.ranged(
+            planning.history_request(self.cfg, "stock", "quote", "SPY", DAY),
+            pd.DatetimeIndex([DAY, DAY + pd.Timedelta(days=1)]),
+        )
+        record = self.save_bytes(quote, _payload(quote))
+        self.assertEqual(
+            self.store.metadata(record)["quality"][
+                "absent_interior_sample_slots"
+            ],
+            0,
+        )
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="tfbsm-collector-test-")
         self.addCleanup(temporary.cleanup)
@@ -317,18 +564,25 @@ class SavedCollectionTest(unittest.TestCase):
             finally:
                 frames.close()
 
-    def test_one_session_preserves_selection_coverage_and_resume(self):
+    def test_month_preserves_selection_coverage_compaction_and_resume(self):
+        scope = {"dates": [str(DAY.date())], "symbol": {"symbol": "SPY"}}
         with mock.patch.object(
             transport.ThetaClient,
             "download",
             autospec=True,
             side_effect=_download_fixture,
         ) as download:
-            manifest = self.collector.collect_day(config.UNIVERSE[0], DAY)
-        self.assertEqual(download.call_count, 17)
-        self.assertEqual(manifest["status"], "complete")
-        self.assertEqual(manifest["coverage"]["status"], "observations_present")
-        self.assertEqual(manifest["selected_contract_count"], 20)
+            manifest = self.collector.collect_month(
+                config.UNIVERSE[0],
+                pd.DatetimeIndex([DAY]),
+                pd.DataFrame(columns=selection.COHORT_COLUMNS),
+                scope,
+            )
+        self.assertEqual(download.call_count, 23)
+        self.assertEqual(manifest["request_error_count"], 0)
+        session = self.store.session("SPY", DAY)
+        self.assertEqual(session["coverage"]["status"], "observations_present")
+        self.assertEqual(session["selected_contract_count"], 20)
         selected = pd.read_parquet(self.root / manifest["contracts"]["path"])
         oi_only = selected.loc[
             selected["strike"].eq("105") & selected["right"].eq("put")
@@ -342,31 +596,36 @@ class SavedCollectionTest(unittest.TestCase):
                 self.assertEqual(int(frame.duplicated().sum()), 1)
                 self.assertEqual(record["retention"]["excluded_rows"], 7)
                 self.assertFalse(frame["strike"].eq("999").any())
-                meta = storage.read_json(self.root / record["metadata"]["path"])
-                self.assertEqual(
-                    meta["collector_code_files"], self.store.code_files
-                )
+                meta = self.store.metadata(record)
                 self.assertEqual(meta["raw_schema_version"], 2)
-        self.assertTrue(self.collector.resumable("SPY", DAY))
+                self.assertIn("row_groups", meta["data"])
+        self.assertTrue(self.collector.month_valid(manifest, scope))
         restarted = workflow.Collector(
-            dataclasses.replace(
-                self.cfg,
-                max_batch_workers=1,
-                max_inflight_requests=4,
-                start_date="2018-01-01",
-                index_subscription="standard",
+            dataclasses.replace(self.cfg, max_inflight_requests=4)
+        )
+        self.assertTrue(restarted.month_valid(manifest, scope))
+        self.assertFalse(
+            restarted.month_valid(
+                manifest, {**scope, "incoming_cohort": "changed"}
             )
         )
-        self.assertTrue(restarted.resumable("SPY", DAY))
         counts = self.collector.coverage.write_availability(
             pd.DatetimeIndex([DAY])
         )
         self.assertEqual(counts["complete"], 1)
-        availability = pd.read_csv(
-            self.store.collection_dir / "availability.csv"
-        )
-        self.assertEqual(availability.loc[0, "excluded_quote_rows"], 40)
         self.assertFalse(list(self.root.rglob("raw_response.csv")))
+        # Five expiration responses now share one quote file, rather than five
+        # separate files plus metadata and pointer files for every request.
+        self.assertEqual(
+            len(
+                list(
+                    (self.root / "parquet" / "option_quotes_1h").rglob(
+                        "*.parquet"
+                    )
+                )
+            ),
+            1,
+        )
 
     def test_excluded_misroute_fails_refresh_and_preserves_previous_cache(self):
         request = self.option_request()
@@ -458,9 +717,7 @@ class SavedCollectionTest(unittest.TestCase):
         )
         record = self.save_bytes(request, rows.to_csv(index=False).encode())
         self.assertEqual(record["status"], "invalid_response")
-        quality = storage.read_json(self.root / record["metadata"]["path"])[
-            "quality"
-        ]
+        quality = self.store.metadata(record)["quality"]
         self.assertEqual(quality["report_dates"]["unparseable_or_missing"], 3)
         self.assertEqual(quality["report_dates"]["first"], "2025-01-10")
         self.assertEqual(
@@ -583,8 +840,8 @@ class CliAndProvenanceTest(unittest.TestCase):
             root = pathlib.Path(directory)
             run = storage.read_json(next(root.glob("collection/*/runs/*.json")))
             self.assertEqual(run["status"], "coverage_gaps")
-            self.assertEqual(run["processed_days"], 1)
-            self.assertEqual(run["coverage"]["complete"], 1)
+            self.assertGreater(run["processed_days"], 1)
+            self.assertEqual(run["coverage"]["complete"], run["processed_days"])
             self.assertEqual(run["reference_failures"], 0)
             ledger = storage.read_json(root / run["reference_ledger"])
             self.assertEqual(
@@ -606,7 +863,7 @@ class CliAndProvenanceTest(unittest.TestCase):
                 action_gaps["corporate_dividend"]["unrequested_end_date"],
                 "2025-07-01",
             )
-            self.assertEqual(run["reference_gaps"], 3)
+            self.assertEqual(run["reference_gaps"], 4)
 
     def test_plan_modes_do_not_contact_theta_or_create_output(self):
         with tempfile.TemporaryDirectory(

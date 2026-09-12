@@ -54,6 +54,9 @@ class Request:
         vendor: Fixed vendor label recorded with the request.
         retained_contract_keys: Option identities retained in Parquet, or None
             to keep every row. This is never sent as a query parameter.
+        retained_contract_windows: Tuples of contract key, first retained date,
+            and last retained date. A monthly response keeps only these dated
+            windows; first-day membership remains retrospective.
     """
 
     dataset: str
@@ -62,6 +65,7 @@ class Request:
     vendor: str = dataclasses.field(default="ThetaData", init=False)
 
     retained_contract_keys: tuple[str, ...] | None = None
+    retained_contract_windows: tuple[tuple[str, str, str], ...] | None = None
 
     def identity(self) -> dict:
         """Return the canonical request and retention policy for cache matching.
@@ -70,6 +74,13 @@ class Request:
         retention preserves the identity of older full-response requests.
         """
         identity = dataclasses.asdict(self)
+        if self.retained_contract_windows is None:
+            identity.pop("retained_contract_windows")
+        else:
+            identity["retained_contract_windows"] = [
+                list(window)
+                for window in sorted(set(self.retained_contract_windows))
+            ]
         if self.retained_contract_keys is None:
             # Older full-response caches omit this field. Keep their identities
             # stable.
@@ -101,6 +112,16 @@ class Request:
             "quote": ("timestamp", *QUOTE_FIELDS),
             "price": ("timestamp", "price"),
             "open_interest": ("timestamp", "open_interest"),
+            "ohlc": (
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "count",
+                "vwap",
+            ),
             "eod": (
                 "created",
                 "last_trade",
@@ -158,6 +179,15 @@ class Request:
                 "kind": "sampled_quotes",
                 "timestamp_role": "sample_boundary",
                 "quote_event_time_available": False,
+            }
+        if kind == "ohlc":
+            return {
+                "kind": "trade_activity_bars",
+                "timestamp_role": "bar_open",
+                "trade_window": "bar_open <= trade_time < bar_open + interval",
+                "aggregation": "Theta SIP trade-condition rules",
+                "missing_bar_means_zero": False,
+                "exact_trade_waiting_times_available": False,
             }
         # Open interest counts outstanding contracts at the previous session's
         # close, not today's trading volume. Missing reports do not mean zero.
@@ -286,7 +316,7 @@ def history_request(
     Args:
         cfg: Sampling interval, feed, and maturity limits.
         asset: Theta asset path: stock, option, or index.
-        kind: Endpoint kind: quote, price, open_interest, or eod.
+        kind: Endpoint kind: quote, price, ohlc, open_interest, or eod.
         symbol: Underlying or index ticker.
         day: Exchange session date, without a time zone.
         contract: Option identity with expiration, strike, and right. A bulk
@@ -317,12 +347,12 @@ def history_request(
                 strike="*" if strike == "*" else format_strike(strike),
                 right=contract["right"],
             )
-    if kind in {"quote", "price"}:
+    if kind in {"quote", "price", "ohlc"}:
         # History snapshots are the latest quotes at boundaries, not hourly
         # averages. Stock and option requests use the same grid for later
         # matching.
         params["interval"] = cfg.quote_interval
-        dataset = f"{asset}_{kind}s_{cfg.quote_interval}"
+        dataset = f"{asset}_{kind}{'' if kind == 'ohlc' else 's'}_{cfg.quote_interval}"
     else:
         dataset = f"{asset}_{kind}"
     if kind == "eod":
@@ -390,83 +420,190 @@ def near_close_request(
     )
 
 
-def shared_day_requests(
-    cfg: config.CollectorConfig, symbol: str, day: pd.Timestamp
-) -> list[Request]:
-    """Return seven stock, discovery, and option-report requests for a day."""
-    # Use dated quote/trade contract lists for discovery. A current chain would
-    # miss expired contracts; a trade list does not download individual trades.
-    return [
-        history_request(cfg, "stock", "quote", symbol, day),
-        near_close_request(cfg, "stock", symbol, day),
-        history_request(cfg, "stock", "eod", symbol, day),
-        *[
-            Request(
-                dataset,
-                f"/option/list/contracts/{kind}",
-                {
-                    "symbol": symbol,
-                    "date": day.strftime("%Y%m%d"),
-                    "max_dte": cfg.max_dte,
-                    "format": "csv",
-                },
-            )
-            for kind, dataset in (
-                ("quote", "quoted_contracts"),
-                ("trade", "traded_contracts"),
-            )
-        ],
-        history_request(cfg, "option", "open_interest", symbol, day),
-        history_request(cfg, "option", "eod", symbol, day),
-    ]
+def date_batches(days, cfg: config.CollectorConfig, *, intraday: bool = True):
+    """Yield contiguous session ranges within a month and one session length.
+
+    Split around excluded dates and early closes: a monthly 15:55 request must
+    never replace the 12:55 observation on a half day. Calendar months keep all
+    sampled requests within Theta's documented one-month limit.
+    """
+    batch, previous_key, previous_position = [], None, None
+    calendar = exchange_calendar().sessions.tz_localize(None)
+    for day in sorted(pd.DatetimeIndex(days)):
+        position = calendar.get_loc(day)
+        key = (
+            day.strftime("%Y-%m"),
+            session_bounds(day, cfg)[1].strftime("%H:%M") if intraday else "",
+        )
+        if batch and (key != previous_key or position != previous_position + 1):
+            yield pd.DatetimeIndex(batch)
+            batch = []
+        batch.append(day)
+        previous_key, previous_position = key, position
+    if batch:
+        yield pd.DatetimeIndex(batch)
 
 
-def option_quote_requests(
+def ranged(request: Request, days: pd.DatetimeIndex) -> Request:
+    """Extend a single-session descriptor to one supported inclusive range."""
+    if len(days) == 1:
+        return request
+    params = {
+        key: value for key, value in request.params.items() if key != "date"
+    }
+    params.update(
+        start_date=days[0].strftime("%Y%m%d"),
+        end_date=days[-1].strftime("%Y%m%d"),
+    )
+    return dataclasses.replace(request, params=params)
+
+
+def request_days(request: Request) -> pd.DatetimeIndex:
+    """Return the exchange sessions addressed by a dated request."""
+    start = request.params.get("date", request.params.get("start_date"))
+    end = request.params.get("date", request.params.get("end_date"))
+    return exchange_calendar().sessions_in_range(start, end).tz_localize(None)
+
+
+def underlying_requests(
     cfg: config.CollectorConfig,
-    symbol: str,
-    day: pd.Timestamp,
-    selected: pd.DataFrame,
+    symbol: config.SymbolConfig,
+    days,
+    unavailable: dict | None = None,
 ) -> list[Request]:
-    """Build hourly and near-close bulk pulls for each selected expiration.
+    """Batch underlying observations, honoring index access and date catalogues.
 
-    Args:
-        cfg: Collection settings.
-        symbol: Underlying ticker.
-        day: Exchange session date, without a time zone.
-        selected: Selection table with expiration and contract_key columns.
+    A successful catalogue can exclude quote or trade dates; a failed catalogue
+    cannot justify skipping them. Index prices have no trade volume, so no
+    synthetic index OHLC activity is manufactured.
+    """
+    unavailable = unavailable or {}
+    asset, ticker = symbol.price_asset, symbol.underlying
+    days = pd.DatetimeIndex(days)
+    if asset == "index":
+        if cfg.index_history_start is None:
+            return []
+        days = days[days >= pd.Timestamp(cfg.index_history_start)]
+    requests_to_make = []
+    kinds = (
+        ("price", "near_close", "eod")
+        if asset == "index"
+        else ("quote", "near_close", "ohlc", "eod")
+    )
+    for kind in kinds:
+        catalogue_kind = (
+            "price"
+            if asset == "index"
+            else ("trade" if kind == "ohlc" else "quote")
+        )
+        excluded = (
+            unavailable.get((ticker, catalogue_kind), set())
+            if kind != "eod"
+            else set()
+        )
+        wanted = [d for d in days if str(d.date()) not in excluded]
+        for batch in date_batches(wanted, cfg, intraday=kind != "eod"):
+            request = (
+                near_close_request(cfg, asset, ticker, batch[0])
+                if kind == "near_close"
+                else history_request(cfg, asset, kind, ticker, batch[0])
+            )
+            requests_to_make.append(ranged(request, batch))
+    return requests_to_make
 
-    Returns:
-        Two requests per selected expiration, each retaining only that
-        expiration's selected contracts. An empty selection returns no pulls.
+
+def discovery_requests(
+    cfg: config.CollectorConfig, symbol: str, days
+) -> list[Request]:
+    """Collect dated membership lists and monthly bulk OI/EOD reports.
+
+    Listing requests remain dated even though their small responses are packed
+    together on disk. An expiration observed later must not enter an earlier
+    day's candidate universe.
     """
     requests_to_make = []
-    for expiration in sorted(selected["expiration"].unique()):
-        family = {"expiration": expiration, "strike": "*", "right": "both"}
-
-        # The HTTP response is bulk, but the stored sample is exact. Recording
-        # these keys prevents a $100-only cache from serving a later $105-call
-        # request.
-        keys = tuple(
-            sorted(
-                selected.loc[
-                    selected["expiration"].eq(expiration), "contract_key"
-                ].unique()
+    for day in days:
+        # OI supplies that day's candidate universe. Keep its request daily so
+        # selection can stream the report without loading a month of full chains.
+        requests_to_make.append(
+            history_request(cfg, "option", "open_interest", symbol, day)
+        )
+        if str(day.date()) <= cfg.end_date:
+            for kind in ("quote", "trade"):
+                requests_to_make.append(
+                    Request(
+                        "quoted_contracts"
+                        if kind == "quote"
+                        else "traded_contracts",
+                        f"/option/list/contracts/{kind}",
+                        {
+                            "symbol": symbol,
+                            "date": day.strftime("%Y%m%d"),
+                            "max_dte": cfg.max_dte,
+                            "format": "csv",
+                        },
+                    )
+                )
+    for batch in date_batches(days, cfg, intraday=False):
+        requests_to_make.append(
+            ranged(
+                history_request(cfg, "option", "eod", symbol, batch[0]), batch
             )
         )
-        requests_to_make.extend(
-            [
-                dataclasses.replace(
-                    history_request(
-                        cfg, "option", "quote", symbol, day, family
-                    ),
-                    retained_contract_keys=keys,
-                ),
-                dataclasses.replace(
-                    near_close_request(cfg, "option", symbol, day, expiration),
-                    retained_contract_keys=keys,
-                ),
-            ]
-        )
+    return requests_to_make
+
+
+def followup_requests(
+    cfg: config.CollectorConfig, symbol: str, days, cohort: pd.DataFrame
+) -> list[Request]:
+    """Batch hourly quotes/activity and near-close quotes for active cohorts.
+
+    Entry DTE and moneyness limits apply only when a contract is first chosen.
+    Continue requesting it through expiration even when it becomes deep ITM/OTM,
+    has no new discovery row, or falls below the entry maturity threshold.
+    """
+    requests_to_make = []
+    for expiration, family in cohort.groupby("expiration", sort=True):
+        active = [
+            d
+            for d in days
+            if family["first_selected_date"].min()
+            <= str(d.date())
+            <= expiration
+        ]
+        for batch in date_batches(active, cfg):
+            windows = tuple(
+                sorted(
+                    (
+                        row.contract_key,
+                        max(row.first_selected_date, str(batch[0].date())),
+                        min(row.expiration, str(batch[-1].date())),
+                    )
+                    for row in family.itertuples(index=False)
+                    if row.first_selected_date <= str(batch[-1].date())
+                )
+            )
+            contract = {
+                "expiration": expiration,
+                "strike": "*",
+                "right": "both",
+            }
+            for kind in ("quote", "ohlc", "near_close"):
+                request = (
+                    near_close_request(
+                        cfg, "option", symbol, batch[0], expiration
+                    )
+                    if kind == "near_close"
+                    else history_request(
+                        cfg, "option", kind, symbol, batch[0], contract
+                    )
+                )
+                requests_to_make.append(
+                    dataclasses.replace(
+                        ranged(request, batch),
+                        retained_contract_windows=windows,
+                    )
+                )
     return requests_to_make
 
 
@@ -505,9 +642,16 @@ def collection_windows(cfg: config.CollectorConfig) -> dict:
     # Record the omitted sessions instead of causing a permission failure or
     # pretending that fewer observations constitute the requested lookback.
     accessible = lookback >= pd.Timestamp(config.PRO_HISTORY_START)
+    followup_end = pd.Timestamp(end) + pd.Timedelta(days=cfg.max_dte)
+    yesterday = pd.Timestamp.now(cfg.exchange_tz).normalize().tz_localize(
+        None
+    ) - pd.Timedelta(days=1)
     return {
         "study_start": start,
         "study_end": end,
+        "followup_end_bound": str(followup_end.date()),
+        "available_followup_end": str(min(followup_end, yesterday).date()),
+        "future_followup_possible": followup_end > yesterday,
         "requested_history_start": requested_history_start,
         "history_start": max(requested_history_start, config.PRO_HISTORY_START),
         "corporate_action_end": str(
@@ -537,7 +681,10 @@ def reference_access_gaps(
     dates = list(
         exchange_calendar()
         .sessions_in_range(
-            windows["requested_history_start"], windows["study_end"]
+            windows["requested_history_start"],
+            windows["available_followup_end"]
+            if cfg.mode == "panels"
+            else windows["study_end"],
         )
         .strftime("%Y-%m-%d")
     )
@@ -551,6 +698,14 @@ def reference_access_gaps(
         gaps.append(
             {
                 "symbol": "VIX",
+                "symbols": sorted(
+                    {"VIX"}
+                    | {
+                        s.underlying
+                        for s in cfg.symbols
+                        if s.price_asset == "index"
+                    }
+                ),
                 "reason": "index_subscription_unavailable"
                 if cfg.index_history_start is None
                 else "before_index_subscription_history_start",
@@ -587,7 +742,7 @@ def reference_access_gaps(
                 ],
             }
         )
-    if cfg.symbols:
+    if any(s.price_asset == "stock" for s in cfg.symbols):
         # The September 2026 live check returned 404 for both corporate-action
         # routes. Theta's v3 migration guide marks them as coming soon. Keep the
         # missing event window visible; absent dividends must never imply zero.
@@ -596,12 +751,30 @@ def reference_access_gaps(
             gaps.append(
                 {
                     "dataset": dataset,
-                    "symbols": [symbol.symbol for symbol in cfg.symbols],
+                    "symbols": [
+                        symbol.underlying
+                        for symbol in cfg.symbols
+                        if symbol.price_asset == "stock"
+                    ],
                     "reason": "theta_v3_endpoint_unavailable",
                     "unrequested_start_date": windows["history_start"],
                     "unrequested_end_date": windows["corporate_action_end"],
                 }
             )
+    if cfg.symbols:
+        gaps.append(
+            {
+                "dataset": "option_contract_terms",
+                "symbols": [s.symbol for s in cfg.symbols],
+                "reason": "historical_contract_terms_not_supplied_by_current_Theta_API",
+                "missing_fields": [
+                    "verified_multiplier",
+                    "deliverable",
+                    "last_trading_timestamp",
+                    "verified_exercise_and_settlement_terms",
+                ],
+            }
+        )
     return gaps
 
 
@@ -615,8 +788,13 @@ def reference_requests(cfg: config.CollectorConfig):
         Request descriptors. Rates and VIX are shared across underlyings.
         Inaccessible dates are omitted and described by reference_access_gaps.
     """
-    start, end = cfg.start_date, cfg.end_date
+    start = cfg.start_date
     windows = collection_windows(cfg)
+    end = (
+        windows["available_followup_end"]
+        if cfg.mode == "panels"
+        else cfg.end_date
+    )
     window = {
         "start_date": windows["history_start"],
         "end_date": end,
@@ -649,20 +827,24 @@ def reference_requests(cfg: config.CollectorConfig):
         if intraday_start <= end:
             # VIX provides S&P 500 volatility context, not each stock's
             # volatility. Intraday values avoid using EOD data that morning.
-            for day in (
+            days = (
                 exchange_calendar()
                 .sessions_in_range(intraday_start, end)
                 .tz_localize(None)
-            ):
-                yield history_request(cfg, "index", "price", "VIX", day)
-                yield near_close_request(cfg, "index", "VIX", day)
-    if cfg.mode == "panels":
-        for date in windows["lookback_dates"]:
-            for symbol in cfg.symbols:
-                for kind in ("quote", "eod"):
-                    yield history_request(
-                        cfg, "stock", kind, symbol.symbol, pd.Timestamp(date)
-                    )
-                yield near_close_request(
-                    cfg, "stock", symbol.symbol, pd.Timestamp(date)
+            )
+            for batch in date_batches(days, cfg):
+                yield ranged(
+                    history_request(cfg, "index", "price", "VIX", batch[0]),
+                    batch,
                 )
+                yield ranged(
+                    near_close_request(cfg, "index", "VIX", batch[0]), batch
+                )
+    if cfg.mode == "panels":
+        days = pd.DatetimeIndex(windows["lookback_dates"])
+        seen = set()
+        for symbol in cfg.symbols:
+            if (symbol.price_asset, symbol.underlying) in seen:
+                continue
+            seen.add((symbol.price_asset, symbol.underlying))
+            yield from underlying_requests(cfg, symbol, days)

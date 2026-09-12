@@ -66,10 +66,22 @@ class CoverageChecker:
                 "status": "not_assessed",
                 "reason": "empty_event_reports_can_be_valid",
             }
-        if request.endpoint.endswith("/quote") and request.endpoint.startswith(
-            "/stock/"
-        ):
-            return self.quote_or_contract_report_coverage(request, record)
+        if request.endpoint.endswith(("/quote", "/price", "/ohlc")):
+            observations = self.observation_clocks(request, record)
+            checks = {
+                str(day.date()): self.quote_or_contract_report_coverage(
+                    request, record, day=day, observations=observations
+                )
+                for day in planning.request_days(request)
+            }
+            return {
+                "status": "unknown"
+                if any(c["status"] == "unknown" for c in checks.values())
+                else "gaps_observed"
+                if any(c["status"] == "gaps_observed" for c in checks.values())
+                else "observations_present",
+                "sessions": checks,
+            }
         if request.endpoint.endswith("/eod"):
             try:
                 frame = self.store.read(record)
@@ -116,24 +128,50 @@ class CoverageChecker:
             "complete_intraday_history_verified": False,
         }
 
+    def observation_clocks(
+        self, request: planning.Request, record: dict | None
+    ) -> dict:
+        """Read one response once and index distinct clocks by date and series.
+
+        Monthly coverage reuses this small clock index instead of rereading the
+        whole Parquet response for every session. Stored duplicate rows remain
+        unchanged; only these presence checks deduplicate timestamps.
+        """
+        if (
+            record is None
+            or record["status"] not in storage.GOOD_REQUEST_STATUSES
+        ):
+            return {}
+        column = "created" if request.endpoint.endswith("/eod") else "timestamp"
+        option = request.endpoint.startswith("/option/")
+        columns = [*planning.CONTRACT_FIELDS, column] if option else [column]
+        dates = {}
+        for frame in self.store.iter_frames(record, columns=columns):
+            keys = (
+                planning.option_contract_keys(frame)
+                if option
+                else [request.params["symbol"]] * len(frame)
+            )
+            for key, clock in zip(
+                keys,
+                validation.parse_vendor_clock(
+                    frame[column], self.cfg.exchange_tz
+                ),
+            ):
+                if pd.notna(clock):
+                    date = str(clock.tz_convert(self.cfg.exchange_tz).date())
+                    dates.setdefault(date, {}).setdefault(key, set()).add(clock)
+        return dates
+
     def quote_or_contract_report_coverage(
         self,
         request: planning.Request,
         record: dict | None,
         selected: pd.DataFrame | None = None,
+        day: pd.Timestamp | None = None,
+        observations: dict | None = None,
     ) -> dict:
-        """Check each wanted series, including missing sampled-quote times.
-
-        Args:
-            request: Stock quote or option quote/EOD descriptor.
-            record: Saved request receipt, or None if no result was recorded.
-            selected: Selection table required for option requests. Bulk data
-                outside these identities cannot satisfy the selected sample.
-
-        Returns:
-            Coverage status, expected sample counts, and missing observations.
-            Presence does not verify quote event age or suitability for pricing.
-        """
+        """Check wanted series on one day, without substituting zeros for gaps."""
         if (
             record is None
             or record["status"] not in storage.GOOD_REQUEST_STATUSES
@@ -142,6 +180,7 @@ class CoverageChecker:
                 "status": "unknown",
                 "reason": "request_not_completed_successfully",
             }
+        day = day if day is not None else planning.request_days(request)[0]
         option = request.endpoint.startswith("/option/")
         if option:
             chosen = selected
@@ -154,15 +193,13 @@ class CoverageChecker:
             wanted = {request.params["symbol"]}
         if not wanted:
             return {"status": "not_assessed", "reason": "no_selected_contracts"}
-        sampled = request.endpoint.endswith("/history/quote")
-        expected_times = set()
-        if sampled:
-            day = pd.Timestamp(request.params["date"])
-            opened, closed = planning.session_bounds(day, self.cfg)
-            # Seven hourly rows can repeat a timestamp and omit another. Compare
-            # the actual clock grid, including endpoints, separately from
-            # near-close data.
-            expected_times = set(
+        sampled = "/history/" in request.endpoint and request.endpoint.endswith(
+            ("/quote", "/price", "/ohlc")
+        )
+        activity = request.endpoint.endswith("/ohlc")
+        opened, closed = planning.session_bounds(day, self.cfg)
+        expected = (
+            set(
                 pd.date_range(
                     opened,
                     closed,
@@ -171,32 +208,21 @@ class CoverageChecker:
                             request.params["interval"]
                         )
                     ),
+                    # A bar opening at the close has no regular-session time in it.
+                    inclusive="left" if activity else "both",
                 ).tz_convert("UTC")
             )
-
-        clocks = {key: set() for key in wanted}
-        column = "created" if request.endpoint.endswith("/eod") else "timestamp"
-        columns = [*planning.CONTRACT_FIELDS, column] if option else [column]
+            if sampled
+            else set()
+        )
         try:
-            for frame in self.store.iter_frames(record, columns=columns):
-                if option:
-                    keys = planning.option_contract_keys(frame)
-                else:
-                    keys = [request.params["symbol"]] * len(frame)
-                for key, clock in zip(
-                    keys,
-                    validation.parse_vendor_clock(
-                        frame[column], self.cfg.exchange_tz
-                    ),
-                ):
-                    if key in wanted and pd.notna(clock):
-                        # Deduplicate clocks only for presence checks. Stored
-                        # quote rows remain intact.
-                        clocks[key].add(clock)
+            if observations is None:
+                observations = self.observation_clocks(request, record)
+            clocks = observations.get(str(day.date()), {})
             missing = []
             for key in sorted(wanted):
-                absent = expected_times - clocks[key]
-                if (sampled and absent) or not clocks[key]:
+                absent = expected - clocks.get(key, set())
+                if (sampled and absent) or not clocks.get(key):
                     missing.append(
                         {
                             "contract_key" if option else "symbol": key,
@@ -205,10 +231,10 @@ class CoverageChecker:
                                     "%H:%M:%S"
                                 )
                                 for t in sorted(absent)
-                            ]
-                            if sampled
-                            else [],
-                            "reason": "missing_sample_rows"
+                            ],
+                            "reason": "missing_activity_bar; zero_activity_not_inferred"
+                            if activity
+                            else "missing_sample_rows"
                             if sampled
                             else "no_dated_observation",
                         }
@@ -218,12 +244,11 @@ class CoverageChecker:
                 if missing
                 else "observations_present",
                 "checked_contract_count": len(wanted) if option else 0,
-                "expected_samples_per_series": len(expected_times)
-                if sampled
-                else 1,
+                "expected_samples_per_series": len(expected) if sampled else 1,
                 "missing_observations": missing,
                 "quote_event_age_verified": False,
                 "research_sample_usability_verified": False,
+                "missing_bars_mean_zero": False,
             }
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return {
@@ -240,64 +265,42 @@ class CoverageChecker:
         records: list[dict],
         missing_times: list[str],
         failed: bool,
+        *,
+        requests: list[planning.Request],
+        observations: dict | None = None,
     ) -> dict:
-        """Combine price and report coverage for the selected option sample.
-
-        Args:
-            symbol: Underlying ticker.
-            day: Exchange session date, without a time zone.
-            selected: Selected contract table, possibly empty.
-            records: Completed request receipts for this session.
-            missing_times: Scheduled stock selection times without a reference.
-            failed: Whether collection encountered a request or processing
-                error.
-
-        Returns:
-            Required-request checks and counts of missing quotes, EOD reports,
-            stock series, and unknown results. Failures take precedence over
-            gaps.
-        """
-        required = [
-            request
-            for request in planning.shared_day_requests(self.cfg, symbol, day)
-            if request.endpoint.endswith(("/quote", "/eod"))
-            and "/list/" not in request.endpoint
-        ]
-        required += planning.option_quote_requests(
-            self.cfg, symbol, day, selected
-        )
+        """Summarize price and activity presence for that day's active cohort."""
         by_id = {record["request_id"]: record for record in records}
         checks = []
-        for request in required:
-            record = by_id.get(request.request_id)
-            coverage = (
-                self.quote_or_contract_report_coverage(
-                    request, record, selected
-                )
-                if request.endpoint.startswith("/option/")
-                else self.request_coverage(request, record)
+        for request in requests:
+            if "/list/" in request.endpoint or request.endpoint.endswith(
+                "/open_interest"
+            ):
+                continue
+            check = self.quote_or_contract_report_coverage(
+                request,
+                by_id.get(request.request_id),
+                selected,
+                day,
+                None
+                if observations is None
+                else observations.get(request.request_id, {}),
             )
             checks.append(
                 {
                     "request_id": request.request_id,
                     "dataset": request.dataset,
-                    "params": request.params,
-                    **coverage,
+                    **check,
                 }
             )
-        missing = [
-            check for check in checks if check["status"] == "gaps_observed"
-        ]
-        unknown = sum(check["status"] == "unknown" for check in checks)
-        status = (
-            "unknown"
+        missing = [c for c in checks if c["status"] == "gaps_observed"]
+        unknown = sum(c["status"] == "unknown" for c in checks)
+        return {
+            "status": "unknown"
             if failed or unknown
             else "gaps_observed"
             if missing or missing_times or selected.empty
-            else "observations_present"
-        )
-        return {
-            "status": status,
+            else "observations_present",
             "required_price_requests": checks,
             "missing_option_quote_count": len(
                 {
@@ -315,8 +318,16 @@ class CoverageChecker:
                     for row in c["missing_observations"]
                 }
             ),
+            "missing_option_activity_count": len(
+                {
+                    row["contract_key"]
+                    for c in missing
+                    if c["dataset"].startswith("option_ohlc_")
+                    for row in c["missing_observations"]
+                }
+            ),
             "missing_stock_dataset_count": sum(
-                c["dataset"].startswith("stock_") for c in missing
+                c["dataset"].startswith(("stock_", "index_")) for c in missing
             ),
             "unknown_required_request_count": unknown,
             "no_selected_contracts": selected.empty,
@@ -344,20 +355,29 @@ class CoverageChecker:
             planning.Request(
                 f"stock_{kind}_dates",
                 f"/stock/list/dates/{kind}",
-                {"symbol": symbol.symbol, "format": "csv"},
+                {"symbol": symbol.underlying, "format": "csv"},
             )
             for symbol in self.cfg.symbols
+            if symbol.price_asset == "stock"
             for kind in ("quote", "trade")
         ]
         access_gaps = []
         if self.cfg.index_history_start is not None:
-            requests_to_make.append(
-                planning.Request(
-                    "index_price_dates",
-                    "/index/list/dates",
-                    {"symbol": "VIX", "format": "csv"},
+            for ticker in sorted(
+                {"VIX"}
+                | {
+                    s.underlying
+                    for s in self.cfg.symbols
+                    if s.price_asset == "index"
+                }
+            ):
+                requests_to_make.append(
+                    planning.Request(
+                        "index_price_dates",
+                        "/index/list/dates",
+                        {"symbol": ticker, "format": "csv"},
+                    )
                 )
-            )
         else:
             # The catalogue itself requires index access too. Record its
             # absence even in --coverage-only mode, before reference collection.
@@ -465,151 +485,104 @@ class CoverageChecker:
         return report
 
     def write_availability(self, anchors: pd.DatetimeIndex) -> dict:
-        """Write one coverage-summary CSV row per requested underlying/session.
+        """Export one coverage row per entry session and collected follow-up day.
 
-        Args:
-            anchors: Exchange session dates to include, even if never attempted.
-
-        Returns:
-            Counts by collection status and observed/unknown coverage. Damaged
-            manifests become explicit failure rows rather than aborting the CSV.
+        Monthly responses are shared across days. Byte totals belong to the
+        response index/files, not to a per-day sum that would count them again.
         """
-        path = self.store.collection_dir / "availability.csv"
-        # Rows and bytes below describe stored records, not distinct market
-        # events. Overlapping snapshots and EOD reports must not be interpreted
-        # as trade counts.
         columns = (
             "symbol",
             "trade_day",
+            "entry_window",
             "status",
             "coverage_status",
             "reason",
-            "quoted_contract_count",
-            "traded_contract_count",
-            "oi_reported_contract_count",
-            "universe_contract_count",
+            "newly_selected_contract_count",
             "selected_contract_count",
+            "universe_contract_count",
             "selection_reference_count",
             "missing_selection_times",
-            "request_count",
             "request_error_count",
             "no_data_request_count",
             "missing_option_quote_count",
             "missing_option_eod_count",
+            "missing_option_activity_count",
             "missing_stock_dataset_count",
             "unknown_required_request_count",
-            "stored_rows",
-            "excluded_quote_rows",
-            "stored_parquet_bytes",
-            "error",
         )
         counts = dict.fromkeys(
-            ("complete", "unavailable", "request_error", "not_attempted"), 0
+            (
+                "complete",
+                "unavailable",
+                "request_error",
+                "not_attempted",
+                "days_with_observed_gaps",
+                "days_with_unknown_coverage",
+            ),
+            0,
         )
-        counts.update(days_with_observed_gaps=0, days_with_unknown_coverage=0)
+        with self.store.index() as db:
+            stored = {
+                (symbol, day)
+                for symbol, day in db.execute(
+                    "SELECT symbol, day FROM sessions WHERE policy=?",
+                    (self.cfg.policy_id,),
+                )
+            }
+        wanted = {
+            (s.symbol, str(day.date()))
+            for s in self.cfg.symbols
+            for day in anchors
+        }
+        wanted |= {
+            (symbol, day)
+            for symbol, day in stored
+            if symbol in {s.symbol for s in self.cfg.symbols}
+        }
+        path = self.store.collection_dir / "availability.csv"
         with storage.atomic_output(path) as temp:
             with temp.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=columns)
                 writer.writeheader()
-                for day in anchors:
-                    for symbol in self.cfg.symbols:
-                        row = {
-                            "symbol": symbol.symbol,
-                            "trade_day": str(day.date()),
-                            "status": "not_attempted",
-                            "coverage_status": "not_checked",
-                        }
-                        try:
-                            manifest = storage.read_json(
-                                self.store.session_path(symbol.symbol, day)
-                            )
-                            if (
-                                manifest["symbol"] != symbol.symbol
-                                or manifest["trade_day"] != str(day.date())
-                                or manifest["status"]
-                                not in {
-                                    "complete",
-                                    "unavailable",
-                                    "request_error",
-                                }
-                            ):
-                                raise ValueError(
-                                    "Session identity or status does not match the requested day"
-                                )
-                            row.update(
-                                {
-                                    key: manifest.get(key, "")
-                                    for key in columns
-                                    if key in manifest
-                                }
-                            )
-                            records = manifest["requests"]
-                            coverage = manifest["coverage"]
-                            if coverage["status"] not in {
-                                "observations_present",
-                                "gaps_observed",
-                                "unknown",
-                            }:
-                                raise ValueError(
-                                    "Unknown session coverage status"
-                                )
-                            row.update(
-                                coverage_status=coverage["status"],
-                                **{
-                                    name: coverage[name]
-                                    for name in (
-                                        "missing_option_quote_count",
-                                        "missing_option_eod_count",
-                                        "missing_stock_dataset_count",
-                                        "unknown_required_request_count",
-                                    )
-                                },
-                            )
-                            row.update(
-                                selection_reference_count=len(
-                                    manifest["stock_selection_references"]
-                                ),
-                                missing_selection_times="|".join(
-                                    manifest["missing_selection_times"]
-                                ),
-                                request_count=len(records),
-                                no_data_request_count=sum(
-                                    r["status"] == "no_data" for r in records
-                                ),
-                                stored_rows=sum(
-                                    r.get("row_count", 0) for r in records
-                                ),
-                                excluded_quote_rows=sum(
-                                    r.get("retention", {}).get(
-                                        "excluded_rows", 0
-                                    )
-                                    for r in records
-                                ),
-                                stored_parquet_bytes=sum(
-                                    (r.get("data") or {}).get("size", 0)
-                                    for r in records
-                                ),
-                            )
-                        except FileNotFoundError:
-                            pass
-                        except (
-                            OSError,
-                            ValueError,
-                            KeyError,
-                            TypeError,
-                            AttributeError,
-                        ) as exc:
-                            row.update(
-                                status="request_error",
-                                coverage_status="unknown",
-                                error=repr(exc),
-                            )
-                        counts[row["status"]] += 1
-                        counts["days_with_observed_gaps"] += (
-                            row["coverage_status"] == "gaps_observed"
+                for symbol, date in sorted(wanted):
+                    row = dict(
+                        symbol=symbol,
+                        trade_day=date,
+                        status="not_attempted",
+                        coverage_status="not_checked",
+                    )
+                    try:
+                        manifest = self.store.session(
+                            symbol, pd.Timestamp(date)
                         )
-                        counts["days_with_unknown_coverage"] += (
-                            row["coverage_status"] == "unknown"
+                        row.update(
+                            {k: manifest[k] for k in columns if k in manifest}
                         )
-                        writer.writerow(row)
+                        checked = manifest["coverage"]
+                        row.update(
+                            {
+                                k: checked[k]
+                                for k in columns
+                                if k in checked and k != "status"
+                            }
+                        )
+                        row.update(
+                            coverage_status=checked["status"],
+                            selection_reference_count=len(
+                                manifest["stock_selection_references"]
+                            ),
+                            missing_selection_times="|".join(
+                                manifest["missing_selection_times"]
+                            ),
+                        )
+                    except FileNotFoundError:
+                        pass
+                    counts[row["status"]] += 1
+                    counts["days_with_observed_gaps"] += (
+                        row["coverage_status"] == "gaps_observed"
+                    )
+                    counts["days_with_unknown_coverage"] += (
+                        row["coverage_status"] == "unknown"
+                    )
+                    writer.writerow(row)
         return counts

@@ -48,34 +48,76 @@ The mathematical specification, parameter units and time normalization, volatili
 
 ## Project status
 
-The collector uses ThetaData exclusively, with hourly stock and option bid/ask snapshots for the hourly-versus-daily pricing study. The default study window is **June 1, 2012 through December 31, 2025**, using Stocks Pro and Options Pro. `--start` and `--end` can select any ordered window from June 2012 through a completed date before today. Normal sessions request the 09:30–15:30 hourly grid and a separate snapshot at 15:55 New York time. The daily comparison snapshot is always five minutes before the actual close, including 12:55 on a 13:00 early close. Daily stock and option EOD reports preserve volume and trade counts; their later report-time quotes are not substituted for the near-close snapshot. Individual trades are not downloaded. Sampled observations cannot reconstruct intervening quote updates or exact trade gaps.
+The collector uses **ThetaData only** with Stocks Pro and Options Pro. It collects hourly observations for the 21 stock/ETF underlyings in `config.py`. The default **contract-entry window is June 1, 2012 through December 31, 2025**. Each selected option is then followed through expiration, including after the entry window ends. Only completed dates are requested; a run records contracts whose expiration is still in the future. No full-history run has been completed.
 
-Discovery combines dated quoted/traded contract lists with one bulk OI report per underlying-day, so OI-only contracts remain eligible. Those lists, OI, and option EOD requests are capped at the study's maximum maturity, 180 days by default. The selected expiration, strike, and call/put grid is preserved. Quotes download in batches across all strikes and both rights for each selected expiration: seven shared requests plus two per selected expiration, at most 17 per underlying-day with the five-expiration cap. Only quotes for the exact selected contracts are written to Parquet; all their observations and vendor fields remain intact. Metadata records the retained keys and parsed/excluded row counts, and `availability.csv` totals excluded quote rows per underlying-day.
+| Collected input | Purpose and interpretation |
+| --- | --- |
+| Hourly underlying and selected-option bid/ask, sizes, conditions, exchanges | Matched pricing observations and quote-quality research. Preserve raw values, duplicates, and vendor fields. |
+| Near-close quotes, five minutes before the actual close | A daily comparison observation: normally 15:55 ET, or 12:55 on a 13:00 close. |
+| Hourly underlying and selected-option OHLC, VWAP, volume, trade count | Activity within bars under Theta's SIP aggregation rules. Missing bars stay missing; reported zero activity stays zero. |
+| Daily underlying and broad option EOD reports | Daily OHLC, volume/count, and available report fields. An EOD quote is not the near-close quote. |
+| Dated quoted/traded contract lists and daily open interest | Historical candidate membership, including quiet OI-only contracts. OI describes the previous trading session's close. |
+| Cohort and daily membership tables | First selection date/time, discovery evidence, entry DTE, current DTE, and which contracts remain tracked. |
+| SOFR and 11 Treasury tenors within the account's access | Raw reported percent rates for later maturity matching; no invented earlier SOFR observations. |
 
-The Pro default permits **eight shared simultaneous HTTP requests**, with eight workers per request batch and four concurrent underlying/day tasks. The shared cap applies across all assets and workers; Stocks Pro plus Options Pro does not provide sixteen slots. References use bounded batches, and request-start pacing is disabled by default. `--max-inflight-requests` can reduce the cap when another client uses the same account. This doubles the former four-request concurrency allowance, but actual runtime still depends on Theta, response sizes, network throughput, parsing, and disk speed. It is not a measured twofold speedup. See [Theta's concurrency rules](https://docs.thetadata.us/Articles/Data-And-Requests/Concurrent-Requests.html).
+Individual trades and tick-by-tick quote histories are not downloaded. Hourly activity bars cannot reveal exact trade waiting times. The final regular-session bar can be shorter than an hour. See Theta's [OHLC semantics](https://docs.thetadata.us/operations/option_history_ohlc.html), [EOD reports](https://docs.thetadata.us/operations/option_history_eod.html), and [OI timing](https://docs.thetadata.us/operations/option_history_open_interest.html).
 
-Reference access is configured separately from stock/option access. Normal runs request SOFR and all 11 documented Treasury tenors from the configured rate-access start. Dividends and splits are recorded as unavailable: the September 12, 2026 live test returned HTTP 404, the current v3 specification omits those routes, and [Theta's migration guide](https://docs.thetadata.us/Articles/Getting-Started/v2-migration-guide.html) marks them as coming soon. VIX daily, hourly, and near-close prices require an index subscription. These limits follow [Theta's subscription documentation](https://docs.thetadata.us/Articles/Getting-Started/Subscriptions.html):
+### Selection and following contracts
 
-| Product | Default configuration | Historical access boundary |
-| --- | --- | --- |
-| Stocks | Pro | June 1, 2012 for UTP history; CTA-only stock history begins in 2020. |
-| Options | Pro | June 1, 2012; individual contracts have their own lifetimes. |
-| Indices | `--index-subscription none` | No VIX requests. Value starts in 2023, Standard in 2022, Pro in 2017. |
-| Interest rates | `--rate-subscription free` | January 1, 2024. Value permits older history, subject to each series' existence. |
+Stock midpoint references at 10:30, 13:30, and 15:30 ET choose listed strikes around target S/K ratios and calendar-day maturities. Selection times outside a half-day session are omitted. The maturity targets remain 7, 14, 30, 60, and 120 calendar days, with entry DTE between 7 and 180. The S/K grid is denser near one: 0.95, 0.975, 0.99, 1, 1.01, 1.025, 1.05, alongside the wider original targets. Nearby targets can select the same listed strike.
 
-These flags declare subscriptions already held; they do not activate access. With only Stocks Pro and Options Pro, VIX and earlier rates remain explicitly missing, alongside the unavailable corporate actions. The collector records these gaps in `references/<run-id>.json` under `access_coverage_gaps`, and records the skipped VIX date catalogue in `coverage/<run-id>.json`. It continues collecting stock/option panels and returns exit code `2` for reported coverage gaps. Unexpected permission or terminal failures still stop the run. Access boundaries are not guarantees of complete observations.
+Entry limits apply **once, when a contract joins the cohort**. A contract stays tracked when it moves away from the target moneyness, falls below seven days to expiration, or disappears from a later discovery list. An absent observation produces a coverage gap, not removal from the sample. No option-volume, spread, or OI threshold censors quiet contracts.
 
-Normal runs request 60 earlier trading sessions of stock hourly/near-close quotes and EOD records. `--lookback-sessions` changes this collection buffer; `0` disables it. Stock requests are bounded by June 1, 2012, so the earliest study start has no accessible stock buffer. `collection_windows` records both the requested history start and inaccessible lookback dates. Rates and VIX EOD use the requested buffer subject to their separate access limits. The reported corporate-action gap extends through the study's end date plus the maximum selected DTE, since an option can expire after the study ends. Missing dividends and split events remain unknown; they cannot be treated as zero dividends or evidence that no split occurred. The lookback does not define a calibration window or guarantee continuous histories for the same option contracts.
+The first selection day's full requested observations are retained for retrospective research. `first_selected_date` and `first_selected_time` expose the selection timing; an afternoon-selected contract was not necessarily known to be in the sample that morning. Dated lists do not establish exact intraday listing times. The fixed modern ticker universe also does not reconstruct historical market membership.
 
-Responses download to disk and convert to Parquet in batches. Strict CSV checks reject extra/missing fields and malformed records at every batch boundary. Quality diagnostics run before the quote storage filter, so excluded rows cannot hide a malformed or misrouted response. Retained observations keep raw values, conditions, row order, duplicates, and separate clock meanings. Session coverage checks every selected contract, including absent hourly samples, near-close snapshots, and daily EOD reports. A nonempty bulk response containing only unselected contracts still produces a selected-sample coverage gap. Quote cache identities include the exact retained contracts; changing the selection can require another bulk download. Existing full-response files are not rewritten. The explicit `--store-raw-payloads` option retains complete CSV responses, including excluded quotes, at additional storage cost; failed responses retain their original bytes for inspection. Daily rate/index reports list exchange sessions without a dated observation, including possible differences in publisher holidays. Empty OI responses are not automatically treated as failures. Older parsed caches that lack strict CSV validation require new downloads.
+### Access and inputs still missing
 
-Stock references at 10:30, 13:30, and 15:30 New York time select the research contracts; these times align with the hourly grid. References outside an early-close session are omitted. The combined universe remains an observed list, not proof of complete historical listings. Evaluation samples, regimes, and pricing inputs are left to later work. The current collection supports hourly/daily comparisons; directly studying exact trade gaps would require a separate collection design.
+| Input | Current account and behavior |
+| --- | --- |
+| Stock/option history | Pro permits history from June 2012, but ticker/date coverage varies. Successfully refreshed date catalogues identify unlisted underlying quote/activity dates to skip; catalogue failures never justify skipping. A listed date does not prove access or complete observations. |
+| Dividends and splits | Unavailable from the current Theta v3 API: live requests returned 404 and the [migration guide](https://docs.thetadata.us/Articles/Getting-Started/v2-migration-guide.html) marks them as coming soon. Recorded as gaps, never zero dividends or no splits. |
+| Rates before 2024 | Missing with the account's free rate access. A separately held Interest Rates Value tier can be declared with `--rate-subscription value`. |
+| SPX and VIX index levels | Missing without a separate index subscription. Indices Pro begins in 2017; Standard in 2022; Value in 2023. Flags declare existing access and do not purchase it. |
+| Exact historical option terms | Verified multipliers, adjusted deliverables, exercise/settlement terms, and last trading timestamps remain unavailable/unverified. Empty fields and explicit gaps prevent assuming every stock option delivers 100 shares. |
 
-Run `python collector.py --symbols SPY AAPL --start 2012-06-01 --end 2025-12-31 --coverage-only` with Theta Terminal v3 running to check available stock dates before downloading history; the VIX catalogue is included only with index access. `--references-only` collects the accessible reference bundle without stock/option panels. [Theta's history limits](https://docs.thetadata.us/Articles/Data-And-Requests/Making-Requests.html) exclude SPY underlying data before 2020. Older option history does not supply the missing underlying quotes needed for selection. Earlier years therefore form an uneven cross-asset sample, not the same 21 assets observed continuously since 2012. A fixed modern ticker universe also does not represent historical market membership.
+Product-context labels accompany cohorts: stock/ETF options are ordinarily American and physically settled; SPX/SPXW are European and cash settled, with AM/PM labels respectively. These labels do **not** certify a particular historical contract's terms. AM settlement can end trading before the expiration date; coverage flags at expiration are not automatically vendor errors. See [Theta's root symbology](https://docs.thetadata.us/Articles/Data-And-Requests/Symbology.html) and [Cboe's SPX specifications](https://www.cboe.com/tradable_products/sp_500/spx_weekly_options/specifications).
 
-For the extended window, earlier discount-rate inputs need separate historical-rate access. SOFR only began publication in 2018; collecting a longer range cannot create earlier SOFR observations. The collector retains Treasury series for later research choices rather than substituting invented SOFR values. See the [Federal Reserve's explanation of SOFR history](https://www.federalreserve.gov/econres/notes/feds-notes/historical-proxies-for-the-secured-overnight-financing-rate-20190715.html). Adjusted option deliverables, historical symbol mappings, and reference-data vintages remain unverified. The collector reports observed gaps without filling them from another vendor; completed requests do not establish complete research coverage.
+SPX/SPXW form an opt-in benchmark using the **SPX index level**, with the option root kept separate from its underlying. Preview with `python collector.py --symbols SPX SPXW --start 2019-01-02 --end 2019-01-04 --plan`. With the current account, index-price access is reported missing and these panels cannot enroll contracts by moneyness. If Indices Pro is later held, adding `--index-subscription pro` enables the relevant price requests. The benchmark uses the same XNYS regular-session observation window, not every extended-hours SPX session. Historical SPXQ/SPXPM roots are outside this benchmark.
 
-No validated BSM or TFBSM pricer, calibration routine, frequency-comparison experiment, or empirical result is included yet. Implementation is being reviewed in pull requests before inclusion on `main`.
+[An et al.](https://doi.org/10.1007/s11075-023-01563-4) used daily OptionMetrics SPX/SPXW histories, midpoint prices, activity/OI, index prices, and Treasury rates matched to maturity. Cohort continuity and these inputs matter more for comparison than tick data. Theta's history cannot reproduce their 2008 sample. SPY ETF options also differ from their European cash-settled index options. The present collection does not yet supply every input needed for a fully controlled pricing comparison.
+
+### Batching, storage, and resume
+
+Each option root advances chronologically in monthly checkpoints. Four roots run concurrently without waiting at a global end-of-day barrier; all requests share the **eight-slot Pro limit**. Quotes, prices, activity, EOD, and near-close requests use date ranges where supported. Batches split at month boundaries, early closes, and excluded dates. Quote/trade discovery lists and OI remain dated. Selected-option requests specify one expiration with all strikes/both rights, then retain only each enrolled contract's date window. Request identities include those windows. See [monthly quote limits](https://docs.thetadata.us/operations/option_history_quote.html) and [account-wide concurrency](https://docs.thetadata.us/Articles/Data-And-Requests/Concurrent-Requests.html).
+
+Before a cohort can exist, dates explicitly absent from the underlying quote catalogue do not trigger broad option-chain downloads. They remain reported gaps. Later underlying-data gaps do not stop requests for an already enrolled cohort. A failed or unavailable catalogue never supplies evidence for skipping.
+
+Successful responses are packed into shared compressed Parquet files. A SQLite index replaces the old per-request metadata and pointer files. Packing preserves response row groups, order, duplicates, and vendor columns; it publishes new locations before removing individual response files. Failed response bytes remain available, and a failed refresh never displaces the last successful response. `--store-raw-payloads` additionally saves full successful CSV responses, including unselected strikes, at extra storage cost.
+
+The output layout is:
+
+```text
+index.sqlite3                       # response receipts, latest successes, session summaries, code hashes
+parquet/<dataset>/symbol=.../month=.../  # shared response Parquet files
+responses/<attempt-id>.parquet      # individual checkpoints awaiting packing
+responses/<attempt-id>.csv          # retained raw/failure payloads
+collection/<policy-id>/months/      # monthly manifests and incoming-cohort identity
+collection/<policy-id>/tables/      # monthly membership, universes, cohort checkpoints
+collection/<policy-id>/availability.csv # one row per entry/follow-up session; no repeated monthly byte sums
+collection/<policy-id>/runs/        # exact run scope, outcome, versions and source hashes
+coverage/                          # dated vendor catalogue evidence
+references/                        # downloaded references and explicit missing-input ledger
+```
+
+Response metadata is readable through `RequestStore.metadata(receipt)`. Its `data.path` and `data.row_groups` locate the response inside a shared Parquet file; `RequestStore.read(receipt)` resolves this automatically. The SQLite `responses.meta` column is plain JSON, and `sessions.manifest` contains each day's coverage and selection references. The `code` table maps a code digest to the full package source hashes.
+
+Schema v6 changes the sample and checkpoint layout. Existing caches and smoke-test outputs remain untouched and readable; identical compatible raw requests can be reused. Old daily manifests cannot satisfy cohort collection. Both entry-window dates are part of the policy identity because they determine which contracts can enter; changing worker counts does not change that identity. A failed discovery month must be retried before advancing that root's cohort. Resume checks completed requests and artifacts even when coverage gaps were recorded.
+
+A 60-session underlying lookback remains separate from contract enrollment. Reference rates extend over the possible follow-up tail, subject to access; missing corporate events are reported through the study end plus maximum entry DTE. Neither that buffer nor requested follow-through guarantees continuous observations or chooses a calibration window. Runs with known missing inputs return `2`; request/processing failures return `1`.
+
+No validated pricer, calibration routine, or empirical result is included. These changes remain under review before inclusion on `main`.
+
+The September 12 live check of this layout used a fresh collector cache for SPY/AAPL on June 2–3, 2025: **61 successful requests, 70,532 saved rows, 24.07 seconds, 33 files, 1.63 MB**. Selected quotes/EOD observations were present; absent option activity bars remained explicit gaps. A recovery check reused saved responses with no downloads, and monthly resume checks passed. This bounded check excluded catalogues, references, and the expiration tail. The broader cohort sample and extra activity fields differ from the earlier smoke test, so neither timing nor storage is a full-history forecast. Data and measurement reports stay local.
 
 ## Running and reading the collector
 
@@ -90,14 +132,14 @@ python collector.py --symbols SPY --start 2025-01-02 --end 2025-01-03 --plan
 
 To preview the full default Pro history, run `python collector.py --plan`. Keep the default reference tiers for Stocks Pro and Options Pro alone. If the account later also has Indices Pro and Interest Rates Value, declare them with `--index-subscription pro --rate-subscription value`; the preview shows any remaining access gaps before downloading.
 
-The implementation has ten modules with distinct jobs. Start with `config.py`, then `Collector.run()` in `workflow.py`: it checks date coverage, collects references, and collects stock/option sessions. `Collector.collect_day()` shows the work for one underlying and date.
+The implementation has ten modules with distinct jobs. Start with `config.py`, then `Collector.run()` in `workflow.py`: it checks date coverage, collects references, and collects stock/option sessions. `Collector.collect_month()` shows dated entry selection followed by batched cohort collection.
 
 One `CollectorConfig` holds the requested symbols, dates, mode, rate series, and collection settings. The CLI parses and previews this configuration; it does not manage collection workers or saved run status. Request builders read the same configuration instead of receiving repeated copies of the run scope. Storage owns output paths and the response-reuse check shared by cache lookup and session resume. Coverage owns both observation checks and the resulting reports.
 
 | File | What to read it for |
 | --- | --- |
 | [`config.py`](tfbsm_collector/config.py) | Study universe, DTE and S/K targets, sampling times, subscription limits, and download settings. |
-| [`workflow.py`](tfbsm_collector/workflow.py) | `Collector.run` and `collect_day`: run order, reference/session collection, cancellation, and final run status. |
+| [`workflow.py`](tfbsm_collector/workflow.py) | `Collector.run` and `collect_month`: run order, reference/session collection, cancellation, and final run status. |
 | [`planning.py`](tfbsm_collector/planning.py) | Exact Theta request identities, required fields, clock meanings, and calendar-aware request construction. |
 | [`selection.py`](tfbsm_collector/selection.py) | Dated contract discovery, stock selection references, and the maturity/moneyness grid. |
 | [`transport.py`](tfbsm_collector/transport.py) | HTTP streaming, shared request limits, retry behavior, and cancellation. |
@@ -109,9 +151,7 @@ One `CollectorConfig` holds the requested symbols, dates, mode, rate series, and
 
 Docstrings and comments follow the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html): docstrings describe each interface with `Args`, `Returns`/`Yields`, and `Raises` where useful; nearby comments explain financial and collection decisions. Module imports make it clear which file owns an operation. Ruff checks the Google docstring convention and keeps formatting consistent through `pyproject.toml`.
 
-The module split preserves request IDs, sampling-policy IDs, output schemas, and existing cache paths. New run records include `code_files`, a mapping from repository-relative Python source paths to SHA-256 hashes; `code_sha256` hashes that mapping. Response metadata stores the same information as `collector_code_files` and `collector_code_sha256`. This covers the launcher and the whole package. Older records retain their original single-file fingerprint and can still be read. A source-layout change alone does not require a new data schema version.
-
-The unused importer for the older pre-PR cache layout has been removed. This does not remove data files or change resume support for the request-keyed caches and session manifests already produced by this PR. Date parsing is shared between response identity checks and diagnostic summaries; vendor text and stored observation schemas stay unchanged.
+A package-layout change alone does not require a new schema version. This update does, because following contracts changes the sample and resume dependencies. Source fingerprints cover the launcher and every package module. Collection inputs and downloaded market values remain separate from future pricing and analysis code.
 
 Run the maintained offline checks without Theta credentials or a running terminal:
 

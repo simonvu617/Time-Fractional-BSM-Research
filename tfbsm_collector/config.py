@@ -17,9 +17,9 @@ import pandas as pd
 
 from tfbsm_collector import provenance
 
-# Saved layout/meaning determines resume compatibility. A source-file move
-# does not change that contract, so the output schema version stays the same.
-OUTPUT_SCHEMA_VERSION = "2026-09-08-selected-quotes-v5"
+# v6 introduces cohorts and monthly checkpoints. Old request caches remain
+# readable, but old daily selections cannot stand in for this different sample.
+OUTPUT_SCHEMA_VERSION = "2026-09-12-expiry-cohorts-v6"
 
 # Resolve from the repository root so splitting the package does not move
 # existing caches into a new data directory.
@@ -69,16 +69,28 @@ class SymbolConfig:
     """An underlying and its fixed study labels.
 
     Attributes:
-        symbol: Theta ticker used in requests.
-        asset_type: ETF or EQUITY for later cross-asset comparisons.
+        symbol: Theta option root used in requests.
+        asset_type: ETF, EQUITY, or INDEX for later cross-asset comparisons.
         universe_bucket: Study group, not historical index membership.
         sector_proxy: Descriptive sector label, not a dated classification.
+        underlying_symbol: Price ticker when it differs from the option root.
     """
 
     symbol: str
     asset_type: str
     universe_bucket: str
     sector_proxy: str
+    underlying_symbol: str = ""
+
+    @property
+    def underlying(self) -> str:
+        """The price ticker, which can differ from the option root."""
+        return self.underlying_symbol or self.symbol
+
+    @property
+    def price_asset(self) -> str:
+        """The Theta price endpoint family for this underlying."""
+        return "index" if self.asset_type == "INDEX" else "stock"
 
 
 # This fixed cross-asset sample is not a reconstruction of all past listings.
@@ -107,6 +119,14 @@ UNIVERSE = [
     SymbolConfig("RIOT", "EQUITY", "small_cap_equity", "crypto_exposed"),
 ]
 
+# An opt-in benchmark: both option roots reference SPX, never SPY. Their
+# underlying prices require a separate index entitlement. Historical product
+# terms and adjusted deliverables still need verification before pricing.
+INDEX_BENCHMARK = (
+    SymbolConfig("SPX", "INDEX", "index_benchmark", "broad_market", "SPX"),
+    SymbolConfig("SPXW", "INDEX", "index_benchmark", "broad_market", "SPX"),
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class CollectorConfig:
@@ -118,8 +138,8 @@ class CollectorConfig:
     Attributes:
         base_url: URL of the running Theta Terminal v3 service.
         start_date: Default inclusive study start; Pro history begins June 2012.
-        end_date: Default inclusive study end. Use --end for later completed
-            dates without changing this default.
+        end_date: Last date for selecting new contracts. Follow-up extends
+            through their expirations, limited to completed historical dates.
         symbols: Underlyings selected from the fixed research universe.
         rate_symbols: Theta rate series shared across the underlyings.
         mode: Collect panels, references only, or date coverage only.
@@ -129,7 +149,8 @@ class CollectorConfig:
         option_rights: Call (right to buy at the strike) and/or put (right to
             sell).
         target_dtes: Preferred calendar-day distances to expiration.
-        max_expirations_per_day: Maximum selected expirations per underlying.
+        max_expirations_per_day: Maximum expirations in one day's new selection;
+            previously enrolled expirations remain tracked separately.
         moneyness_targets: Target underlying-price/strike ratios, S/K.
         strikes_per_moneyness_target: Listed strikes nearest each target.
         min_dte: Inclusive minimum calendar days to expiration.
@@ -143,7 +164,7 @@ class CollectorConfig:
         selection_times: Exchange-local HH:MM:SS times for stock references.
         max_stock_quote_age_seconds: Maximum age of a sampled stock record at
             selection time; does not measure the quote event's age.
-        max_symbol_day_workers: Concurrent underlying/day tasks.
+        max_symbol_workers: Concurrent roots, each advancing months in order.
         max_batch_workers: Concurrent downloads within each batch.
         max_inflight_requests: Shared HTTP cap, at most eight for Pro.
         max_requests_per_second: Shared request-start limit; zero disables it.
@@ -171,6 +192,9 @@ class CollectorConfig:
     target_dtes: tuple[int, ...] = (7, 14, 30, 60, 120)
     max_expirations_per_day: int = 5
 
+    # The denser central grid retains nearby strikes around S/K=1. This helps
+    # comparisons within the narrow near-money bins used in An et al.; it does
+    # not assert that every target has a distinct listed strike.
     # Moneyness is S/K: at S=$100, target 0.80 seeks K=$125. Values above one
     # are in the money for calls and out of the money for puts.
     moneyness_targets: tuple[float, ...] = (
@@ -178,7 +202,11 @@ class CollectorConfig:
         0.85,
         0.90,
         0.95,
+        0.975,
+        0.99,
         1.00,
+        1.01,
+        1.025,
         1.05,
         1.10,
         1.20,
@@ -199,9 +227,9 @@ class CollectorConfig:
     # A 12:30 sample cannot supply the 13:30 reference under this tolerance.
     # The timestamp does not reveal when the underlying quote last changed.
     max_stock_quote_age_seconds: int = 70
-    max_symbol_day_workers: int = 4
+    max_symbol_workers: int = 4
     # A single reference batch can now occupy all eight Pro HTTP slots.
-    # Four symbol-day workers already provide enough independent batches.
+    # Four symbol workers provide independent monthly batches.
     max_batch_workers: int = 8
     # This account-wide budget is not eight slots per asset or worker. Lower it
     # when another client uses the same account; local locks cannot track that.
@@ -254,7 +282,7 @@ class CollectorConfig:
         for name in (
             "max_expirations_per_day",
             "strikes_per_moneyness_target",
-            "max_symbol_day_workers",
+            "max_symbol_workers",
             "max_batch_workers",
             "max_inflight_requests",
             "max_stock_quote_age_seconds",
@@ -309,10 +337,13 @@ class CollectorConfig:
     def policy(self) -> dict:
         """Return the settings that determine the sample and its interpretation.
 
-        Worker counts, parsing batch size, and requested date scope are excluded:
-        changing them does not change an already collected session's sample.
+        Cohort entry depends on the study's start and end. Different entry
+        windows therefore get separate manifests, while identical raw requests
+        can still reuse the shared cache.
         """
         names = (
+            "start_date",
+            "end_date",
             "option_rights",
             "target_dtes",
             "max_expirations_per_day",
@@ -329,6 +360,7 @@ class CollectorConfig:
         )
         return {
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
+            "contract_followup": "through_expiration",
             **{name: getattr(self, name) for name in names},
         }
 

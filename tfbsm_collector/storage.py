@@ -1,7 +1,7 @@
 # Copyright 2026 Simon Vu
 # SPDX-License-Identifier: MIT
 
-"""Atomic artifacts, immutable response caches, and output locking.
+"""Atomic Parquet artifacts, compact response receipts, and output locking.
 
 RequestStore converts verified responses to compressed Parquet, publishes
 receipts, and reuses compatible caches. Session manifests refer to these files
@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import tempfile
 import threading
 import uuid
@@ -222,6 +223,80 @@ class RequestStore:
         # Requests sharing a key also share a lock. Unrelated requests may use
         # different locks and continue downloading concurrently.
         self.locks = tuple(threading.Lock() for _ in range(128))
+        self.index_lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def index(self):
+        """Open the compact receipt index for one short, serialized transaction.
+
+        Downloads and Parquet conversion happen outside this lock. SQLite
+        replaces millions of tiny metadata/pointer files; it is not the market
+        data format. Each committed response still identifies its Parquet rows.
+        """
+        with self.index_lock:
+            self.root.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(
+                sqlite3.connect(self.root / "index.sqlite3", timeout=30)
+            ) as db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS responses "
+                    "(attempt TEXT PRIMARY KEY, request_id TEXT, meta TEXT)"
+                )
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS latest "
+                    "(request_id TEXT PRIMARY KEY, attempt TEXT)"
+                )
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS sessions "
+                    "(policy TEXT, symbol TEXT, day TEXT, manifest TEXT, "
+                    "PRIMARY KEY(policy, symbol, day))"
+                )
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS code "
+                    "(sha256 TEXT PRIMARY KEY, files TEXT)"
+                )
+                with db:
+                    yield db
+
+    def metadata(self, record: dict) -> dict:
+        """Read response provenance, resolving any later storage compaction."""
+        if "attempt_id" not in record:
+            return read_json(self.root / record["metadata"]["path"])
+        with self.index() as db:
+            row = db.execute(
+                "SELECT meta FROM responses WHERE attempt=?",
+                (record["attempt_id"],),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Response receipt missing from index")
+        return json.loads(row[0])
+
+    def session(self, symbol: str, day: pd.Timestamp) -> dict:
+        """Read a session's coverage and selection provenance from the index."""
+        with self.index() as db:
+            row = db.execute(
+                "SELECT manifest FROM sessions WHERE policy=? AND symbol=? AND day=?",
+                (self.cfg.policy_id, symbol, str(day.date())),
+            ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"No session for {symbol} {day.date()}")
+        return json.loads(row[0])
+
+    def save_sessions(self, manifests: list[dict]) -> None:
+        """Commit completed session summaries together after their files exist."""
+        with self.index() as db:
+            db.executemany(
+                "INSERT OR REPLACE INTO sessions VALUES(?,?,?,?)",
+                [
+                    (
+                        self.cfg.policy_id,
+                        m["symbol"],
+                        m["trade_day"],
+                        json.dumps(m, separators=(",", ":"), allow_nan=False),
+                    )
+                    for m in manifests
+                ],
+            )
 
     def directory(self, request: planning.Request) -> pathlib.Path:
         """Return the cache directory for the request's dataset and identity."""
@@ -239,14 +314,6 @@ class RequestStore:
             / f"request={request.request_id}"
         )
 
-    def session_path(self, symbol: str, day: pd.Timestamp) -> pathlib.Path:
-        """Return the manifest path for an underlying and exchange session."""
-        return (
-            self.collection_dir
-            / "sessions"
-            / f"symbol={symbol}__date={day.date()}.json"
-        )
-
     def reusable(self, record: dict) -> bool:
         """Check a response receipt for both cache and session resume.
 
@@ -259,6 +326,16 @@ class RequestStore:
             return False
         if self.cfg.store_raw_payloads and not record.get("payload"):
             return False
+        if "attempt_id" in record:
+            try:
+                meta = self.metadata(record)
+                return all(
+                    artifact_valid(meta.get(name), self.root)
+                    for name in ("data", "payload")
+                    if name == "data" or meta.get(name)
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
         return all(
             artifact_valid(record.get(name), self.root)
             for name in ("data", "metadata", "payload")
@@ -276,6 +353,23 @@ class RequestStore:
             referenced artifacts pass validation. Retention and empty-response
             refresh settings can require a new download even if data exist.
         """
+        if (self.root / "index.sqlite3").exists():
+            with self.index() as db:
+                row = db.execute(
+                    "SELECT responses.meta FROM latest JOIN responses "
+                    "ON latest.attempt=responses.attempt WHERE latest.request_id=?",
+                    (request.request_id,),
+                ).fetchone()
+            if row:
+                meta = json.loads(row[0])
+                if (
+                    meta["request"] == request.identity()
+                    and meta["raw_schema_version"] == RAW_SCHEMA_VERSION
+                    and meta["timestamp_timezone"] == self.cfg.exchange_tz
+                ):
+                    record = self.record(request, meta)
+                    if self.reusable(record):
+                        return record
         path = self.directory(request) / "meta.json"
         try:
             # Current caches point to immutable attempts. Older caches can still
@@ -300,7 +394,10 @@ class RequestStore:
             return None
 
     def record(
-        self, request: planning.Request, meta: dict, meta_path: pathlib.Path
+        self,
+        request: planning.Request,
+        meta: dict,
+        meta_path: pathlib.Path | None = None,
     ) -> dict:
         """Return a compact manifest receipt referencing full response metadata.
 
@@ -324,7 +421,11 @@ class RequestStore:
             "error": meta.get("error", ""),
             "data": meta.get("data"),
             "payload": meta.get("payload"),
-            "metadata": file_receipt(meta_path, self.root),
+            **(
+                {"metadata": file_receipt(meta_path, self.root)}
+                if meta_path
+                else {"attempt_id": meta["attempt_id"]}
+            ),
         }
 
     def collect(
@@ -421,10 +522,10 @@ class RequestStore:
             Only successful attempts advance the reusable cache pointer; a
             failed refresh leaves the previous successful response available.
         """
-        cache_directory = self.directory(request)
         # An attempt gets new files, including on failure. Earlier run receipts
         # must keep pointing to the exact response they originally described.
-        directory = cache_directory / "responses" / uuid.uuid4().hex
+        attempt_id = uuid.uuid4().hex
+        directory = self.root / "responses"
         if isinstance(frames, pd.DataFrame):
             source = frames
             frames = (
@@ -441,7 +542,7 @@ class RequestStore:
         )
         excluded_rows = 0
 
-        data_path = directory / "data.parquet"
+        data_path = directory / f"{attempt_id}.parquet"
         writer, columns = None, []
         with atomic_output(data_path) as temp:
             try:
@@ -467,6 +568,25 @@ class RequestStore:
                         keep = planning.option_contract_keys(frame).isin(
                             retained
                         )
+                        excluded_rows += int((~keep).sum())
+                        frame = frame.loc[keep]
+                    if (
+                        request.retained_contract_windows is not None
+                        and not missing
+                    ):
+                        windows = {
+                            key: (start, end)
+                            for key, start, end in request.retained_contract_windows
+                        }
+                        keys = planning.option_contract_keys(frame)
+                        dates = (
+                            frame["collector_timestamp_utc"]
+                            .dt.tz_convert(self.cfg.exchange_tz)
+                            .dt.strftime("%Y-%m-%d")
+                        )
+                        starts = keys.map({k: v[0] for k, v in windows.items()})
+                        ends = keys.map({k: v[1] for k, v in windows.items()})
+                        keep = (dates.ge(starts) & dates.le(ends)).fillna(False)
                         excluded_rows += int((~keep).sum())
                         frame = frame.loc[keep]
 
@@ -519,6 +639,7 @@ class RequestStore:
             status = "no_data" if diagnostics.rows == 0 else "available"
 
         meta = {
+            "attempt_id": attempt_id,
             "request": request.identity(),
             "request_id": request.request_id,
             "raw_schema_version": RAW_SCHEMA_VERSION,
@@ -534,13 +655,13 @@ class RequestStore:
             "retention": {
                 "mode": "full_response"
                 if retained is None
-                else "selected_contracts",
+                and request.retained_contract_windows is None
+                else "selected_contract_windows",
                 "parsed_rows": diagnostics.rows,
                 "excluded_rows": excluded_rows,
             },
             "observation_semantics": request.observation_semantics(),
             "collector_code_sha256": self.code_sha256,
-            "collector_code_files": self.code_files,
             **response_meta,
         }
         meta["data"] = {
@@ -555,7 +676,7 @@ class RequestStore:
         if payload is not None and (
             self.cfg.store_raw_payloads or status not in GOOD_REQUEST_STATUSES
         ):
-            payload_path = directory / "raw_response.csv"
+            payload_path = directory / f"{attempt_id}.csv"
             with atomic_output(payload_path) as temp:
                 source = (
                     io.BytesIO(payload)
@@ -567,18 +688,31 @@ class RequestStore:
                     shutil.copyfileobj(source, handle, length=256 * 1024)
             meta["payload"] = file_receipt(payload_path, self.root)
 
-        write_json(directory / "meta.json", meta)
-        record = self.record(request, meta, directory / "meta.json")
-        # Advance the reusable pointer only after success. A failed refresh must
-        # leave the previous good response available for another run.
-        if status in GOOD_REQUEST_STATUSES:
-            write_json(
-                cache_directory / "latest.json",
-                {"metadata": record["metadata"]},
+        with self.index() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO code VALUES(?,?)",
+                (self.code_sha256, json.dumps(self.code_files)),
             )
-        return record
+            db.execute(
+                "INSERT INTO responses VALUES(?,?,?)",
+                (
+                    attempt_id,
+                    request.request_id,
+                    json.dumps(meta, separators=(",", ":"), allow_nan=False),
+                ),
+            )
+            # Advance the reusable pointer only after success. A failed refresh must
+            # leave the previous good response available for another run.
+            if status in GOOD_REQUEST_STATUSES:
+                db.execute(
+                    "INSERT OR REPLACE INTO latest VALUES(?,?)",
+                    (request.request_id, attempt_id),
+                )
+        return self.record(request, meta)
 
-    def read(self, record: dict) -> pd.DataFrame:
+    def read(
+        self, record: dict, day: pd.Timestamp | None = None
+    ) -> pd.DataFrame:
         """Return a successful saved table, or an empty table for a failed pull.
 
         Use iter_frames for large responses; this method loads the full table.
@@ -587,22 +721,136 @@ class RequestStore:
             "data"
         ):
             return pd.DataFrame()
-        return pd.read_parquet(self.root / record["data"]["path"])
+        frames = list(self.iter_frames(record, day=day))
+        return (
+            pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        )
 
-    def iter_frames(self, record: dict, columns: list[str] | None = None):
+    def iter_frames(
+        self,
+        record: dict,
+        columns: list[str] | None = None,
+        day: pd.Timestamp | None = None,
+    ):
         """Yield bounded Parquet batches from a successful saved response.
 
         Args:
             record: Request receipt containing status and a data artifact.
             columns: Optional vendor/parsed columns to read; None reads them
                 all.
+            day: Optional exchange-local date slice from a monthly response.
 
         Yields:
             DataFrames in stored order. Failed or absent data yield no batches.
         """
         if record["status"] in GOOD_REQUEST_STATUSES and record.get("data"):
-            with pq.ParquetFile(self.root / record["data"]["path"]) as parquet:
+            data = (
+                self.metadata(record)["data"]
+                if "attempt_id" in record
+                else record["data"]
+            )
+            with pq.ParquetFile(self.root / data["path"]) as parquet:
+                if data.get("row_groups") == []:
+                    empty = parquet.schema_arrow.empty_table().to_pandas()
+                    yield empty if columns is None else empty.loc[:, columns]
+                    return
                 for batch in parquet.iter_batches(
-                    batch_size=self.cfg.raw_chunk_rows, columns=columns
+                    batch_size=self.cfg.raw_chunk_rows,
+                    columns=columns,
+                    row_groups=data.get("row_groups"),
                 ):
-                    yield batch.to_pandas()
+                    frame = batch.to_pandas()
+                    if day is not None:
+                        column = next(
+                            (
+                                c
+                                for c in ("timestamp", "created", "date")
+                                if c in frame
+                            ),
+                            None,
+                        )
+                        if column:
+                            dates = pd.to_datetime(
+                                frame[column], format="mixed", errors="coerce"
+                            ).dt.strftime("%Y-%m-%d")
+                            frame = frame.loc[dates.eq(str(day.date()))]
+                    yield frame
+
+    def compact(self, records: list[dict], label: str) -> None:
+        """Pack successful responses into shared Parquet files by schema.
+
+        Row-group locators preserve response order, duplicate rows, and every
+        vendor field. Publish new locations in one SQLite transaction before
+        deleting the superseded individual files. A failed refresh never
+        replaces a successful response. Existing legacy caches are untouched.
+        """
+        groups = {}
+        for record in records:
+            if (
+                "attempt_id" not in record
+                or record["status"] not in GOOD_REQUEST_STATUSES
+            ):
+                continue
+            meta = self.metadata(record)
+            if "row_groups" in meta["data"]:
+                continue
+            path = self.root / meta["data"]["path"]
+            schema = pq.read_schema(path)
+            key = (record["dataset"], str(schema.remove_metadata()))
+            groups.setdefault(key, {})[record["attempt_id"]] = meta
+        for (dataset, _), attempts in groups.items():
+            path = (
+                self.root
+                / "parquet"
+                / dataset
+                / label
+                / f"{uuid.uuid4().hex}.parquet"
+            )
+            old_paths, updated = [], []
+            with atomic_output(path) as temp:
+                writer, group_index = None, 0
+                try:
+                    for meta in attempts.values():
+                        old = self.root / meta["data"]["path"]
+                        with pq.ParquetFile(old) as source:
+                            if writer is None:
+                                writer = pq.ParquetWriter(
+                                    temp,
+                                    source.schema_arrow,
+                                    compression="zstd",
+                                )
+                            row_groups = []
+                            for batch in source.iter_batches(
+                                batch_size=self.cfg.raw_chunk_rows
+                            ):
+                                writer.write_batch(
+                                    batch, row_group_size=len(batch)
+                                )
+                                row_groups.append(group_index)
+                                group_index += 1
+                        old_paths.append(old)
+                        updated.append((meta, row_groups))
+                finally:
+                    if writer:
+                        writer.close()
+            receipt = file_receipt(path, self.root)
+            with self.index() as db:
+                for meta, row_groups in updated:
+                    meta["data"] = {
+                        **receipt,
+                        "row_groups": row_groups,
+                        "response_rows": meta["row_count"],
+                    }
+                    db.execute(
+                        "UPDATE responses SET meta=? WHERE attempt=?",
+                        (
+                            json.dumps(
+                                meta, separators=(",", ":"), allow_nan=False
+                            ),
+                            meta["attempt_id"],
+                        ),
+                    )
+            for old in old_paths:
+                # Only individually saved response files owned by this store
+                # are removed; retained failure/raw payloads remain beside them.
+                old.unlink(missing_ok=True)

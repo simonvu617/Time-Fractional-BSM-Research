@@ -176,7 +176,13 @@ def raw_frame_with_diagnostics(
                 .drop_duplicates()
                 .sort_values()
             )
-            gaps = unique.diff().dt.total_seconds().dropna()
+            local_dates = unique.dt.tz_convert(cfg.exchange_tz).dt.date
+            gaps = (
+                unique.diff()
+                .dt.total_seconds()
+                .loc[local_dates.eq(local_dates.shift())]
+                .dropna()
+            )
 
             # At 1h, 10:30 to 13:30 misses 11:30 and 12:30. The tolerance
             # prevents floating-point noise from adding a slot; session coverage
@@ -249,6 +255,17 @@ def _response_identity_issues(
             requested_day = pd.Timestamp(
                 request.params.get("date", request.params.get("start_date"))
             )
+            # In a multi-day report the DTE bound is relative to each report's
+            # date, not the first day of the request.
+            for clock in ("collector_timestamp_utc", "collector_created_utc"):
+                if clock in frame:
+                    requested_day = (
+                        frame[clock]
+                        .dt.tz_convert(cfg.exchange_tz)
+                        .dt.tz_localize(None)
+                        .dt.normalize()
+                    )
+                    break
 
             if (
                 (expiry - requested_day)
@@ -385,6 +402,8 @@ class RawDiagnostics:
                 if (
                     name == "timestamp"
                     and "absent_interior_sample_slots" in quality
+                    and valid.iloc[0].tz_convert(self.cfg.exchange_tz).date()
+                    == previous.tz_convert(self.cfg.exchange_tz).date()
                 ):
                     gap = (
                         valid.iloc[0] - previous

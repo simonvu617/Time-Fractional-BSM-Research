@@ -25,6 +25,91 @@ SELECTION_COLUMNS = (
     "discovery_sources",
 )
 
+COHORT_COLUMNS = (
+    *SELECTION_COLUMNS,
+    "first_selected_date",
+    "first_selected_time",
+    "underlying_symbol",
+    "exercise_style",
+    "settlement_type",
+    "settlement_session",
+    "contract_multiplier",
+    "deliverable",
+    "last_trading_timestamp",
+    "terms_status",
+)
+
+
+def extend_cohort(
+    cohort: pd.DataFrame,
+    chosen: pd.DataFrame,
+    day: pd.Timestamp,
+    symbol: config.SymbolConfig,
+) -> pd.DataFrame:
+    """Enroll new identities once and keep their original selection evidence.
+
+    Product labels are context, not validated historical contract specifications.
+    In particular, a standard 100-share assumption would misprice adjusted stock
+    options. Leave unverified multipliers, deliverables, and last-trading times
+    empty instead of treating missing contract metadata as a standard contract.
+    """
+    fresh = chosen.loc[
+        ~chosen["contract_key"].isin(cohort["contract_key"])
+    ].copy()
+    if fresh.empty:
+        return cohort
+    fresh["first_selected_date"] = str(day.date())
+    fresh["first_selected_time"] = (
+        fresh["selection_times"].str.split("|").str[0]
+    )
+    fresh["underlying_symbol"] = symbol.underlying
+    is_index = symbol.asset_type == "INDEX"
+    fresh["exercise_style"] = "European" if is_index else "American"
+    fresh["settlement_type"] = "cash" if is_index else "physical"
+    fresh["settlement_session"] = (
+        "AM"
+        if symbol.symbol == "SPX"
+        else "PM"
+        if symbol.symbol == "SPXW"
+        else ""
+    )
+    for column in (
+        "contract_multiplier",
+        "deliverable",
+        "last_trading_timestamp",
+    ):
+        fresh[column] = ""
+    fresh["terms_status"] = (
+        "product_context_only; historical_contract_terms_unverified"
+    )
+    return pd.concat([cohort, fresh], ignore_index=True).loc[:, COHORT_COLUMNS]
+
+
+def index_selection_references(
+    frames: Iterable[pd.DataFrame],
+    day: pd.Timestamp,
+    cfg: config.CollectorConfig,
+) -> list[dict]:
+    """Use the actual index level for S/K selection, with the same clock checks.
+
+    Index values are not bid/ask quotes. The adapter reuses the selection clock
+    policy on copies, then labels the resulting references as index prices.
+    """
+
+    def prices_as_quotes():
+        for frame in frames:
+            yield frame.assign(
+                bid=frame["price"],
+                ask=frame["price"],
+                bid_condition="",
+                ask_condition="",
+            )
+
+    references = stock_selection_references(prices_as_quotes(), day, cfg)
+    for reference in references:
+        reference["underlying_price_source"] = "index_price"
+    return references
+
 
 def normalize_chain(
     frame: pd.DataFrame, symbol: str, cfg: config.CollectorConfig
