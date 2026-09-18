@@ -422,7 +422,12 @@ class Collector:
                 and manifest["request_error_count"] == 0
                 and all(
                     storage.artifact_valid(manifest[name], self.cfg.output_dir)
-                    for name in ("contracts", "universes", "cohort")
+                    for name in (
+                        "contracts",
+                        "cross_sections",
+                        "universes",
+                        "cohort",
+                    )
                 )
                 and all(
                     self.store.reusable(record)
@@ -458,7 +463,7 @@ class Collector:
                 if self.cfg.index_history_start is None
                 else days[days >= pd.Timestamp(self.cfg.index_history_start)]
             )
-        # A weekly entry needs the underlying price for S/K selection. Skip
+        # Each entry needs the underlying price for S/K selection. Skip
         # discovery when that reference is known to be unavailable, while
         # follow-up below keeps existing contracts through underlying-data gaps.
         quote_kind = "price" if symbol.price_asset == "index" else "quote"
@@ -480,7 +485,7 @@ class Collector:
         )
         self.store.client.check_running()
         daily = []
-        selections, universes = [], []
+        selections, cross_sections, universes = [], [], []
         by_day = {day: [] for day in days}
         for request in requests:
             for day in planning.request_days(request):
@@ -507,6 +512,7 @@ class Collector:
         for day in days:
             entry_day = str(day.date()) <= self.cfg.end_date
             enroll = planning.is_enrollment_day(day, self.cfg)
+            weekly_entry = planning.is_weekly_enrollment_day(day, self.cfg)
             discovery = {
                 kind: table(dataset, day)
                 for kind, dataset in (
@@ -565,6 +571,23 @@ class Collector:
                 if at
                 not in {reference["selection_time"] for reference in references}
             ]
+            selection_status = (
+                "not_scheduled"
+                if not enroll
+                else "observed"
+                if discovery_complete and references and not missing
+                else "incomplete"
+            )
+            # Save today's grid even for contracts already enrolled earlier.
+            # First-entry dates alone cannot reconstruct a fresh cross-section
+            # or identify when a daily entrant later joins the weekly sample.
+            cross_sections.append(
+                chosen.assign(
+                    trade_day=str(day.date()),
+                    weekly_entry_day=weekly_entry,
+                    selection_status=selection_status,
+                )
+            )
             daily.append(
                 {
                     "symbol": symbol.symbol,
@@ -572,7 +595,12 @@ class Collector:
                     "trade_day": str(day.date()),
                     "entry_window": entry_day,
                     "enrollment_scheduled": enroll,
+                    "weekly_entry_day": weekly_entry,
                     "policy_id": self.cfg.policy_id,
+                    "cross_section_status": selection_status,
+                    "cross_section_contract_count": len(chosen)
+                    if selection_status == "observed"
+                    else None,
                     "newly_selected_contract_count": len(cohort) - prior_count,
                     "selected_contract_count": len(active),
                     # Planned omissions are not empty chains. An incomplete
@@ -691,6 +719,7 @@ class Collector:
         artifacts = {}
         for name, frame in (
             ("contracts", selected_table),
+            ("cross_sections", pd.concat(cross_sections, ignore_index=True)),
             ("universes", universe_table),
             (
                 "cohort",

@@ -314,7 +314,16 @@ def session_bounds(
 
 
 def is_enrollment_day(day: pd.Timestamp, cfg: config.CollectorConfig) -> bool:
-    """Select once per exchange week, including a partial first study week.
+    """Apply the entry schedule to an exchange session supplied by the planner."""
+    if cfg.enrollment_frequency == "weekly":
+        return is_weekly_enrollment_day(day, cfg)
+    return pd.Timestamp(cfg.start_date) <= day <= pd.Timestamp(cfg.end_date)
+
+
+def is_weekly_enrollment_day(
+    day: pd.Timestamp, cfg: config.CollectorConfig
+) -> bool:
+    """Identify weekly comparison entries, including a partial first study week.
 
     Calendar closures move Monday's selection to the next exchange session.
     Missing vendor data do not move selection: that would make entry depend on
@@ -542,7 +551,7 @@ def underlying_requests(
 def discovery_requests(
     cfg: config.CollectorConfig, symbol: str, days
 ) -> list[Request]:
-    """Collect full candidate evidence only on weekly enrollment dates.
+    """Collect dated candidate evidence on the configured enrollment dates.
 
     Listing requests remain dated even though their small responses are packed
     together on disk. An expiration observed later must not enter an earlier
@@ -633,7 +642,7 @@ def followup_requests(
                 )
             )
     # Keep the efficient bulk EOD request, but save only enrolled identities on
-    # their tracked dates. Weekly discovery documents the broader universe.
+    # their tracked dates. Enrollment discovery documents the broader universe.
     # EOD is a report, so it can span early closes without changing its clock.
     for batch in date_batches(days, cfg, intraday=False):
         windows = _cohort_windows(cohort, batch)

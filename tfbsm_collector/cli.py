@@ -62,6 +62,12 @@ def parse_run_scope(
         help="Last date for selecting new contracts; existing cohorts are followed through expiration",
     )
     parser.add_argument(
+        "--enrollment-frequency",
+        choices=("daily", "weekly"),
+        default=defaults.enrollment_frequency,
+        help="Refresh the selected moneyness/DTE cross-section daily (default), or collect a smaller weekly-entry cohort",
+    )
+    parser.add_argument(
         "--lookback-sessions",
         type=int,
         default=defaults.lookback_sessions,
@@ -162,6 +168,7 @@ def parse_run_scope(
             rate_symbols=tuple(sorted(set(args.rate_symbols))),
             start_date=args.start,
             end_date=args.end,
+            enrollment_frequency=args.enrollment_frequency,
             index_subscription=args.index_subscription,
             rate_subscription=args.rate_subscription,
             quote_interval=args.quote_interval,
@@ -195,10 +202,18 @@ def _print_scope(cfg: config.CollectorConfig) -> None:
     )
     if panels:
         print(
-            "Monthly date batches: underlying prices/activity and option quotes/activity per tracked expiration; weekly discovery and daily tracked OI"
+            f"Monthly date batches: underlying prices/activity and option quotes/activity per tracked expiration; {cfg.enrollment_frequency} discovery and daily tracked OI"
+        )
+        schedule = (
+            "each exchange session"
+            if cfg.enrollment_frequency == "daily"
+            else "first exchange session of each week"
         )
         print(
-            f"Entry: first exchange session of each week within the entry window at {', '.join(cfg.selection_times)} ET; DTE {cfg.min_dte}-{cfg.max_dte}"
+            f"Entry: {schedule} within the entry window at {', '.join(cfg.selection_times)} ET; DTE {cfg.min_dte}-{cfg.max_dte}"
+        )
+        print(
+            "Sample views: dated cross_sections plus daily tracked contracts; weekly entry dates marked for comparison"
         )
         print(
             f"Follow selected contracts at {cfg.quote_interval} intervals through expiration; retain option EOD only for tracked contract dates"

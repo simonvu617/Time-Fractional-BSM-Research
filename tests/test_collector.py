@@ -232,7 +232,9 @@ class PlanningAndSelectionTest(unittest.TestCase):
         self,
     ):
         cfg = config.CollectorConfig(
-            start_date="2025-01-02", end_date="2025-02-04"
+            start_date="2025-01-02",
+            end_date="2025-02-04",
+            enrollment_frequency="weekly",
         )
         days = planning.exchange_calendar().sessions_in_range(
             cfg.start_date, cfg.end_date
@@ -262,6 +264,20 @@ class PlanningAndSelectionTest(unittest.TestCase):
         self.assertFalse(
             planning.is_enrollment_day(pd.Timestamp("2025-02-05"), cfg)
         )
+        daily = dataclasses.replace(cfg, enrollment_frequency="daily")
+        self.assertTrue(all(planning.is_enrollment_day(d, daily) for d in days))
+        self.assertEqual(
+            [
+                str(d.date())
+                for d in days
+                if planning.is_weekly_enrollment_day(d, daily)
+            ],
+            selected,
+        )
+        self.assertFalse(
+            planning.is_enrollment_day(pd.Timestamp("2025-02-05"), daily)
+        )
+        self.assertNotEqual(cfg.policy_id, daily.policy_id)
 
     def test_followup_keeps_contracts_below_entry_cutoff_and_after_entry_end(
         self,
@@ -535,6 +551,12 @@ class SavedCollectionTest(unittest.TestCase):
         self.assertEqual(
             self.store.session("SPY", DAY)["universe_status"], "not_requested"
         )
+        self.assertEqual(
+            self.store.session("SPY", DAY)["cross_section_status"], "incomplete"
+        )
+        self.assertIsNone(
+            self.store.session("SPY", DAY)["cross_section_contract_count"]
+        )
         self.assertGreater(
             self.store.session("SPY", DAY)["selected_contract_count"], 0
         )
@@ -701,9 +723,115 @@ class SavedCollectionTest(unittest.TestCase):
             1,
         )
 
+    def test_daily_cross_sections_refresh_without_reenrolling_contracts(self):
+        cfg = dataclasses.replace(
+            self.cfg, end_date="2025-01-07", moneyness_targets=(1.0,)
+        )
+        collector = workflow.Collector(cfg)
+        # The last session is follow-up only, after the entry window closes.
+        days = planning.exchange_calendar().sessions_in_range(
+            cfg.start_date, "2025-01-08"
+        )
+        scope = {
+            "dates": days.strftime("%Y-%m-%d").tolist(),
+            "symbol": {"symbol": "SPY"},
+        }
+
+        def shifted_prices(client, request, payload):
+            data = _payload(request)
+            if request.dataset == "stock_quotes_1h":
+                frame = pd.read_csv(io.BytesIO(data), dtype="string")
+                frame.loc[
+                    frame["timestamp"]
+                    .str[:10]
+                    .isin(["2025-01-03", "2025-01-06"]),
+                    ["bid", "ask"],
+                ] = "105"
+                data = frame.to_csv(index=False).encode()
+            payload.write(data)
+            payload.seek(0)
+            return {"status_code": 200, "payload_bytes": len(data)}
+
+        with mock.patch.object(
+            transport.ThetaClient,
+            "download",
+            autospec=True,
+            side_effect=shifted_prices,
+        ) as download:
+            manifest = collector.collect_month(
+                config.UNIVERSE[0],
+                days,
+                pd.DataFrame(columns=selection.COHORT_COLUMNS),
+                scope,
+            )
+        sessions = [collector.store.session("SPY", d) for d in days]
+        self.assertEqual(manifest["request_error_count"], 0)
+        self.assertEqual(
+            [s["newly_selected_contract_count"] for s in sessions],
+            [10, 10, 0, 0, 0],
+        )
+        self.assertEqual(
+            [s["selected_contract_count"] for s in sessions],
+            [10, 20, 20, 20, 20],
+        )
+        self.assertEqual(
+            [s["cross_section_contract_count"] for s in sessions],
+            [10, 10, 8, 8, None],
+        )
+        self.assertEqual(sessions[-1]["cross_section_status"], "not_scheduled")
+        cross = pd.read_parquet(
+            cfg.output_dir / manifest["cross_sections"]["path"]
+        )
+        tracked = pd.read_parquet(
+            cfg.output_dir / manifest["contracts"]["path"]
+        )
+        self.assertFalse(cross.duplicated(["trade_day", "contract_key"]).any())
+        self.assertEqual(set(cross["selection_status"]), {"observed"})
+        for date, strike in (
+            ("2025-01-02", "100"),
+            ("2025-01-03", "105"),
+            ("2025-01-06", "105"),
+            ("2025-01-07", "100"),
+        ):
+            self.assertEqual(
+                set(cross.loc[cross["trade_day"].eq(date), "strike"]), {strike}
+            )
+        # A Friday entrant can appear again in Monday's fresh grid. Its daily
+        # entry stays Friday, but the weekly comparison starts only on Monday.
+        self.assertEqual(
+            set(
+                tracked.loc[tracked["strike"].eq("105"), "first_selected_date"]
+            ),
+            {"2025-01-03"},
+        )
+        weekly = cross.loc[cross["weekly_entry_day"]]
+        self.assertEqual(
+            set(weekly.loc[weekly["strike"].eq("105"), "trade_day"]),
+            {"2025-01-06"},
+        )
+        self.assertEqual(weekly["contract_key"].nunique(), 18)
+        request_ids = [
+            call.args[1].request_id for call in download.call_args_list
+        ]
+        self.assertEqual(len(request_ids), len(set(request_ids)))
+        self.assertEqual(
+            sum(
+                r["dataset"] == "option_quotes_1h" for r in manifest["requests"]
+            ),
+            5,
+        )
+        self.assertTrue(collector.month_valid(manifest, scope))
+        # Missing cross-section evidence must force recovery, even when the
+        # market observations and cohort checkpoint are still intact.
+        (cfg.output_dir / manifest["cross_sections"]["path"]).unlink()
+        self.assertFalse(collector.month_valid(manifest, scope))
+
     def test_weekly_discovery_preserves_daily_cohort_reports(self):
         cfg = dataclasses.replace(
-            self.cfg, end_date="2025-01-06", moneyness_targets=(1.0,)
+            self.cfg,
+            end_date="2025-01-06",
+            moneyness_targets=(1.0,),
+            enrollment_frequency="weekly",
         )
         collector = workflow.Collector(cfg)
         days = planning.exchange_calendar().sessions_in_range(
@@ -979,6 +1107,9 @@ class CliAndProvenanceTest(unittest.TestCase):
         cfg, preview = cli.parse_run_scope(["--symbols", "SPY"])
         self.assertEqual(cfg.start_date, "2017-01-01")
         self.assertEqual(cfg.end_date, "2025-12-31")
+        self.assertEqual(cfg.enrollment_frequency, "daily")
+        weekly, _ = cli.parse_run_scope(["--enrollment-frequency", "weekly"])
+        self.assertEqual(weekly.enrollment_frequency, "weekly")
         self.assertEqual(cfg.symbols, (config.UNIVERSE[0],))
         self.assertFalse(preview)
         earlier, _ = cli.parse_run_scope(["--start", config.PRO_HISTORY_START])
@@ -992,6 +1123,7 @@ class CliAndProvenanceTest(unittest.TestCase):
             ["--start", "2012-05-31"],
             ["--end", "2999-01-01"],
             ["--index-subscription", "invalid"],
+            ["--enrollment-frequency", "monthly"],
         ):
             with (
                 self.subTest(arguments=arguments),

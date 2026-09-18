@@ -17,9 +17,9 @@ import pandas as pd
 
 from tfbsm_collector import provenance
 
-# v8 limits discovery to enrollment days and keeps tracked OI between them.
-# Earlier daily cohorts cannot stand in for this different research sample.
-OUTPUT_SCHEMA_VERSION = "2026-09-12-weekly-discovery-v8"
+# v9 records each day's selected cross-section separately from the accumulated
+# cohort. A weekly-only cache cannot supply missing daily selection evidence.
+OUTPUT_SCHEMA_VERSION = "2026-09-18-daily-cross-sections-v9"
 
 # Resolve from the repository root so splitting the package does not move
 # existing caches into a new data directory.
@@ -162,6 +162,8 @@ class CollectorConfig:
         raw_chunk_rows: Maximum CSV records per parsing/storage batch.
         stock_venue: Theta stock feed; utp_cta requests the merged feeds.
         selection_times: Exchange-local HH:MM:SS times for stock references.
+        enrollment_frequency: Daily refresh by default; weekly is a smaller
+            collection. Both follow enrolled contracts at quote_interval.
         max_stock_quote_age_seconds: Maximum age of a sampled stock record at
             selection time; does not measure the quote event's age.
         max_symbol_workers: Concurrent roots, each advancing months in order.
@@ -221,6 +223,7 @@ class CollectorConfig:
     # One clock limits overlapping enrollment as prices move intraday. 10:30
     # aligns with the hourly grid and precedes scheduled early closes.
     selection_times: tuple[str, ...] = ("10:30:00",)
+    enrollment_frequency: str = "daily"
 
     # A 12:30 sample cannot supply the 13:30 reference under this tolerance.
     # The timestamp does not reveal when the underlying quote last changed.
@@ -263,6 +266,8 @@ class CollectorConfig:
             raise ValueError("The end date must be before today in New York")
         if self.mode not in {"panels", "references", "coverage"}:
             raise ValueError("Unsupported collection mode")
+        if self.enrollment_frequency not in {"daily", "weekly"}:
+            raise ValueError("enrollment_frequency must be daily or weekly")
         if self.index_subscription not in INDEX_HISTORY_STARTS:
             raise ValueError("Unsupported index subscription")
         if self.rate_subscription not in RATE_HISTORY_STARTS:
@@ -354,11 +359,15 @@ class CollectorConfig:
             "near_close_minutes",
             "stock_venue",
             "selection_times",
+            "enrollment_frequency",
             "max_stock_quote_age_seconds",
         )
         return {
             "output_schema_version": OUTPUT_SCHEMA_VERSION,
-            "entry_schedule": "first_exchange_session_of_week_in_entry_window",
+            "entry_schedule": "every_exchange_session_in_entry_window"
+            if self.enrollment_frequency == "daily"
+            else "first_exchange_session_of_week_in_entry_window",
+            "cross_section_membership": "dated_selection_including_existing_contracts",
             "discovery_schedule": "enrollment_days_with_underlying_access",
             "option_oi_retention": "full_discovery_otherwise_tracked_date_windows",
             "contract_followup": "through_expiration",
