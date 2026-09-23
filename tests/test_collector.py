@@ -202,6 +202,15 @@ def _download_fixture(client, request, payload):
 
 
 class PlanningAndSelectionTest(unittest.TestCase):
+    def test_contract_keys_accept_a_header_only_response(self):
+        frame = pd.DataFrame(columns=planning.CONTRACT_FIELDS, dtype="string")
+        original = frame.copy(deep=True)
+        keys = planning.option_contract_keys(frame)
+        self.assertTrue(keys.empty)
+        pd.testing.assert_index_equal(keys.index, frame.index)
+        self.assertTrue(pd.api.types.is_string_dtype(keys.dtype))
+        pd.testing.assert_frame_equal(frame, original)
+
     def test_contract_keys_preserve_precision_rows_and_raw_fields(self):
         frame = pd.DataFrame(
             {
@@ -659,6 +668,34 @@ class SavedCollectionTest(unittest.TestCase):
                 )
             finally:
                 frames.close()
+
+    def test_empty_selected_option_responses_are_saved_and_reusable(self):
+        request = dataclasses.replace(
+            planning.near_close_request(
+                self.cfg, "option", "SPY", DAY, EXPIRATIONS[0]
+            ),
+            retained_contract_windows=(
+                ("SPY|2025-01-10|100|call", str(DAY.date()), str(DAY.date())),
+            ),
+        )
+        header = (",".join(request.required_columns) + "\n").encode()
+        for status_code in (200, 472):
+            with self.subTest(status_code=status_code):
+
+                def download(request, payload):
+                    if status_code == 200:
+                        payload.write(header)
+                    return {"status_code": status_code}
+
+                with mock.patch.object(
+                    self.store.client, "download", side_effect=download
+                ):
+                    record = self.store.collect(request, refresh=True)
+                self.assertEqual(record["status"], "no_data")
+                self.assertEqual(record["row_count"], 0)
+                self.assertTrue(self.store.read(record).empty)
+                self.assertIsNotNone(self.store.cached(request))
+                self.assertFalse(self.store.client.stop_event.is_set())
 
     def test_month_preserves_selection_coverage_compaction_and_resume(self):
         scope = {"dates": [str(DAY.date())], "symbol": {"symbol": "SPY"}}

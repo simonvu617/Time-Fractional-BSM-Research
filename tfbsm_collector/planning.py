@@ -259,6 +259,11 @@ def option_contract_keys(frame: pd.DataFrame) -> pd.Series:
         A series aligned to the input index. Identity spellings are normalized
         only in these keys; the input vendor fields are unchanged.
     """
+    # Header-only and no-data replies are valid collection outcomes. Empty
+    # mappings otherwise infer floats, which cannot be joined to string keys.
+    if frame.empty:
+        return pd.Series(index=frame.index, dtype="string")
+
     # Hourly rows repeat the same strikes and expirations. Normalize each
     # distinct value once per batch without rounding prices or changing rows.
     strikes = {
