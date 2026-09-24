@@ -697,6 +697,143 @@ class SavedCollectionTest(unittest.TestCase):
                 self.assertIsNotNone(self.store.cached(request))
                 self.assertFalse(self.store.client.stop_event.is_set())
 
+    def test_malformed_history_is_preserved_without_stopping_other_requests(
+        self,
+    ):
+        malformed = b"Wrong number of data fields, expecting 11, got 8"
+        corrupt = b"Corrupt FIT data: record has more fields than the established tick width"
+        cases = (
+            (400, malformed, "/option/at_time/quote", False),
+            (500, corrupt, "/option/at_time/quote", False),
+            (400, b"Invalid query parameter", "/option/at_time/quote", True),
+            (403, b"Subscription required", "/option/at_time/quote", True),
+            (400, malformed, "/option/list/contracts/quote", True),
+        )
+        for index, (status, body, endpoint, stopped) in enumerate(cases):
+            with self.subTest(status=status, body=body, endpoint=endpoint):
+                store = storage.RequestStore(
+                    dataclasses.replace(
+                        self.cfg, output_dir=self.root / str(index)
+                    )
+                )
+                request = dataclasses.replace(
+                    planning.near_close_request(
+                        self.cfg, "option", "SPY", DAY, EXPIRATIONS[0]
+                    ),
+                    endpoint=endpoint,
+                )
+                response = mock.MagicMock()
+                response.__enter__.return_value = response
+                response.status_code = status
+                response.url = self.cfg.base_url + endpoint
+                response.headers = {}
+                response.iter_content.return_value = [body]
+                with mock.patch.object(store.client, "session") as session:
+                    session.return_value.get.return_value = response
+                    record = store.collect(request)
+                self.assertEqual(session.return_value.get.call_count, 1)
+                self.assertEqual(record["status"], "request_error")
+                self.assertEqual(record["status_code"], status)
+                self.assertEqual(record["row_count"], 0)
+                self.assertEqual(
+                    (store.root / record["payload"]["path"]).read_bytes(), body
+                )
+                self.assertIsNone(store.cached(request))
+                self.assertEqual(store.client.stop_event.is_set(), stopped)
+
+    def test_only_selection_failures_block_later_months_and_gaps_retry_on_resume(
+        self,
+    ):
+        for dataset in ("option_quotes_near_close", "quoted_contracts"):
+            with self.subTest(dataset=dataset):
+                cfg = dataclasses.replace(
+                    self.cfg,
+                    start_date="2025-01-31",
+                    end_date="2025-02-03",
+                    output_dir=self.root / dataset,
+                    raw_chunk_rows=500,
+                )
+                collector = workflow.Collector(cfg)
+
+                def download(client, request, payload):
+                    if request.dataset == dataset and planning.request_days(
+                        request
+                    )[0] == pd.Timestamp("2025-01-31"):
+                        payload.write(b"Corrupt FIT data: test failure")
+                        payload.seek(0)
+                        return {
+                            "status_code": 500,
+                            "error": "Corrupt FIT data: test failure",
+                        }
+                    return _download_fixture(client, request, payload)
+
+                # Two entry sessions straddle a month boundary. Limit the tail
+                # here so the test isolates advancement and cache reuse.
+                with (
+                    mock.patch.object(
+                        planning,
+                        "collection_windows",
+                        return_value={"available_followup_end": cfg.end_date},
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    with mock.patch.object(
+                        transport.ThetaClient,
+                        "download",
+                        autospec=True,
+                        side_effect=download,
+                    ):
+                        counts = collector.collect_symbol(config.UNIVERSE[0])
+                    months = collector.store.collection_dir / "months" / "SPY"
+                    first_path = months / "2025-01-31_2025-01-31.json"
+                    second_path = months / "2025-02-03_2025-02-03.json"
+                    first = storage.read_json(first_path)
+                    self.assertGreater(first["request_error_count"], 0)
+                    self.assertFalse(
+                        collector.month_valid(first, first["scope"])
+                    )
+                    self.assertEqual(counts["failed_days"], 1)
+                    if dataset == "quoted_contracts":
+                        self.assertGreater(
+                            first["selection_request_error_count"], 0
+                        )
+                        self.assertEqual(counts["processed_days"], 1)
+                        self.assertFalse(second_path.exists())
+                        continue
+                    self.assertEqual(first["selection_request_error_count"], 0)
+                    self.assertEqual(counts["processed_days"], 2)
+                    second = storage.read_json(second_path)
+                    cohort = pd.read_parquet(
+                        cfg.output_dir / first["cohort"]["path"]
+                    )
+                    active = cohort.loc[cohort["expiration"].ge(cfg.end_date)]
+                    self.assertFalse(active.empty)
+                    self.assertEqual(
+                        second["scope"]["incoming_cohort"],
+                        provenance.digest_json(active.to_dict("records")),
+                    )
+                    with mock.patch.object(
+                        transport.ThetaClient,
+                        "download",
+                        autospec=True,
+                        side_effect=_download_fixture,
+                    ) as repaired:
+                        resumed = collector.collect_symbol(config.UNIVERSE[0])
+                    self.assertEqual(resumed["failed_days"], 0)
+                    self.assertEqual(resumed["processed_days"], 1)
+                    self.assertEqual(resumed["resumed_days"], 1)
+                    self.assertTrue(repaired.called)
+                    self.assertTrue(
+                        all(
+                            c.args[1].dataset == dataset
+                            for c in repaired.call_args_list
+                        )
+                    )
+                    fixed = storage.read_json(first_path)
+                    self.assertTrue(
+                        collector.month_valid(fixed, fixed["scope"])
+                    )
+
     def test_month_preserves_selection_coverage_compaction_and_resume(self):
         scope = {"dates": [str(DAY.date())], "symbol": {"symbol": "SPY"}}
         with mock.patch.object(

@@ -198,6 +198,24 @@ class ThetaClient:
                 payload.seek(0)
                 meta["error"] = f"HTTP {response.status_code}: {preview}"
 
+                # Theta sometimes reports corrupt historical records as 400
+                # instead of 500. These specific replies concern one data
+                # request, not account access. Preserve the failed body and let
+                # the workflow decide whether the gap blocks contract selection.
+                if (
+                    response.status_code in {400, 500}
+                    and request.endpoint.startswith(
+                        ("/option/history/", "/option/at_time/")
+                    )
+                    and preview.lstrip().startswith(
+                        (
+                            "Wrong number of data fields, expecting ",
+                            "Corrupt FIT data:",
+                        )
+                    )
+                ):
+                    return meta
+
                 # 429 is throttling, 474 a lost vendor connection, and 571 a
                 # vendor restart. Retry these and temporary server errors within
                 # the attempt cap.

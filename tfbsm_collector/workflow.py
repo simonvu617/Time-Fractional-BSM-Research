@@ -280,15 +280,23 @@ class Collector:
             counts["processed_days"] += len(month)
             if manifest["request_error_count"]:
                 counts["failed_days"] += len(month)
-                # A failed discovery month could change every later cohort.
-                # Retry it on resume before advancing this root's history.
+            if manifest["selection_request_error_count"]:
+                # Missing selection inputs could change every later cohort.
+                # Price observations after enrollment do not change membership;
+                # keep their gaps explicit while collecting the remaining months.
+                print(
+                    f"{symbol.symbol} {month[0]:%Y-%m}: stopped this asset after "
+                    f"{manifest['selection_request_error_count']} failed selection "
+                    "input requests; rerun to retry"
+                )
                 break
             cohort = pd.read_parquet(
                 self.cfg.output_dir / manifest["cohort"]["path"]
             )
             print(
                 f"{symbol.symbol} {month[0]:%Y-%m}: {len(month)} sessions; "
-                f"{manifest['request_count']} requests; {len(cohort)} tracked contracts"
+                f"{manifest['request_count']} requests; {len(cohort)} tracked contracts; "
+                f"{manifest['request_error_count']} failed request/session pairs"
             )
         counts["contracts_pending_future_expiration"] = int(
             cohort["expiration"].gt(windows["available_followup_end"]).sum()
@@ -484,6 +492,14 @@ class Collector:
             for request, record in self.collect_batch(requests)
         )
         self.store.client.check_running()
+        # This batch provides the dated chain and underlying prices used to
+        # enroll contracts. A failed response cannot establish a complete sample,
+        # even if other responses supplied enough contracts to continue this month.
+        selection_request_error_count = sum(
+            records.get(request.request_id, {}).get("status")
+            not in storage.GOOD_REQUEST_STATUSES
+            for request in requests
+        )
         daily = []
         selections, cross_sections, universes = [], [], []
         by_day = {day: [] for day in days}
@@ -739,6 +755,7 @@ class Collector:
             "request_count": len(requests),
             "requests": all_records,
             "request_error_count": sum(m["request_error_count"] for m in daily),
+            "selection_request_error_count": selection_request_error_count,
             "contract_terms": "product labels only; missing exact deliverables and last trading times",
             "intraday_window": "underlying XNYS regular session; not full index options session",
         }
