@@ -14,11 +14,66 @@ The candidate model uses an inverse-stable market-time clock with:
 
 `alpha = 1` must recover classical BSM under identical inputs. This is not a Hurst-exponent, fractional-Brownian-motion, or rough-volatility project.
 
-No validated BSM or TFBSM pricer, calibration routine, or empirical result is included yet.
+The `tfbsm_pricing` package contains two independently implemented European
+TFBSM finite-difference solvers:
+
+- the weighted L1 method of Krzyzanowski, Magdziarz, and Plociniczak (2020);
+- the L2 method of An et al. (2024).
+
+They share the same model and grid interface but keep their fractional-history
+weights and recurrences separate. Neither solver is coupled to the ThetaData
+collector.
+
+## Pricing example
+
+```python
+from tfbsm_pricing import EuropeanOptionProblem, GridSpec, solve_l2, solve_weighted
+
+problem = EuropeanOptionProblem(
+    S0=100.0,
+    K=100.0,
+    T=1.0,
+    r=0.05,
+    sigma=0.20,
+    alpha=0.80,
+    option_type="call",
+)
+grid = GridSpec(
+    x_min=2.0,
+    x_max=7.0,
+    space_steps=300,
+    time_steps=200,
+)
+
+weighted = solve_weighted(problem, grid)
+l2 = solve_l2(problem, grid)
+
+print(weighted.price, l2.price)
+```
+
+`grid_price` in each result contains the complete solution surface with shape
+`(time_steps + 1, space_steps + 1)`. The diagnostics report the scheme,
+spacing, paper order claims, and known proof limitations.
+
+The paper-to-code formula crosswalk is in
+[`docs/numerical_solvers.md`](docs/numerical_solvers.md). Reproducible paper,
+BSM-limit, and cross-solver results are in
+[`docs/validation_results.md`](docs/validation_results.md).
+
+## Run the checks
+
+```powershell
+python -m unittest discover -s tests -v
+python -m validation.run_validation
+```
+
+Only NumPy is required.
 
 ## Project status
 
-Implementation is being reviewed in pull requests before inclusion on `main`.
+The numerical solvers are being reviewed in a pull request before inclusion on
+`main`. Calibration, empirical fitting, American options, trading logic, and
+data analysis remain outside this implementation.
 
 ## License, citation, and data
 
