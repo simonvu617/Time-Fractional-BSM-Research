@@ -1,240 +1,203 @@
-# Numerical solver definitions and paper crosswalk
+# European TFBSM solvers: definitions, citations, and validation
 
-This project implements two independent finite-difference solvers for the same
-European time-fractional Black--Scholes problem.  This note fixes the model and
-notation before code is used, and records where each numerical formula comes
-from.
+This document defines the model before describing the code. Citations use
+`KMP20` for Krzyżanowski, Magdziarz, and Płociniczak [1] and `An24` for An et
+al. [2]. Both papers are listed in full, with DOI links, in the references.
 
-## Canonical pricing problem
+## Shared pricing problem
 
-Let `t` be elapsed time from valuation toward maturity, measured in years, and
-let `x = log(S)`.  For `0 < alpha <= 1`, both papers reduce to
+Let `t` be elapsed time from the payoff toward valuation, measured in years,
+and let `x=log(S)`. Both implementations solve
 
 ```text
-Caputo_D_t^alpha u = (sigma^2 / 2) u_xx
-                     + (r - sigma^2 / 2) u_x - r u,
-u(x, 0) = payoff(exp(x)).
+Caputo_D_t^alpha u
+  = (sigma^2/2) u_xx + (r-sigma^2/2) u_x - r u,
+u(x,0) = payoff(exp(x)),                    0 < alpha <= 1.
 ```
 
-The Caputo derivative is
+This is KMP20 equations (4)--(6), pages 5--6, and An24 equations (2)--(4),
+pages 4--5. The Caputo derivative is
 
 ```text
 Caputo_D_t^alpha g(t)
-  = 1 / Gamma(1-alpha) * integral_0^t g'(s) / (t-s)^alpha ds.
+  = 1/Gamma(1-alpha) integral_0^t g'(s)(t-s)^(-alpha) ds,
 ```
 
-This is Krzyzanowski, Magdziarz, and Plociniczak (2020), equations (4)--(6),
-pages 5--6, and An et al. (2024), equations (2)--(4), pages 4--5.  The
-stochastic model in the former is a geometric Brownian motion evaluated at the
-inverse of an independent alpha-stable subordinator.  Both papers assume
-constant `r` and `sigma` and zero dividend yield.  The implementation therefore
-does not add a dividend term.
+as defined in KMP20 equation (4), page 5, and An24 equation (3), page 5.
+`alpha` is dimensionless. An24 introduces `rho` with units
+`year^(alpha-1)` and then sets `rho=1` in equation (4), page 5. The code makes
+the same normalization, so changing the time unit without rescaling `rho`
+would change the model.
 
-Krzyzanowski et al. define the inverse clock in equation (1), page 2, assume it
-is independent of the Brownian motion, and select a minimal-relative-entropy
-martingale measure in Proposition 2.1, page 3. An et al. do not state an
-underlying stochastic clock or a martingale measure; they introduce their model
-on page 4 by replacing the ordinary time derivative in BSM with a Caputo
-derivative. The canonical interface therefore standardizes only the PDE the two
-papers actually share, not an unstated stochastic interpretation for An et al.
+KMP20 defines the underlying as geometric Brownian motion evaluated at an
+independent inverse alpha-stable subordinator (equation (1), page 2) and uses a
+minimal-relative-entropy martingale measure (Proposition 2.1, page 3). An24
+introduces its PDE by replacing the ordinary BSM time derivative with a Caputo
+derivative and does not supply the same stochastic construction. The shared
+interface therefore standardizes the PDE, not an unstated stochastic model.
 
-An et al. include a dimensional coefficient `rho` with units
-`year^(alpha-1)` and then set `rho = 1` (equation (4), page 5).  The canonical
-interface uses years and makes the same normalization.  This convention is
-material: changing the time unit without rescaling `rho` changes the model.
-The fractional order `alpha` itself is dimensionless.
+Both papers use constant `r` and `sigma` and zero dividends. The code does not
+add an unsupported dividend term. At `alpha=1`, the Caputo derivative becomes
+the ordinary derivative and the model must recover classical BSM.
 
-At `alpha = 1`, the Caputo derivative becomes the ordinary first derivative,
-so the canonical equation is the classical Black--Scholes equation in forward
-time-to-maturity coordinates.
+## Payoff and boundaries
 
-## Initial and boundary data
-
-On a finite log-price interval `[x_min, x_max]`, the code uses the standard
-European asymptotic boundaries at elapsed time `t`:
+On `[x_min,x_max]`, both solvers use
 
 ```text
-call: u(x_min,t) = 0
-      u(x_max,t) = exp(x_max) - K exp(-r t)
-
-put:  u(x_min,t) = K exp(-r t) - exp(x_min)
-      u(x_max,t) = 0
+call: left=0,                          right=exp(x_max)-K exp(-rt)
+put:  left=K exp(-rt)-exp(x_min),      right=0.
 ```
 
-The call boundaries agree with Krzyzanowski et al., page 6, after translating
-their elapsed-time notation.  An et al. equations (5)--(6), page 5, print
-`x_R` where dimensional consistency requires `exp(x_R)`, and use `T-t` in a
-place where their transformation `u(x,t)=V(S,T-t)` requires elapsed time `t`.
-Those expressions are treated as typographical errors rather than implemented
-literally.  The finite-left put boundary retains the small `exp(x_min)` term;
-the papers state the limiting boundary as `x_min -> -infinity`.
+The call condition follows KMP20 page 6. An24 equations (5)--(6), page 5,
+print `x_R` where dimensional consistency requires `exp(x_R)` and use `T-t`
+after defining `t=T-tau`; those are treated as typographical errors. The put
+condition retains the finite-left `exp(x_min)` correction.
 
-There is also a model-level inconsistency worth preserving in the record.  The
-put--call parity in Krzyzanowski et al., Proposition 2.1, page 3, and the
-exponential strike discount used in both papers' boundary data imply
-`C-P = S-K exp(-rt)`.  For `alpha < 1`, that function does not satisfy the
-printed Caputo PDE because the Caputo derivative of `exp(-rt)` is not its
-ordinary derivative.  The homogeneous PDE instead gives a Mittag--Leffler
-discount factor.  The implementation keeps the papers' stated exponential
-boundaries so both numerical methods solve the same published finite-domain
-problem, and the validation report exposes the resulting fractional-parity
-residual.  At `alpha=1` the inconsistency disappears.
+There is a separate model inconsistency. KMP20 Proposition 2.1, page 3, claims
+`C-P=S-K exp(-rt)`, and both papers use the same exponential strike discount
+in their boundaries. For `alpha<1`, this function does not solve the printed
+Caputo PDE because the Caputo derivative of `exp(-rt)` is not its ordinary
+derivative. The homogeneous PDE instead produces a Mittag--Leffler discount.
+The implementation retains the papers' exponential boundaries so the two
+solvers compare the same published finite-domain problem. The tests expose the
+fractional parity residual rather than hiding it. The discrepancy vanishes at
+`alpha=1`.
 
-## Solver A: weighted L1 finite differences
+## Weighted L1 method
 
-`tfbsm_pricing.weighted_fd` follows Krzyzanowski et al. equations (7)--(11),
-pages 6--7.  With `dt = T/N`,
+`tfbsm_pricing.weighted_fd` implements KMP20 equations (7)--(11), pages 6--7.
+For `dt=T/N`,
 
 ```text
-b_j = (j+1)^(1-alpha) - j^(1-alpha),
+b_j = (j+1)^(1-alpha)-j^(1-alpha),
 d   = Gamma(2-alpha) dt^alpha.
 ```
 
-Centered differences discretize the spatial operator.  In the paper's
-weighting convention, `theta = 0` is fully implicit and `theta = 1` is fully
-explicit.  The default is their optimal stable weight
-
-```text
-theta_hat = (2 - 2^(1-alpha)) / (3 - 2^(1-alpha)),
-```
-
-from page 16.  At `alpha = 1`, it equals `1/2` and the method reduces exactly
-to Crank--Nicolson.  The paper claims global error
-`O(dt^(2-alpha) + dx^2)` in Theorem 3.3, page 15.  Its stability result is
-unconditional only in the parameter region stated in Theorem 3.2, pages
-10--12; the optimal default lies in that region.
-
-Writing `L_h` for the centered spatial operator and `G^k` for its boundary
-contribution, the implemented equation (11) is
+Writing `L_h` for the centered spatial operator, equation (11) becomes
 
 ```text
 [I-(1-theta)d L_h] U^n
   = sum_(j=0)^(n-2) (b_j-b_(j+1)) U^(n-1-j) + b_(n-1) U^0
-    + theta d L_h U^(n-1)
-    + (1-theta) G^n + theta G^(n-1).
+    + theta d L_h U^(n-1) + boundary terms.
 ```
 
-For `n=1`, the history sum is simply `U^0`. This form also records the precise
-newest-to-oldest indexing used by the code.
-
-## Solver B: L2 finite differences
-
-`tfbsm_pricing.l2_fd` independently implements An et al. equations (7)--(17),
-pages 6--7.  The first time step uses their L1 formula with
+For `n=1`, the history is `U^0`. KMP20 uses `theta=0` for fully implicit and
+`theta=1` for fully explicit, the reverse of another common convention. The
+default is the stable weight from KMP20 page 16,
 
 ```text
-phi_1 = Gamma(2-alpha) dt^alpha.
+theta_hat = (2-2^(1-alpha))/(3-2^(1-alpha)).
 ```
 
-Later steps use the paper's quadratic L2 interpolation with the three
-coefficient sequences `a_i`, `b_i`, and `c_i`, and
+It becomes `1/2` at `alpha=1`, so the method reduces exactly to
+Crank--Nicolson. KMP20 Theorem 3.3, page 15, claims
+`O(dt^(2-alpha)+dx^2)` error under its regularity assumptions.
+
+## L2 method
+
+`tfbsm_pricing.l2_fd` independently implements An24 equations (7)--(17),
+pages 6--7. The first step is the L1 formula in equation (7), with
+`phi_1=Gamma(2-alpha)dt^alpha`. Later steps use the quadratic L2 formula in
+equations (8)--(9), with `phi_2=Gamma(3-alpha)dt^alpha` and
 
 ```text
-phi_2 = Gamma(3-alpha) dt^alpha.
-```
-
-The sequences from equations (8)--(9), page 6, are
-
-```text
-a_i = (2-alpha)[i^(1-alpha)/2 - 3(i+1)^(1-alpha)/2]
-      - i^(2-alpha) + (i+1)^(2-alpha),
-b_i = (4-2alpha)(i+1)^(1-alpha)
-      + 2i^(2-alpha) - 2(i+1)^(2-alpha),
+a_i = (2-alpha)[i^(1-alpha)/2-3(i+1)^(1-alpha)/2]
+      -i^(2-alpha)+(i+1)^(2-alpha),
+b_i = (4-2alpha)(i+1)^(1-alpha)+2i^(2-alpha)-2(i+1)^(2-alpha),
 c_i = (alpha/2-1)[i^(1-alpha)+(i+1)^(1-alpha)]
-      - i^(2-alpha) + (i+1)^(2-alpha).
+      -i^(2-alpha)+(i+1)^(2-alpha).
 ```
 
-The complete time-history recurrence is implemented directly from equations
-(14)--(17), page 7. Centered first and second spatial differences are equations
-(12)--(13), page 7.
+The complete history recurrence follows An24 equations (14)--(17), page 7.
+At `alpha=1`, its later steps reduce exactly to BDF2 after a backward-Euler
+startup. An24 claims order `3-alpha`, but equation (39), page 14, refers to a
+first-step transformation without specifying it. The code uses the published
+equation (14) startup and does not invent the missing correction.
 
-These weights are implemented in the L2 module rather than shared with the L1
-solver, so a mistake in one time discretization cannot automatically reproduce
-itself in the other.  At `alpha = 1`, the later steps reduce exactly to BDF2,
-with a backward-Euler startup.
+The component equations (14)--(17) determine the tridiagonal signs. An24
+equation (20), page 8, prints a positive upper off-diagonal entry that conflicts
+with those component equations and the differential operator, so that sign is
+not copied.
 
-The component equations (14)--(17) determine the implemented tridiagonal
-signs.  The matrix displayed in equation (20), page 8, has a positive
-right-off-diagonal entry that conflicts with those component equations and
-with the stated differential operator; the code does not copy that sign.
+## Independence and sign audit
 
-An et al. claim temporal order `3-alpha` and spatial order two.  Their first
-step is only L1, and equation (39), page 14, says it can be transformed to the
-higher-order form without giving the transformation.  The implementation
-faithfully uses the published equation (14) startup and does not invent the
-missing correction.  Validation therefore reports the measured order of the
-published recurrence rather than presuming the claimed order.
+The solvers share model definitions, boundaries, result types, and a Thomas
+factorization. Their Caputo weights, startup rules, and history recurrences are
+separate. A shared fractional-time bug therefore cannot make them agree.
 
-## Stability-proof limitation in An et al.
-
-Theorem 2 in An et al., pages 11--13, claims unconditional stability in the
-ordinary discrete `L2` norm.  In the move from equation (31) to equation (32),
-the drift cross-term is discarded even though it does not cancel for the
-forward-difference pairing used in their proof.  A bounded grid function gives
-a direct counterexample to the asserted intermediate inequality.  This does
-not by itself show that the numerical recurrence is unstable; it means the
-published proof does not establish the stated theorem.  Solver validation
-therefore relies on convergence, benchmark, and cross-solver evidence rather
-than treating that proof as conclusive.
-
-A concrete check of equation (32) uses `(x_L,x_R)=(0,pi)`, `alpha=1/2`,
-`dt=1/100`, `mu=r=1/100`, and `u^0=sin(30x)`. The exact first semidiscrete step
-makes the left side of the claimed bound, divided by `||u^0||_2`, equal to
-`5.130259...`, while equation (32) bounds it by `4`. Separately, with nonzero
-drift and a two-eigenmode initial condition, the cross term discarded in the
-paper evaluates to `-6.7195e-5` at step four rather than zero. These checks
-invalidate the proof steps, not the numerical method itself.
-
-## Independence and comparison rules
-
-The solvers share only the model, grid, boundary definitions, result container,
-and tridiagonal linear algebra.  Their Caputo-history weights, startup rules,
-and time recurrences are separate.  Cross-solver comparisons always use the
-same model, domain, spatial grid, time grid, payoff, and corrected boundaries.
-Agreement between solvers is supporting numerical evidence, not an analytic
-proof of correctness.
-
-## Indexing and sign audit
-
-The code's zero-based array level `surface[n]` represents the papers' `U^n` or
-`u^n`. In the weighted recurrence, `b_j-b_(j+1)` multiplies
-`surface[n-1-j]`, and `b_(n-1)` multiplies the payoff `surface[0]`, exactly as
-in Krzyzanowski et al. equation (11), page 7. In the L2 recurrence, the lag
-`n-j` in An et al. equation (17), page 7, is kept distinct from the stored time
-level `j`; the three special startup equations are coded separately rather
-than folded into a general loop.
-
-For `L = a*d_xx + b*d_x - r`, the centered spatial row is
+For `L=a*d_xx+b*d_x-r`, centered differences give
 
 ```text
-lower = a/dx^2 - b/(2dx)
-diag  = -2a/dx^2 - r
-upper = a/dx^2 + b/(2dx).
+lower=a/dx^2-b/(2dx),  diag=-2a/dx^2-r,  upper=a/dx^2+b/(2dx).
 ```
 
-Consequently the weighted left side is `I-(1-theta)dL`, the first L2 left side
-is `I-phi_1 L`, and later L2 left sides are `beta I-phi_2 L`. Boundary entries
-removed from those matrices enter the right side with a positive multiplier.
-This agrees with Krzyzanowski et al. equations (7)--(11), pages 6--7, and the
-component equations (14)--(17) in An et al., page 7. It also explains why the
-conflicting upper-diagonal sign in An et al. equation (20), page 8, is rejected.
+The weighted left side is `I-(1-theta)dL`; the L2 left sides are
+`I-phi_1 L` and `beta I-phi_2 L`. Removed boundary entries therefore enter the
+right side positively. In the histories, array level `surface[n]` is the
+papers' `u^n`; the special L2 startup equations are kept separate from the
+general history loop.
 
-The weighting convention was checked independently: Krzyzanowski et al.
-`theta=0` is implicit and `theta=1` is explicit. The code never substitutes the
-more common opposite theta convention.
+## Stability-proof limitation in An24
 
-## Reproducibility targets
+An24 Theorem 2, pages 11--13, claims unconditional stability. Between
+equations (31) and (32), its proof discards a drift cross term that does not
+cancel for consecutive time levels. A direct check using
+`(x_L,x_R)=(0,pi)`, `alpha=1/2`, `dt=1/100`, `mu=r=1/100`, and
+`u^0=sin(30x)` makes the normalized left side of equation (32) equal
+`5.130259...`, exceeding the asserted bound `4`. With nonzero drift and two
+eigenmodes, the discarded cross term is `-6.7195e-5` at step four, not zero.
+This invalidates the printed proof, not the numerical method. Validation below
+therefore rests on benchmarks and convergence rather than that theorem.
 
-Validation covers:
+## Validation results
 
-1. the European-call numerical examples in Krzyzanowski et al., pages 17--18;
-2. the manufactured-solution table in An et al., pages 13--14;
-3. exact `alpha = 1` comparisons with the analytic Black--Scholes price;
-4. grid refinement in time and space;
-5. cross-solver agreement for several fractional orders and both calls and
-   puts;
-6. payoff, boundary, non-negativity, monotonicity, and put--call parity checks.
+Run all reproducible checks with:
 
-The validation report records any paper result that cannot be reproduced from
-the published information, including the unspecified first-step
-transformation in An et al.
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The tests cover all nine An24 Table 1 entries. Representative values are:
+
+| alpha | dt | paper maximum error | computed maximum error |
+|---:|---:|---:|---:|
+| 0.1 | 1/10 | 2.5543e-4 | 2.554339e-4 |
+| 0.5 | 1/20 | 1.1428e-4 | 1.142771e-4 |
+| 0.9 | 1/40 | 8.7868e-5 | 8.786794e-5 |
+
+KMP20 Table 1 temporal orders are also reproduced:
+
+| alpha | paper order | computed order | theoretical `2-alpha` |
+|---:|---:|---:|---:|
+| 0.99 | 1.02 | 1.057 | 1.01 |
+| 0.70 | 1.32 | 1.359 | 1.30 |
+| 0.50 | 1.51 | 1.520 | 1.50 |
+| 0.30 | 1.70 | 1.700 | 1.70 |
+| 0.10 | 1.85 | 1.850 | 1.90 |
+
+At `alpha=1`, joint space-time refinement from 80 to 320 intervals reduces
+the weighted solver's BSM error from `4.65e-2` to `1.61e-3` and the L2
+solver's error from `4.67e-2` to `1.60e-3`. For fractional calls, the absolute
+cross-solver difference shrinks from `2.73e-5` to `8.03e-6` at `alpha=0.5`
+and from `7.92e-5` to `2.73e-5` at `alpha=0.9` over 60--240 intervals.
+
+KMP20 Example 2 is only partially reproduced. The reported ordering by
+`theta` agrees, but on the stated `(n,N)=(500,50)` grid the computed errors are
+`0.603%`, `0.325%`, and `0.047%` for `theta=0`, `0.25`, and `0.5`, versus the
+paper's `1.74%`, `1.12%`, and `0.61%`. The paper does not specify how `S0=1`
+is extracted when `log(S0)=0` is not a grid node; this code uses linear
+interpolation. KMP20 Table 2 is not used as a spatial benchmark because it says
+the error is measured at the prescribed boundary `x=x_max`.
+
+## References
+
+1. G. Krzyżanowski, M. Magdziarz, and Ł. Płociniczak, “A weighted finite
+   difference method for subdiffusive Black--Scholes model,” *Computers &
+   Mathematics with Applications*, 80(5), 653--670, 2020.
+   [doi:10.1016/j.camwa.2020.04.029](https://doi.org/10.1016/j.camwa.2020.04.029);
+   [arXiv:1907.00297](https://arxiv.org/abs/1907.00297).
+2. X. An, Q. Wang, F. Liu, V. V. Anh, and I. W. Turner, “Parameter estimation
+   for time-fractional Black--Scholes equation with S&P 500 index option,”
+   *Numerical Algorithms*, 95, 1--30, 2024.
+   [doi:10.1007/s11075-023-01563-4](https://doi.org/10.1007/s11075-023-01563-4).

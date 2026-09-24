@@ -1,4 +1,9 @@
-"""Krzyzanowski--Magdziarz--Plociniczak weighted L1 solver."""
+"""Weighted L1 solver from Krzyzanowski, Magdziarz, and Plociniczak.
+
+Reference: Computers & Mathematics with Applications 80(5), 653--670 (2020),
+https://doi.org/10.1016/j.camwa.2020.04.029. Equations and pages are cited at
+the formulas they implement.
+"""
 
 from __future__ import annotations
 
@@ -8,10 +13,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ._tridiagonal import TridiagonalFactor
-from .boundaries import boundary_values, payoff
-from .diagnostics import SolverResult
-from .grid import GridSpec
-from .model import EuropeanOptionProblem
+from .model import (
+    EuropeanOptionProblem,
+    GridSpec,
+    SolverResult,
+    boundary_values,
+    payoff,
+)
 
 
 def weighted_caputo_weights(alpha: float, count: int) -> NDArray[np.float64]:

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import numpy as np
 
-from tfbsm_pricing.grid import GridSpec
-from tfbsm_pricing.model import EuropeanOptionProblem
+from tfbsm_pricing.model import EuropeanOptionProblem, GridSpec, SolverResult
 from tfbsm_pricing.weighted_fd import (
     optimal_weight,
     solve_weighted,
@@ -31,6 +31,34 @@ class WeightedMethodTests(unittest.TestCase):
         crank_nicolson = solve_weighted(problem, grid, theta=0.5)
         self.assertLess(abs(crank_nicolson.price - 0.593), abs(implicit.price - 0.593))
         self.assertLess(abs(crank_nicolson.price - 0.593), 0.002)
+
+    def test_krzyzanowski_table_1_temporal_orders(self) -> None:
+        cases = (
+            (0.99, 0.01, 1.02),
+            (0.7, 2.22e-3, 1.32),
+            (0.5, 1.67e-3, 1.51),
+            (0.3, 1.39e-3, 1.70),
+            (0.1, 1.25e-3, 1.85),
+        )
+        for alpha, dt, paper_order in cases:
+            problem = EuropeanOptionProblem(1.0, 2.0, 1.0, 0.04, 1.0, alpha, "call")
+            reference = solve_weighted(
+                problem, GridSpec(-1.0, 1.0, 10, 2597), theta=0.0
+            )
+            coarse = solve_weighted(
+                problem, GridSpec(-1.0, 1.0, 10, round(1.0 / dt)), theta=0.0
+            )
+            fine = solve_weighted(
+                problem, GridSpec(-1.0, 1.0, 10, round(2.0 / dt)), theta=0.0
+            )
+
+            def value(result: SolverResult) -> float:
+                return float(np.interp(-0.01, result.x_grid, result.grid_price[-1]))
+
+            order = math.log2(
+                abs((value(coarse) - value(reference)) / (value(fine) - value(reference)))
+            )
+            self.assertAlmostEqual(order, paper_order, delta=0.07)
 
 
 if __name__ == "__main__":

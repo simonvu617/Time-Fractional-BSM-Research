@@ -25,6 +25,18 @@ class CrossSolverTests(unittest.TestCase):
                         self.assertGreaterEqual(np.min(np.diff(weighted.grid_price[-1])), -1e-9)
                         self.assertGreaterEqual(np.min(np.diff(l2.grid_price[-1])), -1e-9)
 
+    def test_cross_solver_difference_shrinks_under_refinement(self) -> None:
+        for alpha in (0.5, 0.9):
+            problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.04, 0.3, alpha, "call")
+            differences = []
+            for count in (60, 120, 240):
+                grid = GridSpec(-5.0, 5.0, count, count)
+                differences.append(
+                    abs(solve_weighted(problem, grid).price - solve_l2(problem, grid).price)
+                )
+            self.assertGreater(differences[0], differences[1])
+            self.assertGreater(differences[1], differences[2])
+
 
 if __name__ == "__main__":
     unittest.main()

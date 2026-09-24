@@ -17,8 +17,10 @@ The candidate model uses an inverse-stable market-time clock with:
 The `tfbsm_pricing` package contains two independently implemented European
 TFBSM finite-difference solvers:
 
-- the weighted L1 method of Krzyzanowski, Magdziarz, and Plociniczak (2020);
-- the L2 method of An et al. (2024).
+- the weighted L1 method of
+  [Krzyżanowski, Magdziarz, and Płociniczak (2020)](https://doi.org/10.1016/j.camwa.2020.04.029);
+- the L2 method of
+  [An, Wang, Liu, Anh, and Turner (2024)](https://doi.org/10.1007/s11075-023-01563-4).
 
 They share the same model and grid interface but keep their fractional-history
 weights and recurrences separate. Neither solver is coupled to the ThetaData
@@ -55,16 +57,14 @@ print(weighted.price, l2.price)
 `(time_steps + 1, space_steps + 1)`. The diagnostics report the scheme,
 spacing, paper order claims, and known proof limitations.
 
-The paper-to-code formula crosswalk is in
-[`docs/numerical_solvers.md`](docs/numerical_solvers.md). Reproducible paper,
-BSM-limit, and cross-solver results are in
-[`docs/validation_results.md`](docs/validation_results.md).
+The paper-to-code formula crosswalk, complete scholarly references, validation
+results, and known limitations are in
+[`docs/numerical_solvers.md`](docs/numerical_solvers.md).
 
 ## Run the checks
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m validation.run_validation
 ```
 
 Only NumPy is required.

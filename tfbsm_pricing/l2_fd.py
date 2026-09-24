@@ -1,4 +1,9 @@
-"""An et al. L2 time-discretization solver."""
+"""L2 solver from An, Wang, Liu, Anh, and Turner.
+
+Reference: Numerical Algorithms 95, 1--30 (2024),
+https://doi.org/10.1007/s11075-023-01563-4. Equations and pages are cited at
+the formulas they implement.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +14,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ._tridiagonal import TridiagonalFactor
-from .boundaries import boundary_values, payoff
-from .diagnostics import SolverResult
-from .grid import GridSpec
-from .model import EuropeanOptionProblem
+from .model import (
+    EuropeanOptionProblem,
+    GridSpec,
+    SolverResult,
+    boundary_values,
+    payoff,
+)
 
 
 InitialFunction = Callable[[NDArray[np.float64]], NDArray[np.float64]]
