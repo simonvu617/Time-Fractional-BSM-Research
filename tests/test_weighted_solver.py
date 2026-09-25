@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from tfbsm_pricing.model import EuropeanOptionProblem, GridSpec, SolverResult
-from tfbsm_pricing.weighted_fd import (
+from tfbsm_pricing.weighted_solver import (
     optimal_weight,
     paper_unconditional_stability_threshold,
     solve_weighted,

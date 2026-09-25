@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Literal, Mapping
 
 import numpy as np
 from numpy.typing import NDArray
@@ -103,6 +103,58 @@ class SolverResult:
     diagnostics: Mapping[str, Any]
 
 
+@dataclass(slots=True)
+class TridiagonalFactor:
+    """Reusable Thomas factorization of a nonsingular tridiagonal matrix."""
+
+    lower_multipliers: NDArray[np.float64]
+    diagonal: NDArray[np.float64]
+    upper: NDArray[np.float64]
+
+    @classmethod
+    def factor(
+        cls,
+        lower: NDArray[np.float64],
+        diagonal: NDArray[np.float64],
+        upper: NDArray[np.float64],
+    ) -> "TridiagonalFactor":
+        lower = np.asarray(lower, dtype=float).copy()
+        diagonal = np.asarray(diagonal, dtype=float).copy()
+        upper = np.asarray(upper, dtype=float).copy()
+        n = diagonal.size
+        if lower.size != max(n - 1, 0) or upper.size != max(n - 1, 0):
+            raise ValueError("invalid tridiagonal dimensions")
+        if n == 0:
+            raise ValueError("the system must contain at least one row")
+
+        multipliers = np.empty_like(lower)
+        tolerance = np.finfo(float).eps
+        for row in range(1, n):
+            pivot = diagonal[row - 1]
+            if abs(pivot) <= tolerance:
+                raise np.linalg.LinAlgError("zero pivot in tridiagonal factorization")
+            multiplier = lower[row - 1] / pivot
+            multipliers[row - 1] = multiplier
+            diagonal[row] -= multiplier * upper[row - 1]
+        if abs(diagonal[-1]) <= tolerance:
+            raise np.linalg.LinAlgError("zero pivot in tridiagonal factorization")
+        return cls(multipliers, diagonal, upper)
+
+    def solve(self, right_hand_side: NDArray[np.float64]) -> NDArray[np.float64]:
+        rhs = np.asarray(right_hand_side, dtype=float).copy()
+        if rhs.ndim != 1 or rhs.size != self.diagonal.size:
+            raise ValueError("right-hand side has the wrong shape")
+
+        for row in range(1, rhs.size):
+            rhs[row] -= self.lower_multipliers[row - 1] * rhs[row - 1]
+        rhs[-1] /= self.diagonal[-1]
+        for row in range(rhs.size - 2, -1, -1):
+            rhs[row] = (
+                rhs[row] - self.upper[row] * rhs[row + 1]
+            ) / self.diagonal[row]
+        return rhs
+
+
 def payoff(
     problem: EuropeanOptionProblem, x: NDArray[np.float64]
 ) -> NDArray[np.float64]:
@@ -187,3 +239,97 @@ def black_scholes_price(problem: EuropeanOptionProblem) -> float:
     if problem.option_type == "call":
         return problem.S0 * normal_cdf(d1) - discounted_strike * normal_cdf(d2)
     return discounted_strike * normal_cdf(-d2) - problem.S0 * normal_cdf(-d1)
+
+
+PricingSolver = Callable[[EuropeanOptionProblem, GridSpec], SolverResult]
+
+
+def refine_price(
+    solver: PricingSolver,
+    problem: EuropeanOptionProblem,
+    initial_grid: GridSpec,
+    *,
+    tolerance: float = 1e-4,
+    max_refinements: int = 3,
+) -> SolverResult:
+    """Estimate discretization error by joint refinement on a fixed domain.
+
+    Both space and time counts are doubled at each level. The returned error
+    is an empirical Richardson estimate, not a rigorous bound. It excludes
+    error caused by truncating the infinite asset-price domain.
+    """
+
+    if tolerance <= 0.0:
+        raise ValueError("tolerance must be positive")
+    if max_refinements < 2:
+        raise ValueError("max_refinements must be at least 2")
+
+    grids = [initial_grid]
+    results = [solver(problem, initial_grid)]
+    differences: list[float] = []
+    observed_order: float | None = None
+    estimated_error: float | None = None
+    converged = False
+
+    for _ in range(max_refinements):
+        previous_grid = grids[-1]
+        grid = GridSpec(
+            previous_grid.x_min,
+            previous_grid.x_max,
+            2 * previous_grid.space_steps,
+            2 * previous_grid.time_steps,
+        )
+        grids.append(grid)
+        results.append(solver(problem, grid))
+        differences.append(abs(results[-1].price - results[-2].price))
+
+        if len(differences) < 2:
+            continue
+
+        scale = max(1.0, *(abs(result.price) for result in results))
+        roundoff_floor = 32.0 * np.finfo(float).eps * scale
+        regular = (
+            all(difference > roundoff_floor for difference in differences)
+            and all(
+                later < earlier
+                for earlier, later in zip(differences, differences[1:])
+            )
+        )
+        if not regular:
+            observed_order = None
+            estimated_error = None
+            continue
+
+        ratio = differences[-2] / differences[-1]
+        observed_order = math.log2(ratio)
+        denominator = ratio - 1.0
+        if (
+            not math.isfinite(observed_order)
+            or observed_order <= 0.0
+            or denominator <= math.sqrt(np.finfo(float).eps)
+        ):
+            observed_order = None
+            estimated_error = None
+            continue
+
+        estimated_error = differences[-1] / denominator
+        if math.isfinite(estimated_error) and estimated_error <= tolerance:
+            converged = True
+            break
+
+    final = results[-1]
+    diagnostics = dict(final.diagnostics)
+    diagnostics["grid_refinement"] = {
+        "grid_levels": tuple(grids),
+        "prices": tuple(result.price for result in results),
+        "successive_differences": tuple(differences),
+        "observed_convergence_order": observed_order,
+        "estimated_remaining_discretization_error": estimated_error,
+        "requested_tolerance": tolerance,
+        "refinements": len(grids) - 1,
+        "converged": converged,
+        "error_estimate_kind": "empirical discretization-error estimate",
+        "fixed_domain": (initial_grid.x_min, initial_grid.x_max),
+        "finite_domain_error_included": False,
+    }
+    return replace(final, diagnostics=diagnostics)

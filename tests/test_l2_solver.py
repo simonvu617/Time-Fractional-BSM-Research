@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 from numpy.typing import NDArray
 
-from tfbsm_pricing.l2_fd import l2_coefficients, solve_l2_pde
+from tfbsm_pricing.l2_solver import l2_coefficients, solve_l2_pde
 from tfbsm_pricing.model import EuropeanOptionProblem, GridSpec
 
 

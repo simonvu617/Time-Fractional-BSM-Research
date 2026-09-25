@@ -12,11 +12,11 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
-from ._tridiagonal import TridiagonalFactor
 from .model import (
     EuropeanOptionProblem,
     GridSpec,
     SolverResult,
+    TridiagonalFactor,
     boundary_values,
     payoff,
 )

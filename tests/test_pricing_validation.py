@@ -11,10 +11,11 @@ from tfbsm_pricing import (
     solve_l2,
     solve_weighted,
 )
-from tfbsm_pricing.l2_fd import l2_coefficients
+from tfbsm_pricing.l2_solver import l2_coefficients
 from tfbsm_pricing.model import (
     EuropeanOptionProblem,
     GridSpec,
+    SolverResult,
     boundary_values,
     mittag_leffler_discount,
     payoff,
@@ -193,6 +194,51 @@ class ModelTests(unittest.TestCase):
                     self.assertTrue(np.all(np.diff(errors) < 0.0))
                     self.assertLess(errors[-1], errors[0] / 10.0)
 
+    def test_short_maturity_solvers_converge_to_independent_benchmark(self) -> None:
+        cases = (
+            EuropeanOptionProblem(1.0, 1.0, 7 / 365, 0.03, 0.2, 0.1, "call"),
+            EuropeanOptionProblem(
+                1.0, math.exp(0.0625), 14 / 365, 0.03, 0.6, 0.5, "put"
+            ),
+            EuropeanOptionProblem(
+                1.0, math.exp(0.0625), 7 / 365, 0.03, 1.0, 0.9, "call"
+            ),
+            EuropeanOptionProblem(
+                1.0,
+                math.exp(-0.0625),
+                14 / 365,
+                0.03,
+                0.6,
+                0.9999,
+                "put",
+            ),
+        )
+        for problem in cases:
+            benchmark_values = [
+                subordinated_bsm_price(problem, order)
+                for order in (64, 128, 256, 512)
+            ]
+            benchmark_changes = np.abs(np.diff(benchmark_values))
+            self.assertTrue(np.all(np.diff(benchmark_changes) < 0.0))
+            benchmark = benchmark_values[-1]
+            for solver in (solve_weighted, solve_l2):
+                errors = [
+                    abs(
+                        solver(problem, GridSpec(-2.0, 2.0, count, count)).price
+                        - benchmark
+                    )
+                    for count in (64, 128, 256, 512)
+                ]
+                with self.subTest(
+                    days=round(365 * problem.T),
+                    alpha=problem.alpha,
+                    option=problem.option_type,
+                    solver=solver.__name__,
+                ):
+                    self.assertTrue(np.all(np.diff(errors) < 0.0))
+                    self.assertLess(errors[-1], errors[0] / 20.0)
+                    self.assertLess(benchmark_changes[-1], errors[-1] / 100.0)
+
     def test_l2_remains_finite_and_convergent_near_alpha_one(self) -> None:
         bsm_problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.03, 0.3, 1.0, "call")
         bsm_price = black_scholes_price(bsm_problem)
@@ -231,7 +277,7 @@ class ModelTests(unittest.TestCase):
                 with self.subTest(solver=solver.__name__, mode=mode):
                     self.assertTrue(np.all(np.diff(errors) < 0.0))
 
-    def test_refinement_helper_reports_convergence(self) -> None:
+    def test_refinement_helper_reports_empirical_error(self) -> None:
         problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.0, 0.3, 0.5, "call")
         initial = GridSpec(-4.0, 4.0, 40, 40)
         for solver in (solve_weighted, solve_l2):
@@ -241,29 +287,57 @@ class ModelTests(unittest.TestCase):
             refinement = result.diagnostics["grid_refinement"]
             self.assertTrue(
                 {
-                    "coarse_grid",
-                    "fine_grid",
-                    "coarse_price",
-                    "fine_price",
-                    "absolute_difference",
-                    "refinements",
+                    "grid_levels",
+                    "prices",
+                    "successive_differences",
+                    "observed_convergence_order",
+                    "estimated_remaining_discretization_error",
                     "requested_tolerance",
                     "converged",
+                    "fixed_domain",
+                    "finite_domain_error_included",
                 }
                 <= refinement.keys()
             )
             self.assertTrue(refinement["converged"])
             self.assertEqual(refinement["refinements"], 3)
-            self.assertLessEqual(refinement["absolute_difference"], 5e-4)
-            self.assertEqual(refinement["requested_tolerance"], 5e-4)
-            self.assertEqual(result.price, refinement["fine_price"])
-            self.assertEqual(refinement["coarse_grid"].space_steps, 160)
-            self.assertEqual(refinement["fine_grid"].space_steps, 320)
+            self.assertEqual(len(refinement["grid_levels"]), 4)
+            self.assertEqual(result.price, refinement["prices"][-1])
+            self.assertTrue(np.all(np.diff(refinement["successive_differences"]) < 0.0))
+            self.assertGreater(refinement["observed_convergence_order"], 0.0)
+            self.assertLessEqual(
+                refinement["estimated_remaining_discretization_error"], 5e-4
+            )
+            self.assertEqual(refinement["fixed_domain"], (-4.0, 4.0))
+            self.assertFalse(refinement["finite_domain_error_included"])
 
-        result = refine_price(
-            solve_l2, problem, initial, tolerance=1e-12, max_refinements=1
+        strict = refine_price(
+            solve_l2, problem, initial, tolerance=1e-12, max_refinements=2
         )
-        self.assertFalse(result.diagnostics["grid_refinement"]["converged"])
+        self.assertFalse(strict.diagnostics["grid_refinement"]["converged"])
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            refine_price(solve_l2, problem, initial, max_refinements=1)
+
+        prices = iter((0.0, 1.0, 3.0))
+
+        def irregular_solver(
+            unused_problem: EuropeanOptionProblem, grid: GridSpec
+        ) -> SolverResult:
+            price = next(prices)
+            return SolverResult(
+                price,
+                grid.x_values(),
+                grid.time_values(unused_problem.T),
+                np.zeros((2, 2)),
+                {},
+            )
+
+        irregular = refine_price(
+            irregular_solver, problem, initial, max_refinements=2
+        ).diagnostics["grid_refinement"]
+        self.assertFalse(irregular["converged"])
+        self.assertIsNone(irregular["observed_convergence_order"])
+        self.assertIsNone(irregular["estimated_remaining_discretization_error"])
 
     def test_nonzero_rate_canonical_prices_match_subordination(self) -> None:
         grid = GridSpec(-6.0, 4.0, 400, 400)

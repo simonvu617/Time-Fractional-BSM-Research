@@ -78,7 +78,7 @@ it rejects larger arguments rather than risk cancellation error.
 
 ## Weighted L1 method
 
-`tfbsm_pricing.weighted_fd` implements KMP20 equations (7)--(11), pages 6--7.
+`tfbsm_pricing.weighted_solver` implements KMP20 equations (7)--(11), pages 6--7.
 For `dt=T/N`,
 
 ```text
@@ -118,7 +118,7 @@ boundary. The diagnostics implement this exact typeset condition.
 
 ## L2 method
 
-`tfbsm_pricing.l2_fd` independently implements An24 equations (7)--(17),
+`tfbsm_pricing.l2_solver` independently implements An24 equations (7)--(17),
 pages 6--7. The first step is the L1 formula in equation (7), with
 `phi_1=Gamma(2-alpha)dt^alpha`. Later steps use the quadratic L2 formula in
 equations (8)--(9), with `phi_2=Gamma(3-alpha)dt^alpha` and
@@ -144,9 +144,21 @@ not copied.
 
 ## Empirical grid-refinement estimate
 
-The low-level solvers continue to accept an explicit `GridSpec`. For workflows
-that need an accuracy check, `refine_price` repeatedly doubles both grid counts
-and compares consecutive prices:
+The low-level solvers accept an explicit `GridSpec`. `refine_price` jointly
+doubles space and time counts on the same finite domain. It evaluates at least
+`N`, `2N`, and `4N`, then uses
+
+```text
+p_hat = log2(|V_N-V_2N| / |V_2N-V_4N|),
+E_hat_4N = |V_4N-V_2N| / (2^p_hat-1).
+```
+
+This is an **empirical discretization-error estimate**, not a rigorous bound.
+The helper reports convergence only when all observed differences are above a
+roundoff floor, decrease strictly, `p_hat` is positive and finite, and the
+estimated remaining error is at most the requested tolerance. Otherwise it
+returns `converged=False` instead of treating close consecutive prices as
+proof of accuracy.
 
 ```python
 from tfbsm_pricing import GridSpec, refine_price, solve_l2
@@ -161,11 +173,16 @@ result = refine_price(
 estimate = result.diagnostics["grid_refinement"]
 ```
 
-The returned `SolverResult` contains the finest price and surface. Its
-`grid_refinement` diagnostics record the coarse and fine grids, both prices,
-their absolute difference, the requested tolerance, the refinement count, and
-whether the tolerance was reached. This difference is an empirical estimate,
-not a rigorous bound on error relative to the exact solution.
+The diagnostics contain every grid level and price, successive differences,
+the latest observed order, the estimated remaining discretization error, the
+requested tolerance, and the convergence flag. They also record the fixed
+log-price domain and state that finite-domain error is excluded. Domain width
+is validated separately because
+
+```text
+total numerical error
+  = finite-domain error + space discretization error + time discretization error.
+```
 
 ## Independence and sign audit
 
@@ -205,7 +222,7 @@ Run all reproducible checks with:
 python -m unittest discover -s tests -v
 ```
 
-The 24 tests cover all 15 An24 Table 1 entries. Representative values are:
+The 25 tests cover all 15 An24 Table 1 entries. Representative values are:
 
 | alpha | dt | paper maximum error | computed maximum error |
 |---:|---:|---:|---:|
@@ -276,6 +293,24 @@ With nonzero `r=0.05`, `S=1`, `K=1.1`, `T=1`, `sigma=0.3`, and `alpha=0.7`,
 the benchmark/weighted/L2 call prices are `0.1026890`, `0.1026182`, and
 `0.1026366`; put prices are `0.1443118`, `0.1442812`, and `0.1442764`. This
 also validates the Mittag--Leffler parity and boundaries away from `r=0`.
+
+### Seven- and fourteen-day maturities
+
+The research-facing short-maturity checks use `S=1`, `r=.03`, the fixed domain
+`[-2,2]`, and aligned strikes `1` or `exp(+/-0.0625)`. The table gives absolute
+errors against the independent order-512 subordination price as
+`N=64/128/256/512`, with `Nx=Nt=N`.
+
+| case | benchmark | weighted errors | L2 errors |
+|:---|---:|:---|:---|
+| 7d ATM call, `alpha=.1`, `sigma=.2` | .0696660711 | 1.927e-3 / 5.069e-4 / 1.314e-4 / 3.465e-5 | 1.924e-3 / 5.053e-4 / 1.306e-4 / 3.424e-5 |
+| 14d slightly ITM put, `alpha=.5`, `sigma=.6` | .1382332752 | 9.018e-4 / 2.549e-4 / 7.780e-5 / 2.643e-5 | 8.955e-4 / 2.519e-4 / 7.641e-5 / 2.576e-5 |
+| 7d slightly OTM call, `alpha=.9`, `sigma=1` | .0425209975 | 1.142e-3 / 3.045e-4 / 8.676e-5 / 2.726e-5 | 1.107e-3 / 2.846e-4 / 7.580e-5 / 2.132e-5 |
+| 14d slightly OTM put, `alpha=.9999`, `sigma=.6` | .0210735049 | 1.284e-3 / 3.174e-4 / 7.905e-5 / 1.975e-5 | 1.285e-3 / 3.176e-4 / 7.909e-5 / 1.975e-5 |
+
+Every finite-difference error decreases at each refinement. For these cases,
+the order-256 to order-512 benchmark change is at most `8.98e-8`, more than
+100 times smaller than the finest finite-difference error.
 
 ### Near-classical limit
 
