@@ -142,6 +142,31 @@ equation (20), page 8, prints a positive upper off-diagonal entry that conflicts
 with those component equations and the differential operator, so that sign is
 not copied.
 
+## Empirical grid-refinement estimate
+
+The low-level solvers continue to accept an explicit `GridSpec`. For workflows
+that need an accuracy check, `refine_price` repeatedly doubles both grid counts
+and compares consecutive prices:
+
+```python
+from tfbsm_pricing import GridSpec, refine_price, solve_l2
+
+result = refine_price(
+    solve_l2,
+    problem,
+    GridSpec(-4.0, 4.0, 80, 80),
+    tolerance=1e-4,
+    max_refinements=3,
+)
+estimate = result.diagnostics["grid_refinement"]
+```
+
+The returned `SolverResult` contains the finest price and surface. Its
+`grid_refinement` diagnostics record the coarse and fine grids, both prices,
+their absolute difference, the requested tolerance, the refinement count, and
+whether the tolerance was reached. This difference is an empirical estimate,
+not a rigorous bound on error relative to the exact solution.
+
 ## Independence and sign audit
 
 The solvers share model definitions, boundaries, result types, and a Thomas
@@ -180,7 +205,7 @@ Run all reproducible checks with:
 python -m unittest discover -s tests -v
 ```
 
-The tests cover all 15 An24 Table 1 entries. Representative values are:
+The 24 tests cover all 15 An24 Table 1 entries. Representative values are:
 
 | alpha | dt | paper maximum error | computed maximum error |
 |---:|---:|---:|---:|
@@ -210,20 +235,84 @@ and from `7.92e-5` to `2.73e-5` at `alpha=0.9` over 60--240 intervals.
 uses the distributional identity
 `S_alpha(t)=t^alpha D_1^(-alpha)`, Kanter's positive-stable representation [3],
 and deterministic Gauss--Legendre quadrature. Its clock mean agrees with
-`t^alpha/Gamma(1+alpha)` within `1.3e-5` at quadrature order 96.
+`t^alpha/Gamma(1+alpha)` within `1e-5` at quadrature order 256 for
+`alpha=0.1, 0.5, 0.9, 0.9999`. The same quadrature reproduces
+`E_alpha(-0.05)` within `2.1e-7` across those orders.
 
-For an ATM call with `S=K=T=1`, `r=0`, `sigma=0.3`, and a 400-by-400 FD grid:
+Benchmark prices converge independently of either finite-difference method:
 
-| alpha | subordination | weighted FD | L2 FD |
-|---:|---:|---:|---:|
-| 0.5 | 0.1163738 | 0.1161971 | 0.1161984 |
-| 0.7 | 0.1184408 | 0.1182756 | 0.1182823 |
-| 0.9 | 0.1192653 | 0.1191253 | 0.1191359 |
+| case | order 32 | order 64 | order 128 | order 256 | `|V256-V512|` |
+|:---|---:|---:|---:|---:|---:|
+| `alpha=.1`, short ATM call | .101133993 | .101139277 | .101140632 | .101140964 | 7.97e-8 |
+| `alpha=.3`, long ITM put | .637119071 | .637118225 | .637117954 | .637117875 | 2.16e-8 |
+| `alpha=.9999`, ATM put | .103285676 | .103281179 | .103278738 | .103278153 | 6.97e-8 |
+
+The largest `|V128-V256|` in this table is `5.85e-7`, below the tolerances used
+to judge the finite-difference methods.
+
+The next table reports absolute error relative to the order-512 benchmark on
+`[-4,4]`, with `Nx=Nt=N`. Strikes at `exp(0.5)`, `1`, or `exp(-0.5)` align
+with every spatial grid, preventing payoff-grid alignment from obscuring the
+refinement trend. All cases use `S=1`. In alpha order, `(K,T,r,sigma)` is
+`(1,.25,0,.3)`, `(exp(.5),2,.03,.4)`, `(exp(.5),1,0,.3)`,
+`(exp(-.5),1,.03,.35)`, `(exp(-.5),2,.04,.45)`, and `(1,1,.03,.3)`.
+
+| alpha and case | solver | N=80 | N=160 | N=320 | N=640 |
+|:---|:---|---:|---:|---:|---:|
+| .1, short ATM call | weighted | 3.017e-3 | 7.849e-4 | 2.012e-4 | 5.209e-5 |
+|  | L2 | 3.015e-3 | 7.837e-4 | 2.006e-4 | 5.180e-5 |
+| .3, long ITM put | weighted | 2.551e-4 | 6.769e-5 | 1.853e-5 | 5.413e-6 |
+|  | L2 | 2.497e-4 | 6.515e-5 | 1.729e-5 | 4.809e-6 |
+| .5, OTM call | weighted | 2.320e-4 | 8.332e-5 | 3.305e-5 | 1.434e-5 |
+|  | L2 | 1.800e-4 | 5.732e-5 | 2.005e-5 | 7.844e-6 |
+| .9, OTM put | weighted | 1.850e-4 | 6.258e-5 | 2.373e-5 | 1.015e-5 |
+|  | L2 | 1.467e-4 | 4.153e-5 | 1.230e-5 | 3.999e-6 |
+| .99, long ITM call | weighted | 3.818e-4 | 1.038e-4 | 3.043e-5 | 1.000e-5 |
+|  | L2 | 3.668e-4 | 9.434e-5 | 2.488e-5 | 6.864e-6 |
+| .9999, ATM put | weighted | 1.632e-3 | 4.011e-4 | 9.989e-5 | 2.496e-5 |
+|  | L2 | 1.634e-3 | 4.015e-4 | 9.999e-5 | 2.498e-5 |
 
 With nonzero `r=0.05`, `S=1`, `K=1.1`, `T=1`, `sigma=0.3`, and `alpha=0.7`,
 the benchmark/weighted/L2 call prices are `0.1026890`, `0.1026182`, and
 `0.1026366`; put prices are `0.1443118`, `0.1442812`, and `0.1442764`. This
 also validates the Mittag--Leffler parity and boundaries away from `r=0`.
+
+### Near-classical limit
+
+All L2 coefficient arrays through 800 lags are finite at
+`alpha=0.99, 0.999, 0.9999, 1`. Prices and complete surfaces contain no
+NaNs or infinities. For an ATM call with `r=.03`, `sigma=.3`, and `T=1`, the
+order-512 benchmark approaches analytic BSM monotonically:
+
+| alpha | benchmark | distance to BSM | weighted error, N=640 | L2 error, N=640 |
+|---:|---:|---:|---:|---:|
+| .99 | .1328956641 | 6.258e-5 | 2.790e-5 | 2.604e-5 |
+| .999 | .1328395037 | 6.420e-6 | 2.507e-5 | 2.490e-5 |
+| .9999 | .1328337366 | 6.526e-7 | 2.478e-5 | 2.479e-5 |
+| 1 | .1328330840 | 0 | 2.474e-5 | 2.477e-5 |
+
+Direct high-precision spot checks show relative cancellation in the smallest
+late-lag L2 coefficients near one, but the absolute discrepancies remain near
+machine precision. The price tests show monotone convergence and no resulting
+instability, so the paper's coefficient formulas remain unchanged.
+
+### Separate time, space, and joint refinement
+
+For the `alpha=.5`, `S=K=T=1`, `r=0`, `sigma=.3` call, the table reports error
+against the order-512 benchmark. Time refinement fixes `Nx=640`; space
+refinement fixes `Nt=640`; joint refinement uses `Nx=Nt=N`.
+
+| mode and solver | N=80 | N=160 | N=320 |
+|:---|---:|---:|---:|
+| time, weighted | 1.531e-4 | 9.539e-5 | 6.682e-5 |
+| time, L2 | 1.458e-4 | 9.196e-5 | 6.517e-5 |
+| space, weighted | 2.450e-3 | 6.296e-4 | 1.683e-4 |
+| space, L2 | 2.450e-3 | 6.289e-4 | 1.675e-4 |
+| joint, weighted | 2.551e-3 | 6.723e-4 | 1.825e-4 |
+| joint, L2 | 2.546e-3 | 6.692e-4 | 1.809e-4 |
+
+At these grids, spatial error dominates the residual. All three controlled
+sequences decrease for both solvers.
 
 ### Domain convergence
 

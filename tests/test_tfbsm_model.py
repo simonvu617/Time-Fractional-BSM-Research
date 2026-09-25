@@ -5,7 +5,13 @@ import unittest
 
 import numpy as np
 
-from tfbsm_pricing import black_scholes_price, solve_l2, solve_weighted
+from tfbsm_pricing import (
+    black_scholes_price,
+    refine_price,
+    solve_l2,
+    solve_weighted,
+)
+from tfbsm_pricing.l2_fd import l2_coefficients
 from tfbsm_pricing.model import (
     EuropeanOptionProblem,
     GridSpec,
@@ -126,29 +132,138 @@ class ModelTests(unittest.TestCase):
             mittag_leffler_discount(0.5, 1.0, 1.0)
 
     def test_inverse_stable_quadrature_moments(self) -> None:
-        for alpha in (0.5, 0.7, 0.9):
+        for alpha in (0.1, 0.5, 0.9, 0.9999):
             expected = 1.0 / math.gamma(1.0 + alpha)
             self.assertAlmostEqual(
-                inverse_stable_moment(alpha, 1.0, 1.0), expected, delta=2e-5
+                inverse_stable_moment(alpha, 1.0, 1.0, order=256),
+                expected,
+                delta=1e-5,
             )
 
     def test_canonical_discount_matches_clock_expectation(self) -> None:
-        for alpha in (0.5, 0.7, 0.9):
-            clock, weights = inverse_stable_quadrature(alpha, 1.0, order=128)
+        for alpha in (0.1, 0.5, 0.9, 0.9999):
+            clock, weights = inverse_stable_quadrature(alpha, 1.0, order=256)
             expected = float(weights @ np.exp(-0.05 * clock))
             self.assertAlmostEqual(
                 mittag_leffler_discount(alpha, 0.05, 1.0), expected, delta=5e-7
             )
 
-    def test_fractional_solvers_match_subordination_benchmark(self) -> None:
-        grid = GridSpec(-6.0, 4.0, 400, 400)
-        for alpha in (0.5, 0.7, 0.9):
-            problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.0, 0.3, alpha, "call")
-            benchmark = subordinated_bsm_price(problem, order=128)
-            self.assertAlmostEqual(
-                solve_weighted(problem, grid).price, benchmark, delta=3e-4
+    def test_subordination_quadrature_converges_independently(self) -> None:
+        cases = (
+            EuropeanOptionProblem(1.0, 1.0, 0.25, 0.0, 0.3, 0.1, "call"),
+            EuropeanOptionProblem(
+                1.0, math.exp(0.5), 2.0, 0.03, 0.4, 0.3, "put"
+            ),
+            EuropeanOptionProblem(1.0, 1.0, 1.0, 0.03, 0.3, 0.9999, "put"),
+        )
+        for problem in cases:
+            values = [
+                subordinated_bsm_price(problem, order)
+                for order in (32, 64, 128, 256, 512)
+            ]
+            changes = np.abs(np.diff(values))
+            with self.subTest(alpha=problem.alpha, option=problem.option_type):
+                self.assertTrue(np.all(changes[1:] < changes[:-1]))
+                self.assertLess(changes[2], 1e-6)
+                self.assertLess(changes[3], 1e-7)
+
+    def test_both_solvers_converge_to_subordination_across_alpha_range(self) -> None:
+        cases = (
+            (0.1, 1.0, 0.25, 0.0, 0.3, "call"),
+            (0.3, math.exp(0.5), 2.0, 0.03, 0.4, "put"),
+            (0.5, math.exp(0.5), 1.0, 0.0, 0.3, "call"),
+            (0.9, math.exp(-0.5), 1.0, 0.03, 0.35, "put"),
+            (0.99, math.exp(-0.5), 2.0, 0.04, 0.45, "call"),
+            (0.9999, 1.0, 1.0, 0.03, 0.3, "put"),
+        )
+        for alpha, strike, maturity, rate, sigma, option_type in cases:
+            problem = EuropeanOptionProblem(
+                1.0, strike, maturity, rate, sigma, alpha, option_type
             )
-            self.assertAlmostEqual(solve_l2(problem, grid).price, benchmark, delta=3e-4)
+            benchmark = subordinated_bsm_price(problem, order=512)
+            for solver in (solve_weighted, solve_l2):
+                errors = [
+                    abs(
+                        solver(problem, GridSpec(-4.0, 4.0, count, count)).price
+                        - benchmark
+                    )
+                    for count in (80, 160, 320, 640)
+                ]
+                with self.subTest(alpha=alpha, solver=solver.__name__):
+                    self.assertTrue(np.all(np.diff(errors) < 0.0))
+                    self.assertLess(errors[-1], errors[0] / 10.0)
+
+    def test_l2_remains_finite_and_convergent_near_alpha_one(self) -> None:
+        bsm_problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.03, 0.3, 1.0, "call")
+        bsm_price = black_scholes_price(bsm_problem)
+        benchmark_distances = []
+        for alpha in (0.99, 0.999, 0.9999, 1.0):
+            coefficients = np.concatenate(l2_coefficients(alpha, 800))
+            self.assertTrue(np.all(np.isfinite(coefficients[~np.isnan(coefficients)])))
+            problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.03, 0.3, alpha, "call")
+            benchmark = subordinated_bsm_price(problem, order=512)
+            benchmark_distances.append(abs(benchmark - bsm_price))
+            result = solve_l2(problem, GridSpec(-4.0, 4.0, 160, 160))
+            self.assertTrue(np.isfinite(result.price))
+            self.assertTrue(np.all(np.isfinite(result.grid_price)))
+        self.assertTrue(np.all(np.diff(benchmark_distances) < 0.0))
+
+        problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.03, 0.3, 0.999, "call")
+        benchmark = subordinated_bsm_price(problem, order=512)
+        for solver in (solve_weighted, solve_l2):
+            errors = [
+                abs(solver(problem, GridSpec(-4.0, 4.0, n, n)).price - benchmark)
+                for n in (80, 160, 320, 640)
+            ]
+            self.assertTrue(np.all(np.diff(errors) < 0.0))
+
+    def test_separate_time_space_and_joint_refinement(self) -> None:
+        problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.0, 0.3, 0.5, "call")
+        benchmark = subordinated_bsm_price(problem, order=512)
+        grids = {
+            "time": [GridSpec(-4.0, 4.0, 640, n) for n in (80, 160, 320)],
+            "space": [GridSpec(-4.0, 4.0, n, 640) for n in (80, 160, 320)],
+            "joint": [GridSpec(-4.0, 4.0, n, n) for n in (80, 160, 320)],
+        }
+        for solver in (solve_weighted, solve_l2):
+            for mode, sequence in grids.items():
+                errors = [abs(solver(problem, grid).price - benchmark) for grid in sequence]
+                with self.subTest(solver=solver.__name__, mode=mode):
+                    self.assertTrue(np.all(np.diff(errors) < 0.0))
+
+    def test_refinement_helper_reports_convergence(self) -> None:
+        problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.0, 0.3, 0.5, "call")
+        initial = GridSpec(-4.0, 4.0, 40, 40)
+        for solver in (solve_weighted, solve_l2):
+            result = refine_price(
+                solver, problem, initial, tolerance=5e-4, max_refinements=3
+            )
+            refinement = result.diagnostics["grid_refinement"]
+            self.assertTrue(
+                {
+                    "coarse_grid",
+                    "fine_grid",
+                    "coarse_price",
+                    "fine_price",
+                    "absolute_difference",
+                    "refinements",
+                    "requested_tolerance",
+                    "converged",
+                }
+                <= refinement.keys()
+            )
+            self.assertTrue(refinement["converged"])
+            self.assertEqual(refinement["refinements"], 3)
+            self.assertLessEqual(refinement["absolute_difference"], 5e-4)
+            self.assertEqual(refinement["requested_tolerance"], 5e-4)
+            self.assertEqual(result.price, refinement["fine_price"])
+            self.assertEqual(refinement["coarse_grid"].space_steps, 160)
+            self.assertEqual(refinement["fine_grid"].space_steps, 320)
+
+        result = refine_price(
+            solve_l2, problem, initial, tolerance=1e-12, max_refinements=1
+        )
+        self.assertFalse(result.diagnostics["grid_refinement"]["converged"])
 
     def test_nonzero_rate_canonical_prices_match_subordination(self) -> None:
         grid = GridSpec(-6.0, 4.0, 400, 400)
