@@ -17,10 +17,14 @@ The candidate model uses an inverse-stable market-time clock with:
 The `tfbsm_pricing` package contains two independently implemented European
 TFBSM finite-difference solvers:
 
-- the weighted L1 method of
-  [Krzyżanowski, Magdziarz, and Płociniczak (2020)](https://doi.org/10.1016/j.camwa.2020.04.029);
-- the L2 method of
-  [An, Wang, Liu, Anh, and Turner (2024)](https://doi.org/10.1007/s11075-023-01563-4).
+- the weighted L1 method in G. Krzyżanowski, M. Magdziarz, and Ł.
+  Płociniczak, [“A weighted finite difference method for subdiffusive
+  Black-Scholes model”](https://doi.org/10.1016/j.camwa.2020.04.029),
+  *Computers & Mathematics with Applications* 80(5), 653-670 (2020);
+- the L2 method in X. An, Q. Wang, F. Liu, V. V. Anh, and I. W. Turner,
+  [“Parameter estimation for time-fractional Black-Scholes equation with S&P
+  500 index option”](https://doi.org/10.1007/s11075-023-01563-4),
+  *Numerical Algorithms* 95, 1-30 (2024).
 
 They share the same model and grid interface but keep their fractional-history
 weights and recurrences separate. Neither solver is coupled to the ThetaData

@@ -1,8 +1,12 @@
-"""Weighted L1 solver from Krzyzanowski, Magdziarz, and Plociniczak.
+"""Weighted L1 solver reproduced from KMP20.
 
-Reference: Computers & Mathematics with Applications 80(5), 653--670 (2020),
-https://doi.org/10.1016/j.camwa.2020.04.029. Equations and pages are cited at
-the formulas they implement.
+KMP20: G. Krzyzanowski, M. Magdziarz, and L. Plociniczak, "A weighted
+finite difference method for subdiffusive Black-Scholes model," Computers &
+Mathematics with Applications 80(5), 653-670 (2020).
+DOI: https://doi.org/10.1016/j.camwa.2020.04.029
+Open manuscript: https://arxiv.org/abs/1907.00297v4
+
+Equation and page locators below refer to the publisher PDF.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from .model import (
 
 
 def weighted_caputo_weights(alpha: float, count: int) -> NDArray[np.float64]:
-    """Return the paper's L1 weights ``b_j`` (equation (7), page 6)."""
+    """Return ``b_j`` from KMP20 equation (7), PDF page 6."""
 
     if not 0.0 < alpha <= 1.0:
         raise ValueError("alpha must satisfy 0 < alpha <= 1")
@@ -40,7 +44,7 @@ def weighted_caputo_weights(alpha: float, count: int) -> NDArray[np.float64]:
 
 
 def optimal_weight(alpha: float) -> float:
-    """Return the stable weight proposed on page 16 of the 2020 paper."""
+    """Return KMP20's optimal stable weight after Theorem 3.3, PDF page 16."""
 
     if not 0.0 < alpha <= 1.0:
         raise ValueError("alpha must satisfy 0 < alpha <= 1")
@@ -49,7 +53,7 @@ def optimal_weight(alpha: float) -> float:
 
 
 def paper_unconditional_stability_threshold(theta: float) -> float:
-    """Return the minimum alpha in KMP20 Theorem 3.2(i), page 10.
+    """Return the minimum alpha in KMP20 Theorem 3.2(i), PDF page 10.
 
     The typeset condition is ``1-log2(2-theta/(1-theta)) <= alpha``.
     For ``theta >= 2/3`` its logarithm is not positive, so the theorem gives no
@@ -69,7 +73,7 @@ def solve_weighted(
     *,
     theta: float | None = None,
 ) -> SolverResult:
-    """Price an option with equations (7)--(11) of Krzyzanowski et al.
+    """Price an option with KMP20 equations (7)-(11), PDF pages 6-7.
 
     The paper defines ``theta=0`` as fully implicit and ``theta=1`` as fully
     explicit.  When omitted, ``theta`` is their alpha-dependent optimal stable
@@ -98,8 +102,8 @@ def solve_weighted(
         surface[step, 0] = left
         surface[step, -1] = right
 
-    # After x=log(S), L u = a*u_xx + b*u_x - r*u.  Centered differences
-    # produce these three constant coefficients on the uniform grid.
+    # KMP20 equations (9)-(11), PDF page 7: after x=log(S), centered
+    # differences of L u = a*u_xx + b*u_x - r*u give these coefficients.
     lower_l = problem.diffusion / dx**2 - problem.drift / (2.0 * dx)
     diagonal_l = -2.0 * problem.diffusion / dx**2 - problem.r
     upper_l = problem.diffusion / dx**2 + problem.drift / (2.0 * dx)
@@ -121,9 +125,9 @@ def solve_weighted(
         if step == 1:
             history = surface[0, 1:-1].copy()
         else:
-            # Equation (11): successive differences of b_j multiply the
-            # preceding solution levels, newest first.  The final b term
-            # multiplies the payoff level.
+            # KMP20 equation (11), PDF page 7: successive differences of b_j
+            # multiply prior levels newest-first; the final b term multiplies
+            # the payoff level.
             history_coefficients = weights[: step - 1] - weights[1:step]
             prior_levels = surface[step - 1 : 0 : -1, 1:-1]
             history = history_coefficients @ prior_levels
@@ -137,9 +141,9 @@ def solve_weighted(
         )
         rhs = history + theta * scale * previous_l
 
-        # The current boundary values occur in the implicit spatial operator
-        # and move to the right-hand side.  The preceding boundaries are
-        # already included in previous_l above.
+        # KMP20 equations (8) and (11), PDF page 7: current boundaries from
+        # the implicit operator move to the right-hand side. Previous
+        # boundaries are already included in previous_l.
         rhs[0] += (1.0 - theta) * scale * lower_l * surface[step, 0]
         rhs[-1] += (1.0 - theta) * scale * upper_l * surface[step, -1]
         surface[step, 1:-1] = factor.solve(rhs)
@@ -154,7 +158,9 @@ def solve_weighted(
         grid_price=surface,
         diagnostics={
             "solver": "weighted_l1",
-            "paper": "Krzyzanowski, Magdziarz, and Plociniczak (2020)",
+            "paper": "KMP20",
+            "paper_doi": "10.1016/j.camwa.2020.04.029",
+            "paper_equations": "(7)-(11)",
             "theta": theta,
             "dt": dt,
             "dx": dx,

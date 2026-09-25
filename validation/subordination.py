@@ -1,9 +1,15 @@
-"""Independent inverse-stable subordination benchmark for validation only.
+"""Independent inverse-stable subordination benchmark.
 
-KMP20, page 3, states ``V_alpha(t)=E[V_BS(S_alpha(t))]``. This module evaluates
-that expectation without using either finite-difference history recurrence.
-The stable-law representation is from Kanter (1975),
-https://doi.org/10.1214/aop/1176996309.
+KMP20 Section 2.2, PDF pages 3-5, gives
+``V_alpha(t)=E[V_BS(S_alpha(t))]`` and the inverse-clock density transform.
+DOI: https://doi.org/10.1016/j.camwa.2020.04.029
+
+The positive-stable random-variable representation is from M. Kanter,
+"Stable densities under change of scale and total variation inequalities,"
+The Annals of Probability 3(4), 697-707 (1975).
+DOI: https://doi.org/10.1214/aop/1176996309
+
+This module uses neither finite-difference recurrence.
 """
 
 from __future__ import annotations
@@ -24,10 +30,10 @@ def inverse_stable_quadrature(
 
     If ``D_1`` is a positive alpha-stable random variable with Laplace
     transform ``exp(-s**alpha)``, then the inverse clock satisfies
-    ``S_alpha(t) = t**alpha * D_1**(-alpha)`` in distribution. Kanter's exact
-    representation writes ``D_1`` in terms of independent uniform and
-    exponential variables. Gauss--Legendre quadrature integrates both uniforms
-    after transforming the exponential variable by its inverse CDF.
+    ``S_alpha(t) = t**alpha * D_1**(-alpha)`` in distribution (KMP20,
+    Section 2.2, PDF pages 3-5). Kanter's representation writes ``D_1`` using
+    independent uniform and exponential variables. Gauss-Legendre quadrature
+    integrates both uniforms after the exponential inverse-CDF transform.
     """
 
     if not 0.0 < alpha <= 1.0:

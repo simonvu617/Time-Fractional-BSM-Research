@@ -1,8 +1,24 @@
 # European TFBSM solvers: definitions, citations, and validation
 
-This document defines the model before describing the code. Citations use
-`KMP20` for Krzyżanowski, Magdziarz, and Płociniczak [1] and `An24` for An et
-al. [2]. Both papers are listed in full, with DOI links, in the references.
+This document defines the model before describing the code. Source keys are
+`KMP20`, `An24`, and `Kanter75`; full references and persistent links appear
+below. Equation numbers and PDF pages refer to the publisher-version PDFs, not
+the journal's running page numbers.
+
+## Paper-to-code citation crosswalk
+
+| Implemented item | Primary-source locator | Code |
+|:---|:---|:---|
+| Inverse-stable TFBS model, `x=log(S)`, elapsed time | KMP20 equations (4)-(6), PDF pages 5-6; An24 equations (2)-(4), PDF pages 4-5 | `model.py` |
+| Weighted L1 coefficients and history | KMP20 equation (7), PDF page 6; weighted recurrence (11), PDF page 7 | `weighted_solver.py` |
+| Weighted-method stability and convergence | KMP20 Theorem 3.2, PDF page 10; Theorem 3.3 and optimal weight, PDF pages 15-16 | `weighted_solver.py` |
+| L2 startup and fractional coefficients | An24 equations (7)-(9), PDF page 6 | `l2_solver.py` |
+| L2 spatial differences and complete recurrence | An24 equations (12)-(17), PDF page 7 | `l2_solver.py` |
+| An24 matrix-sign discrepancy | Component equations (14)-(17), PDF page 7, compared with equation (20), PDF page 8 | `l2_solver.py` |
+| Independent subordination benchmark | KMP20 Section 2.2, PDF pages 3-5; Kanter75 positive-stable representation | `validation/subordination.py` |
+
+The comments beside each nontrivial recurrence repeat its source locator so the
+implementation can be audited without searching this document.
 
 ## Shared pricing problem
 
@@ -250,7 +266,7 @@ and from `7.92e-5` to `2.73e-5` at `alpha=0.9` over 60--240 intervals.
 
 `validation/subordination.py` does not use either fractional recurrence. It
 uses the distributional identity
-`S_alpha(t)=t^alpha D_1^(-alpha)`, Kanter's positive-stable representation [3],
+`S_alpha(t)=t^alpha D_1^(-alpha)`, Kanter75's positive-stable representation,
 and deterministic Gauss--Legendre quadrature. Its clock mean agrees with
 `t^alpha/Gamma(1+alpha)` within `1e-5` at quadrature order 256 for
 `alpha=0.1, 0.5, 0.9, 0.9999`. The same quadrature reproduces
@@ -375,15 +391,17 @@ at the prescribed boundary `x=x_max`.
 
 ## References
 
-1. G. Krzyżanowski, M. Magdziarz, and Ł. Płociniczak, “A weighted finite
-   difference method for subdiffusive Black--Scholes model,” *Computers &
-   Mathematics with Applications*, 80(5), 653--670, 2020.
-   [doi:10.1016/j.camwa.2020.04.029](https://doi.org/10.1016/j.camwa.2020.04.029);
-   [arXiv:1907.00297](https://arxiv.org/abs/1907.00297).
-2. X. An, Q. Wang, F. Liu, V. V. Anh, and I. W. Turner, “Parameter estimation
-   for time-fractional Black--Scholes equation with S&P 500 index option,”
-   *Numerical Algorithms*, 95, 1--30, 2024.
-   [doi:10.1007/s11075-023-01563-4](https://doi.org/10.1007/s11075-023-01563-4).
-3. M. Kanter, “Stable densities under change of scale and total variation
-   inequalities,” *The Annals of Probability*, 3(4), 697--707, 1975.
-   [doi:10.1214/aop/1176996309](https://doi.org/10.1214/aop/1176996309).
+- **KMP20:** G. Krzyżanowski, M. Magdziarz, and Ł. Płociniczak, “A weighted
+  finite difference method for subdiffusive Black-Scholes model,” *Computers &
+  Mathematics with Applications* **80**(5), 653-670 (2020).
+  [Publisher DOI](https://doi.org/10.1016/j.camwa.2020.04.029);
+  [open manuscript, arXiv:1907.00297v4](https://arxiv.org/abs/1907.00297v4).
+
+- **An24:** X. An, Q. Wang, F. Liu, V. V. Anh, and I. W. Turner, “Parameter
+  estimation for time-fractional Black-Scholes equation with S&P 500 index
+  option,” *Numerical Algorithms* **95**, 1-30 (2024). Published online 27 June
+  2023. [Publisher DOI and open article](https://doi.org/10.1007/s11075-023-01563-4).
+
+- **Kanter75:** M. Kanter, “Stable densities under change of scale and total
+  variation inequalities,” *The Annals of Probability* **3**(4), 697-707
+  (1975). [Publisher DOI](https://doi.org/10.1214/aop/1176996309).

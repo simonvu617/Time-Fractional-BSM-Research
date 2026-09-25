@@ -1,8 +1,11 @@
-"""L2 solver from An, Wang, Liu, Anh, and Turner.
+"""L2 solver reproduced from An24.
 
-Reference: Numerical Algorithms 95, 1--30 (2024),
-https://doi.org/10.1007/s11075-023-01563-4. Equations and pages are cited at
-the formulas they implement.
+An24: X. An, Q. Wang, F. Liu, V. V. Anh, and I. W. Turner, "Parameter
+estimation for time-fractional Black-Scholes equation with S&P 500 index
+option," Numerical Algorithms 95, 1-30 (2024).
+DOI and open article: https://doi.org/10.1007/s11075-023-01563-4
+
+Equation and page locators below refer to the publisher PDF.
 """
 
 from __future__ import annotations
@@ -33,8 +36,8 @@ def l2_coefficients(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Return the independent ``a_i``, ``b_i``, and ``c_i`` L2 sequences.
 
-    The formulas are equations (8)--(9) of An et al., page 6.  Element zero is
-    unused so array indices match the paper's one-based subscripts.
+    These are An24 equations (8)-(9), PDF page 6. Element zero is unused so
+    array indices match the paper's one-based subscripts.
     """
 
     if not 0.0 < alpha <= 1.0:
@@ -74,7 +77,7 @@ def solve_l2(
     problem: EuropeanOptionProblem,
     grid: GridSpec,
 ) -> SolverResult:
-    """Price an option with equations (7)--(17) of An et al. (2024)."""
+    """Price an option with An24 equations (7)-(17), PDF pages 6-7."""
 
     return solve_l2_pde(
         problem,
@@ -96,9 +99,8 @@ def solve_l2_pde(
 ) -> SolverResult:
     """Solve the paper's transformed PDE, optionally with a validation source.
 
-    The callback form exists to reproduce the manufactured-solution experiment
-    in An et al.; the public option pricer supplies the European payoff and
-    boundaries automatically.
+    The callback form reproduces An24 Section 4.4's manufactured-solution
+    experiment; the public option pricer supplies the payoff and boundaries.
     """
 
     log_spot = math.log(problem.S0)
@@ -122,13 +124,14 @@ def solve_l2_pde(
         surface[step, 0] = left
         surface[step, -1] = right
 
-    # These coefficients discretize the same log-price operator as the L1
-    # solver, but the time recurrence and all fractional weights below are
-    # independently implemented from An et al.
+    # An24 equations (12)-(13), PDF page 7, give the centered log-price
+    # operator. Its L2 weights and history recurrence remain independent of
+    # the KMP20 solver.
     lower_l = problem.diffusion / dx**2 - problem.drift / (2.0 * dx)
     diagonal_l = -2.0 * problem.diffusion / dx**2 - problem.r
     upper_l = problem.diffusion / dx**2 + problem.drift / (2.0 * dx)
 
+    # An24 equations (7) and (14), PDF pages 6-7: L1 starts the L2 method.
     phi_1 = math.gamma(2.0 - problem.alpha) * dt**problem.alpha
     first_factor = _implicit_factor(
         interior_size, phi_1, 1.0, lower_l, diagonal_l, upper_l
@@ -144,6 +147,7 @@ def solve_l2_pde(
         a_weight, b_weight, c_weight = l2_coefficients(
             problem.alpha, grid.time_steps
         )
+        # An24 equations (8)-(9) and (15)-(17), PDF pages 6-7.
         phi_2 = math.gamma(3.0 - problem.alpha) * dt**problem.alpha
         beta = c_weight[1] + (4.0 - problem.alpha) / 2.0
         later_factor = _implicit_factor(
@@ -152,15 +156,18 @@ def solve_l2_pde(
 
         for step in range(2, grid.time_steps + 1):
             if step == 2:
+                # An24 equation (15), PDF page 7.
                 rhs = (2.0 - b_weight[1]) * surface[1, 1:-1]
                 rhs -= (0.5 * problem.alpha + a_weight[1]) * surface[0, 1:-1]
             elif step == 3:
+                # An24 equation (16), PDF page 7.
                 rhs = (2.0 - b_weight[1] - c_weight[2]) * surface[2, 1:-1]
                 rhs -= (
                     0.5 * problem.alpha + a_weight[1] + b_weight[2]
                 ) * surface[1, 1:-1]
                 rhs -= a_weight[2] * surface[0, 1:-1]
             else:
+                # An24 equation (17), PDF page 7.
                 rhs = (2.0 - b_weight[1] - c_weight[2]) * surface[
                     step - 1, 1:-1
                 ]
@@ -194,7 +201,9 @@ def solve_l2_pde(
         grid_price=surface,
         diagnostics={
             "solver": "l2",
-            "paper": "An et al. (2024)",
+            "paper": "An24",
+            "paper_doi": "10.1007/s11075-023-01563-4",
+            "paper_equations": "(7)-(17)",
             "startup": "published L1 equation (14)",
             "dt": dt,
             "dx": dx,
@@ -215,6 +224,9 @@ def _implicit_factor(
     diagonal_l: float,
     upper_l: float,
 ) -> TridiagonalFactor:
+    # The signs follow An24 component equations (14)-(17), PDF page 7.
+    # Equation (20), PDF page 8, prints the later upper entry with the opposite
+    # sign; copying that matrix-entry typo would contradict equations (15)-(17).
     lower = np.full(max(interior_size - 1, 0), -time_scale * lower_l)
     diagonal = np.full(interior_size, mass - time_scale * diagonal_l)
     upper = np.full(max(interior_size - 1, 0), -time_scale * upper_l)

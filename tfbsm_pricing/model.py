@@ -1,4 +1,9 @@
-"""Canonical model, grid, boundary data, and solver result types."""
+"""Shared European TFBS model definitions.
+
+The transformed PDE and elapsed-time convention follow KMP20 equations
+(4)-(6), PDF pages 5-6, and An24 equations (2)-(4), PDF pages 4-5. Full
+references and a paper-to-code crosswalk are in docs/numerical_solvers.md.
+"""
 
 from __future__ import annotations
 
@@ -18,9 +23,9 @@ BoundaryMode = Literal["canonical_subdiffusive", "paper_reproduction"]
 class EuropeanOptionProblem:
     """A zero-dividend European option in the papers' normalized time units.
 
-    Time is measured in years.  The coefficient called ``rho`` by An et al.
-    has units year^(alpha-1); that paper sets it to one, and this canonical
-    problem makes the same normalization.
+    Time is measured in years. An24 introduces ``rho`` immediately after
+    equation (3), PDF page 5, with units year^(alpha-1), then sets ``rho=1``
+    in equation (4). This canonical problem uses the same normalization.
     """
 
     S0: float
@@ -172,9 +177,9 @@ def boundary_values(
     """Return finite-domain values for the selected mathematical model.
 
     The canonical discount is ``E_alpha(-r*t^alpha)``, obtained by applying the
-    KMP20 subordination identity (page 3) and clock-density transform (page 4)
-    to the operational-time BSM discount. Paper reproduction mode retains the
-    ordinary exponential used in the published numerical setup.
+    KMP20 Section 2.2, PDF pages 3-5, gives the subordination identity and
+    inverse-clock density transform used here. Paper reproduction mode retains
+    the ordinary exponential used in the published numerical setup.
     """
 
     if problem.boundary_mode == "canonical_subdiffusive":
