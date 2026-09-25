@@ -4,6 +4,13 @@ This repository is a small empirical-research foundation for testing whether sub
 
 The answer is unknown. The project must support a positive, negative, or inconclusive result without changing the test after seeing outcomes.
 
+## AI authorship disclosure
+
+The solver code and related documentation introduced by PR #2 were generated
+by OpenAI Codex, an artificial-intelligence coding system, from Simon Vu's
+research instructions. They remain draft research software and require human
+review before they are merged or used for empirical conclusions.
+
 ## Model scope
 
 The candidate model uses an inverse-stable market-time clock with:
