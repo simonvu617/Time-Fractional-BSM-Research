@@ -240,21 +240,21 @@ python -m unittest discover -s tests -v
 
 The 25 tests cover all 15 An24 Table 1 entries. Representative values are:
 
-| alpha | dt | paper maximum error | computed maximum error |
-|---:|---:|---:|---:|
-| 0.1 | 1/10 | 2.5543e-4 | 2.554339e-4 |
-| 0.5 | 1/20 | 1.1428e-4 | 1.142771e-4 |
-| 0.9 | 1/40 | 8.7868e-5 | 8.786794e-5 |
+| `alpha` | `dt` | Paper error | Computed error |
+| :-----: | :--: | ----------: | -------------: |
+|   0.10  | 1/10 |  2.5543e-04 |   2.554339e-04 |
+|   0.50  | 1/20 |  1.1428e-04 |   1.142771e-04 |
+|   0.90  | 1/40 |  8.7868e-05 |   8.786794e-05 |
 
 KMP20 Table 1 temporal orders are also reproduced:
 
-| alpha | paper order | computed order | theoretical `2-alpha` |
-|---:|---:|---:|---:|
-| 0.99 | 1.02 | 1.057 | 1.01 |
-| 0.70 | 1.32 | 1.359 | 1.30 |
-| 0.50 | 1.51 | 1.520 | 1.50 |
-| 0.30 | 1.70 | 1.700 | 1.70 |
-| 0.10 | 1.85 | 1.850 | 1.90 |
+| `alpha` | Paper | Computed | `2-alpha` |
+| :-----: | ----: | -------: | --------: |
+|   0.99  |  1.02 |    1.057 |      1.01 |
+|   0.70  |  1.32 |    1.359 |      1.30 |
+|   0.50  |  1.51 |    1.520 |      1.50 |
+|   0.30  |  1.70 |    1.700 |      1.70 |
+|   0.10  |  1.85 |    1.850 |      1.90 |
 
 At `alpha=1`, joint space-time refinement from 80 to 320 intervals reduces
 the weighted solver's BSM error from `4.65e-2` to `1.61e-3` and the L2
@@ -274,11 +274,11 @@ and deterministic Gauss--Legendre quadrature. Its clock mean agrees with
 
 Benchmark prices converge independently of either finite-difference method:
 
-| case | order 32 | order 64 | order 128 | order 256 | `|V256-V512|` |
-|:---|---:|---:|---:|---:|---:|
-| `alpha=.1`, short ATM call | .101133993 | .101139277 | .101140632 | .101140964 | 7.97e-8 |
-| `alpha=.3`, long ITM put | .637119071 | .637118225 | .637117954 | .637117875 | 2.16e-8 |
-| `alpha=.9999`, ATM put | .103285676 | .103281179 | .103278738 | .103278153 | 6.97e-8 |
+| Case                   |    Order 32 |    Order 64 |   Order 128 |   Order 256 |   Change |
+| :--------------------- | ----------: | ----------: | ----------: | ----------: | -------: |
+| 0.1000, short ATM call | 0.101133993 | 0.101139277 | 0.101140632 | 0.101140964 | 7.97e-08 |
+| 0.3000, long ITM put   | 0.637119071 | 0.637118225 | 0.637117954 | 0.637117875 | 2.16e-08 |
+| 0.9999, ATM put        | 0.103285676 | 0.103281179 | 0.103278738 | 0.103278153 | 6.97e-08 |
 
 The largest `|V128-V256|` in this table is `5.85e-7`, below the tolerances used
 to judge the finite-difference methods.
@@ -289,21 +289,31 @@ with every spatial grid, preventing payoff-grid alignment from obscuring the
 refinement trend. All cases use `S=1`. In alpha order, `(K,T,r,sigma)` is
 `(1,.25,0,.3)`, `(exp(.5),2,.03,.4)`, `(exp(.5),1,0,.3)`,
 `(exp(-.5),1,.03,.35)`, `(exp(-.5),2,.04,.45)`, and `(1,1,.03,.3)`.
+Cases A-F below follow that order.
 
-| alpha and case | solver | N=80 | N=160 | N=320 | N=640 |
-|:---|:---|---:|---:|---:|---:|
-| .1, short ATM call | weighted | 3.017e-3 | 7.849e-4 | 2.012e-4 | 5.209e-5 |
-|  | L2 | 3.015e-3 | 7.837e-4 | 2.006e-4 | 5.180e-5 |
-| .3, long ITM put | weighted | 2.551e-4 | 6.769e-5 | 1.853e-5 | 5.413e-6 |
-|  | L2 | 2.497e-4 | 6.515e-5 | 1.729e-5 | 4.809e-6 |
-| .5, OTM call | weighted | 2.320e-4 | 8.332e-5 | 3.305e-5 | 1.434e-5 |
-|  | L2 | 1.800e-4 | 5.732e-5 | 2.005e-5 | 7.844e-6 |
-| .9, OTM put | weighted | 1.850e-4 | 6.258e-5 | 2.373e-5 | 1.015e-5 |
-|  | L2 | 1.467e-4 | 4.153e-5 | 1.230e-5 | 3.999e-6 |
-| .99, long ITM call | weighted | 3.818e-4 | 1.038e-4 | 3.043e-5 | 1.000e-5 |
-|  | L2 | 3.668e-4 | 9.434e-5 | 2.488e-5 | 6.864e-6 |
-| .9999, ATM put | weighted | 1.632e-3 | 4.011e-4 | 9.989e-5 | 2.496e-5 |
-|  | L2 | 1.634e-3 | 4.015e-4 | 9.999e-5 | 2.498e-5 |
+| Case | `alpha` | Description    |
+| :--: | ------: | :------------- |
+|  A   |  0.1000 | Short ATM call |
+|  B   |  0.3000 | Long ITM put   |
+|  C   |  0.5000 | OTM call       |
+|  D   |  0.9000 | OTM put        |
+|  E   |  0.9900 | Long ITM call  |
+|  F   |  0.9999 | ATM put        |
+
+| Case | Solver   |    `N=80` |   `N=160` |   `N=320` |   `N=640` |
+| :--: | :------- | --------: | --------: | --------: | --------: |
+|  A   | Weighted | 3.017e-03 | 7.849e-04 | 2.012e-04 | 5.209e-05 |
+|  A   | L2       | 3.015e-03 | 7.837e-04 | 2.006e-04 | 5.180e-05 |
+|  B   | Weighted | 2.551e-04 | 6.769e-05 | 1.853e-05 | 5.413e-06 |
+|  B   | L2       | 2.497e-04 | 6.515e-05 | 1.729e-05 | 4.809e-06 |
+|  C   | Weighted | 2.320e-04 | 8.332e-05 | 3.305e-05 | 1.434e-05 |
+|  C   | L2       | 1.800e-04 | 5.732e-05 | 2.005e-05 | 7.844e-06 |
+|  D   | Weighted | 1.850e-04 | 6.258e-05 | 2.373e-05 | 1.015e-05 |
+|  D   | L2       | 1.467e-04 | 4.153e-05 | 1.230e-05 | 3.999e-06 |
+|  E   | Weighted | 3.818e-04 | 1.038e-04 | 3.043e-05 | 1.000e-05 |
+|  E   | L2       | 3.668e-04 | 9.434e-05 | 2.488e-05 | 6.864e-06 |
+|  F   | Weighted | 1.632e-03 | 4.011e-04 | 9.989e-05 | 2.496e-05 |
+|  F   | L2       | 1.634e-03 | 4.015e-04 | 9.999e-05 | 2.498e-05 |
 
 With nonzero `r=0.05`, `S=1`, `K=1.1`, `T=1`, `sigma=0.3`, and `alpha=0.7`,
 the benchmark/weighted/L2 call prices are `0.1026890`, `0.1026182`, and
@@ -313,16 +323,27 @@ also validates the Mittag--Leffler parity and boundaries away from `r=0`.
 ### Seven- and fourteen-day maturities
 
 The research-facing short-maturity checks use `S=1`, `r=.03`, the fixed domain
-`[-2,2]`, and aligned strikes `1` or `exp(+/-0.0625)`. The table gives absolute
-errors against the independent order-512 subordination price as
+`[-2,2]`, and aligned strikes `1` or `exp(+/-0.0625)`. The first table defines
+the cases and benchmarks. The second gives absolute error for
 `N=64/128/256/512`, with `Nx=Nt=N`.
 
-| case | benchmark | weighted errors | L2 errors |
-|:---|---:|:---|:---|
-| 7d ATM call, `alpha=.1`, `sigma=.2` | .0696660711 | 1.927e-3 / 5.069e-4 / 1.314e-4 / 3.465e-5 | 1.924e-3 / 5.053e-4 / 1.306e-4 / 3.424e-5 |
-| 14d slightly ITM put, `alpha=.5`, `sigma=.6` | .1382332752 | 9.018e-4 / 2.549e-4 / 7.780e-5 / 2.643e-5 | 8.955e-4 / 2.519e-4 / 7.641e-5 / 2.576e-5 |
-| 7d slightly OTM call, `alpha=.9`, `sigma=1` | .0425209975 | 1.142e-3 / 3.045e-4 / 8.676e-5 / 2.726e-5 | 1.107e-3 / 2.846e-4 / 7.580e-5 / 2.132e-5 |
-| 14d slightly OTM put, `alpha=.9999`, `sigma=.6` | .0210735049 | 1.284e-3 / 3.174e-4 / 7.905e-5 / 1.975e-5 | 1.285e-3 / 3.176e-4 / 7.909e-5 / 1.975e-5 |
+| Case | DTE | Description       | `alpha` | `sigma` |    Benchmark |
+| :--: | --: | :---------------- | ------: | ------: | -----------: |
+|  A   |   7 | ATM call          |  0.1000 |    0.20 | 0.0696660711 |
+|  B   |  14 | Slightly ITM put  |  0.5000 |    0.60 | 0.1382332752 |
+|  C   |   7 | Slightly OTM call |  0.9000 |    1.00 | 0.0425209975 |
+|  D   |  14 | Slightly OTM put  |  0.9999 |    0.60 | 0.0210735049 |
+
+| Case | Solver   |    `N=64` |   `N=128` |   `N=256` |   `N=512` |
+| :--: | :------- | --------: | --------: | --------: | --------: |
+|  A   | Weighted | 1.927e-03 | 5.069e-04 | 1.314e-04 | 3.465e-05 |
+|  A   | L2       | 1.924e-03 | 5.053e-04 | 1.306e-04 | 3.424e-05 |
+|  B   | Weighted | 9.018e-04 | 2.549e-04 | 7.780e-05 | 2.643e-05 |
+|  B   | L2       | 8.955e-04 | 2.519e-04 | 7.641e-05 | 2.576e-05 |
+|  C   | Weighted | 1.142e-03 | 3.045e-04 | 8.676e-05 | 2.726e-05 |
+|  C   | L2       | 1.107e-03 | 2.846e-04 | 7.580e-05 | 2.132e-05 |
+|  D   | Weighted | 1.284e-03 | 3.174e-04 | 7.905e-05 | 1.975e-05 |
+|  D   | L2       | 1.285e-03 | 3.176e-04 | 7.909e-05 | 1.975e-05 |
 
 Every finite-difference error decreases at each refinement. For these cases,
 the order-256 to order-512 benchmark change is at most `8.98e-8`, more than
@@ -335,12 +356,12 @@ All L2 coefficient arrays through 800 lags are finite at
 NaNs or infinities. For an ATM call with `r=.03`, `sigma=.3`, and `T=1`, the
 order-512 benchmark approaches analytic BSM monotonically:
 
-| alpha | benchmark | distance to BSM | weighted error, N=640 | L2 error, N=640 |
-|---:|---:|---:|---:|---:|
-| .99 | .1328956641 | 6.258e-5 | 2.790e-5 | 2.604e-5 |
-| .999 | .1328395037 | 6.420e-6 | 2.507e-5 | 2.490e-5 |
-| .9999 | .1328337366 | 6.526e-7 | 2.478e-5 | 2.479e-5 |
-| 1 | .1328330840 | 0 | 2.474e-5 | 2.477e-5 |
+| `alpha` |    Benchmark |   BSM gap | Weighted `N=640` | L2 `N=640` |
+| ------: | -----------: | --------: | ---------------: | ---------: |
+|  0.9900 | 0.1328956641 | 6.258e-05 |        2.790e-05 |  2.604e-05 |
+|  0.9990 | 0.1328395037 | 6.420e-06 |        2.507e-05 |  2.490e-05 |
+|  0.9999 | 0.1328337366 | 6.526e-07 |        2.478e-05 |  2.479e-05 |
+|  1.0000 | 0.1328330840 | 0.000e+00 |        2.474e-05 |  2.477e-05 |
 
 Direct high-precision spot checks show relative cancellation in the smallest
 late-lag L2 coefficients near one, but the absolute discrepancies remain near
@@ -353,14 +374,14 @@ For the `alpha=.5`, `S=K=T=1`, `r=0`, `sigma=.3` call, the table reports error
 against the order-512 benchmark. Time refinement fixes `Nx=640`; space
 refinement fixes `Nt=640`; joint refinement uses `Nx=Nt=N`.
 
-| mode and solver | N=80 | N=160 | N=320 |
-|:---|---:|---:|---:|
-| time, weighted | 1.531e-4 | 9.539e-5 | 6.682e-5 |
-| time, L2 | 1.458e-4 | 9.196e-5 | 6.517e-5 |
-| space, weighted | 2.450e-3 | 6.296e-4 | 1.683e-4 |
-| space, L2 | 2.450e-3 | 6.289e-4 | 1.675e-4 |
-| joint, weighted | 2.551e-3 | 6.723e-4 | 1.825e-4 |
-| joint, L2 | 2.546e-3 | 6.692e-4 | 1.809e-4 |
+|  Mode | Solver   |    `N=80` |   `N=160` |   `N=320` |
+| :---: | :------- | --------: | --------: | --------: |
+|  Time | Weighted | 1.531e-04 | 9.539e-05 | 6.682e-05 |
+|  Time | L2       | 1.458e-04 | 9.196e-05 | 6.517e-05 |
+| Space | Weighted | 2.450e-03 | 6.296e-04 | 1.683e-04 |
+| Space | L2       | 2.450e-03 | 6.289e-04 | 1.675e-04 |
+| Joint | Weighted | 2.551e-03 | 6.723e-04 | 1.825e-04 |
+| Joint | L2       | 2.546e-03 | 6.692e-04 | 1.809e-04 |
 
 At these grids, spatial error dominates the residual. All three controlled
 sequences decrease for both solvers.
@@ -371,12 +392,12 @@ The following tests hold `dx=0.025` and `Nt=240` fixed while expanding the
 log-price half-width from 2 to 3 to 4. The table reports the absolute change
 from half-width 3 to 4; `r=0.03` in every case.
 
-| case | alpha | T | sigma | weighted change | L2 change |
-|:---|---:|---:|---:|---:|---:|
-| ATM call, short | 0.5 | 0.10 | 0.25 | 6.9e-18 | 6.9e-18 |
-| ITM call, long/high vol | 0.9 | 2.00 | 0.60 | 2.0e-8 | 1.5e-8 |
-| OTM put, long | 0.5 | 1.50 | 0.30 | 3.0e-11 | 2.0e-11 |
-| ITM put, short/high vol | 0.9 | 0.25 | 0.60 | 0.0 | 2.8e-17 |
+| Case                    | `alpha` |  `T` | `sigma` | Weighted change | L2 change |
+| :---------------------- | ------: | ---: | ------: | --------------: | --------: |
+| ATM call, short         |    0.50 | 0.10 |    0.25 |         6.9e-18 |   6.9e-18 |
+| ITM call, long/high vol |    0.90 | 2.00 |    0.60 |         2.0e-08 |   1.5e-08 |
+| OTM put, long           |    0.50 | 1.50 |    0.30 |         3.0e-11 |   2.0e-11 |
+| ITM put, short/high vol |    0.90 | 0.25 |    0.60 |         0.0e+00 |   2.8e-17 |
 
 KMP20 Example 2 is only partially reproduced. The reported ordering by
 `theta` agrees, but on the stated `(n,N)=(500,50)` grid the computed errors are
