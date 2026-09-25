@@ -40,29 +40,41 @@ Both papers use constant `r` and `sigma` and zero dividends. The code does not
 add an unsupported dividend term. At `alpha=1`, the Caputo derivative becomes
 the ordinary derivative and the model must recover classical BSM.
 
-## Payoff and boundaries
+## Canonical subdiffusive discount and boundaries
 
-On `[x_min,x_max]`, both solvers use
+KMP20 page 3 gives the subordination identity
 
 ```text
-call: left=0,                          right=exp(x_max)-K exp(-rt)
-put:  left=K exp(-rt)-exp(x_min),      right=0.
+V_alpha(t) = E[V_BS(S_alpha(t))],
 ```
 
-The call condition follows KMP20 page 6. An24 equations (5)--(6), page 5,
-print `x_R` where dimensional consistency requires `exp(x_R)` and use `T-t`
-after defining `t=T-tau`; those are treated as typographical errors. The put
-condition retains the finite-left `exp(x_min)` correction.
+where `S_alpha` is the inverse stable clock. Averaging the operational-time BSM
+discount gives `q_alpha(t)=E[exp(-r S_alpha(t))]`. KMP20 page 4 gives the clock
+density transform `L_t rho_alpha(s,t)=k^(alpha-1) exp(-s k^alpha)`, hence
 
-There is a separate model inconsistency. KMP20 Proposition 2.1, page 3, claims
-`C-P=S-K exp(-rt)`, and both papers use the same exponential strike discount
-in their boundaries. For `alpha<1`, this function does not solve the printed
-Caputo PDE because the Caputo derivative of `exp(-rt)` is not its ordinary
-derivative. The homogeneous PDE instead produces a Mittag--Leffler discount.
-The implementation retains the papers' exponential boundaries so the two
-solvers compare the same published finite-domain problem. The tests expose the
-fractional parity residual rather than hiding it. The discrepancy vanishes at
-`alpha=1`.
+```text
+L_t q_alpha(k) = k^(alpha-1)/(k^alpha+r),
+q_alpha(t)     = E_alpha(-r t^alpha).
+```
+
+This produces the coherent inverse-stable relationships
+
+```text
+call right = exp(x_max) - K q_alpha(t),    call left = 0,
+put left   = K q_alpha(t) - exp(x_min),    put right = 0,
+C_alpha-P_alpha = S-K q_alpha(t).
+```
+
+They satisfy the printed Caputo PDE because
+`Caputo_D_t^alpha q_alpha=-r q_alpha`. The default
+`boundary_mode="canonical_subdiffusive"` uses these values. The separate
+`boundary_mode="paper_reproduction"` uses `exp(-rt)` to reproduce the papers'
+ordinary-discount numerical setup after correcting the evident `x_R` and time
+coordinate typos in An24 equations (5)--(6), page 5. At `alpha=1`, both modes
+reduce to ordinary BSM boundaries and parity. The dependency-free
+Mittag--Leffler evaluator uses its defining series only for
+`|r|t^alpha <= 0.75`, which covers the validation and intended market ranges;
+it rejects larger arguments rather than risk cancellation error.
 
 ## Weighted L1 method
 
@@ -93,6 +105,16 @@ theta_hat = (2-2^(1-alpha))/(3-2^(1-alpha)).
 It becomes `1/2` at `alpha=1`, so the method reduces exactly to
 Crank--Nicolson. KMP20 Theorem 3.3, page 15, claims
 `O(dt^(2-alpha)+dx^2)` error under its regularity assumptions.
+
+KMP20 Theorem 3.2(i), page 10, labels the scheme unconditionally stable when
+
+```text
+1-log2(2-theta/(1-theta)) <= alpha.
+```
+
+The parentheses matter. Thus `theta=0` is on the unconditional side for every
+`alpha>0`, `theta=0.5` requires `alpha=1`, and `theta_hat(alpha)` lies on the
+boundary. The diagnostics implement this exact typeset condition.
 
 ## L2 method
 
@@ -158,7 +180,7 @@ Run all reproducible checks with:
 python -m unittest discover -s tests -v
 ```
 
-The tests cover all nine An24 Table 1 entries. Representative values are:
+The tests cover all 15 An24 Table 1 entries. Representative values are:
 
 | alpha | dt | paper maximum error | computed maximum error |
 |---:|---:|---:|---:|
@@ -182,13 +204,50 @@ solver's error from `4.67e-2` to `1.60e-3`. For fractional calls, the absolute
 cross-solver difference shrinks from `2.73e-5` to `8.03e-6` at `alpha=0.5`
 and from `7.92e-5` to `2.73e-5` at `alpha=0.9` over 60--240 intervals.
 
+### Independent subordination benchmark
+
+`validation/subordination.py` does not use either fractional recurrence. It
+uses the distributional identity
+`S_alpha(t)=t^alpha D_1^(-alpha)`, Kanter's positive-stable representation [3],
+and deterministic Gauss--Legendre quadrature. Its clock mean agrees with
+`t^alpha/Gamma(1+alpha)` within `1.3e-5` at quadrature order 96.
+
+For an ATM call with `S=K=T=1`, `r=0`, `sigma=0.3`, and a 400-by-400 FD grid:
+
+| alpha | subordination | weighted FD | L2 FD |
+|---:|---:|---:|---:|
+| 0.5 | 0.1163738 | 0.1161971 | 0.1161984 |
+| 0.7 | 0.1184408 | 0.1182756 | 0.1182823 |
+| 0.9 | 0.1192653 | 0.1191253 | 0.1191359 |
+
+With nonzero `r=0.05`, `S=1`, `K=1.1`, `T=1`, `sigma=0.3`, and `alpha=0.7`,
+the benchmark/weighted/L2 call prices are `0.1026890`, `0.1026182`, and
+`0.1026366`; put prices are `0.1443118`, `0.1442812`, and `0.1442764`. This
+also validates the Mittag--Leffler parity and boundaries away from `r=0`.
+
+### Domain convergence
+
+The following tests hold `dx=0.025` and `Nt=240` fixed while expanding the
+log-price half-width from 2 to 3 to 4. The table reports the absolute change
+from half-width 3 to 4; `r=0.03` in every case.
+
+| case | alpha | T | sigma | weighted change | L2 change |
+|:---|---:|---:|---:|---:|---:|
+| ATM call, short | 0.5 | 0.10 | 0.25 | 6.9e-18 | 6.9e-18 |
+| ITM call, long/high vol | 0.9 | 2.00 | 0.60 | 2.0e-8 | 1.5e-8 |
+| OTM put, long | 0.5 | 1.50 | 0.30 | 3.0e-11 | 2.0e-11 |
+| ITM put, short/high vol | 0.9 | 0.25 | 0.60 | 0.0 | 2.8e-17 |
+
 KMP20 Example 2 is only partially reproduced. The reported ordering by
 `theta` agrees, but on the stated `(n,N)=(500,50)` grid the computed errors are
 `0.603%`, `0.325%`, and `0.047%` for `theta=0`, `0.25`, and `0.5`, versus the
 paper's `1.74%`, `1.12%`, and `0.61%`. The paper does not specify how `S0=1`
 is extracted when `log(S0)=0` is not a grid node; this code uses linear
-interpolation. KMP20 Table 2 is not used as a spatial benchmark because it says
-the error is measured at the prescribed boundary `x=x_max`.
+interpolation. Using the two adjacent nodes instead gives `2.67%` and `5.19%`
+for `theta=0.5`; reversing the stated space/time counts gives about `1.7%` for
+all three theta values. Neither interpretation reproduces the table. KMP20
+Table 2 is not used as a spatial benchmark because it says the error is measured
+at the prescribed boundary `x=x_max`.
 
 ## References
 
@@ -201,3 +260,6 @@ the error is measured at the prescribed boundary `x=x_max`.
    for time-fractional Black--Scholes equation with S&P 500 index option,”
    *Numerical Algorithms*, 95, 1--30, 2024.
    [doi:10.1007/s11075-023-01563-4](https://doi.org/10.1007/s11075-023-01563-4).
+3. M. Kanter, “Stable densities under change of scale and total variation
+   inequalities,” *The Annals of Probability*, 3(4), 697--707, 1975.
+   [doi:10.1214/aop/1176996309](https://doi.org/10.1214/aop/1176996309).

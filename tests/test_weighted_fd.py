@@ -8,6 +8,7 @@ import numpy as np
 from tfbsm_pricing.model import EuropeanOptionProblem, GridSpec, SolverResult
 from tfbsm_pricing.weighted_fd import (
     optimal_weight,
+    paper_unconditional_stability_threshold,
     solve_weighted,
     weighted_caputo_weights,
 )
@@ -25,7 +26,16 @@ class WeightedMethodTests(unittest.TestCase):
         self.assertAlmostEqual(optimal_weight(1.0), 0.5)
 
     def test_krzyzanowski_example_2_is_near_reported_benchmark(self) -> None:
-        problem = EuropeanOptionProblem(1.0, 2.0, 4.0, 0.04, 1.0, 0.999, "call")
+        problem = EuropeanOptionProblem(
+            1.0,
+            2.0,
+            4.0,
+            0.04,
+            1.0,
+            0.999,
+            "call",
+            boundary_mode="paper_reproduction",
+        )
         grid = GridSpec(-20.0, 10.0, 500, 50)
         implicit = solve_weighted(problem, grid, theta=0.0)
         crank_nicolson = solve_weighted(problem, grid, theta=0.5)
@@ -41,7 +51,16 @@ class WeightedMethodTests(unittest.TestCase):
             (0.1, 1.25e-3, 1.85),
         )
         for alpha, dt, paper_order in cases:
-            problem = EuropeanOptionProblem(1.0, 2.0, 1.0, 0.04, 1.0, alpha, "call")
+            problem = EuropeanOptionProblem(
+                1.0,
+                2.0,
+                1.0,
+                0.04,
+                1.0,
+                alpha,
+                "call",
+                boundary_mode="paper_reproduction",
+            )
             reference = solve_weighted(
                 problem, GridSpec(-1.0, 1.0, 10, 2597), theta=0.0
             )
@@ -59,6 +78,32 @@ class WeightedMethodTests(unittest.TestCase):
                 abs((value(coarse) - value(reference)) / (value(fine) - value(reference)))
             )
             self.assertAlmostEqual(order, paper_order, delta=0.07)
+
+    def test_paper_unconditional_stability_condition(self) -> None:
+        self.assertEqual(paper_unconditional_stability_threshold(0.0), 0.0)
+        self.assertAlmostEqual(
+            paper_unconditional_stability_threshold(0.25),
+            1.0 - math.log2(5.0 / 3.0),
+        )
+        self.assertEqual(paper_unconditional_stability_threshold(0.5), 1.0)
+
+        alpha = 0.7
+        theta_hat = optimal_weight(alpha)
+        self.assertAlmostEqual(
+            paper_unconditional_stability_threshold(theta_hat), alpha, places=14
+        )
+        problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.0, 0.3, alpha, "call")
+        grid = GridSpec(-4.0, 3.0, 60, 40)
+        self.assertFalse(
+            solve_weighted(problem, grid, theta=0.5).diagnostics[
+                "paper_unconditional_stability_condition"
+            ]
+        )
+        self.assertTrue(
+            solve_weighted(problem, grid, theta=theta_hat).diagnostics[
+                "paper_unconditional_stability_condition"
+            ]
+        )
 
 
 if __name__ == "__main__":

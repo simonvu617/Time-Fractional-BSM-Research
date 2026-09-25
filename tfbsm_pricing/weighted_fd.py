@@ -48,6 +48,21 @@ def optimal_weight(alpha: float) -> float:
     return (2.0 - power) / (3.0 - power)
 
 
+def paper_unconditional_stability_threshold(theta: float) -> float:
+    """Return the minimum alpha in KMP20 Theorem 3.2(i), page 10.
+
+    The typeset condition is ``1-log2(2-theta/(1-theta)) <= alpha``.
+    For ``theta >= 2/3`` its logarithm is not positive, so the theorem gives no
+    unconditional fractional-alpha region.
+    """
+
+    if not 0.0 <= theta <= 1.0:
+        raise ValueError("theta must lie in [0, 1]")
+    if theta >= 2.0 / 3.0:
+        return math.inf
+    return 1.0 - math.log2(2.0 - theta / (1.0 - theta))
+
+
 def solve_weighted(
     problem: EuropeanOptionProblem,
     grid: GridSpec,
@@ -130,7 +145,8 @@ def solve_weighted(
         surface[step, 1:-1] = factor.solve(rhs)
 
     price = float(np.interp(log_spot, x, surface[-1]))
-    threshold = 1.0 - math.log2((2.0 - theta) / (1.0 - theta)) if theta < 1.0 else math.inf
+    threshold = paper_unconditional_stability_threshold(theta)
+    on_unconditional_side = problem.alpha >= threshold - 16.0 * np.finfo(float).eps
     return SolverResult(
         price=price,
         x_grid=x,
@@ -142,7 +158,8 @@ def solve_weighted(
             "theta": theta,
             "dt": dt,
             "dx": dx,
-            "paper_unconditional_stability_condition": problem.alpha >= threshold,
+            "paper_unconditional_stability_threshold": threshold,
+            "paper_unconditional_stability_condition": on_unconditional_side,
             "time_order_claim": 2.0 - problem.alpha,
             "space_order_claim": 2.0,
         },

@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 
 OptionType = Literal["call", "put"]
+BoundaryMode = Literal["canonical_subdiffusive", "paper_reproduction"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,7 @@ class EuropeanOptionProblem:
     sigma: float
     alpha: float
     option_type: OptionType
+    boundary_mode: BoundaryMode = "canonical_subdiffusive"
 
     def __post_init__(self) -> None:
         if self.S0 <= 0.0:
@@ -43,6 +45,8 @@ class EuropeanOptionProblem:
             raise ValueError("alpha must satisfy 0 < alpha <= 1")
         if self.option_type not in ("call", "put"):
             raise ValueError("option_type must be 'call' or 'put'")
+        if self.boundary_mode not in ("canonical_subdiffusive", "paper_reproduction"):
+            raise ValueError("unknown boundary_mode")
 
     @property
     def diffusion(self) -> float:
@@ -113,12 +117,58 @@ def payoff(
 def boundary_values(
     problem: EuropeanOptionProblem, x_min: float, x_max: float, elapsed: float
 ) -> tuple[float, float]:
-    """Return the papers' European finite-domain boundary values."""
+    """Return finite-domain values for the selected mathematical model.
 
-    discounted_strike = problem.K * math.exp(-problem.r * elapsed)
+    The canonical discount is ``E_alpha(-r*t^alpha)``, obtained by applying the
+    KMP20 subordination identity (page 3) and clock-density transform (page 4)
+    to the operational-time BSM discount. Paper reproduction mode retains the
+    ordinary exponential used in the published numerical setup.
+    """
+
+    if problem.boundary_mode == "canonical_subdiffusive":
+        discount = mittag_leffler_discount(problem.alpha, problem.r, elapsed)
+    else:
+        discount = math.exp(-problem.r * elapsed)
+    discounted_strike = problem.K * discount
     if problem.option_type == "call":
         return 0.0, max(math.exp(x_max) - discounted_strike, 0.0)
     return max(discounted_strike - math.exp(x_min), 0.0), 0.0
+
+
+def mittag_leffler_discount(alpha: float, rate: float, elapsed: float) -> float:
+    """Compute ``E_alpha(-rate * elapsed**alpha)`` by its defining series.
+
+    The direct series is deliberately limited to the range verified here.
+    Larger arguments need a separate asymptotic or contour algorithm; refusing
+    them avoids silent cancellation error in finite-domain boundary values.
+    """
+
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError("alpha must satisfy 0 < alpha <= 1")
+    if elapsed < 0.0:
+        raise ValueError("elapsed time must be nonnegative")
+    if elapsed == 0.0 or rate == 0.0:
+        return 1.0
+    if alpha == 1.0:
+        return math.exp(-rate * elapsed)
+
+    argument = -rate * elapsed**alpha
+    if abs(argument) > 0.75:
+        raise ValueError(
+            "Mittag-Leffler boundary evaluation requires "
+            "abs(rate * elapsed**alpha) <= 0.75"
+        )
+    total = 1.0
+    for index in range(1, 512):
+        magnitude = math.exp(
+            index * math.log(abs(argument))
+            - math.lgamma(alpha * index + 1.0)
+        )
+        term = -magnitude if argument < 0.0 and index % 2 else magnitude
+        total += term
+        if abs(term) <= 1e-15 * max(1.0, abs(total)):
+            return total
+    raise ArithmeticError("Mittag-Leffler series did not converge")
 
 
 def black_scholes_price(problem: EuropeanOptionProblem) -> float:
