@@ -75,13 +75,13 @@ Both papers assume zero dividends.
 The solvers use elapsed time `t`, measured forward from the payoff at `t=0`
 toward the requested value at `t=T`, and transform asset price with
 
-$$
+```math
 x=\log S.
-$$
+```
 
 They solve the same canonical transformed PDE:
 
-$$
+```math
 {}^C_0D_t^\alpha u(x,t)
 =
 \frac{\sigma^2}{2}u_{xx}(x,t)
@@ -89,26 +89,26 @@ $$
 \left(r-\frac{\sigma^2}{2}\right)u_x(x,t)
 -r\,u(x,t),
 \qquad 0<\alpha\le1,
-$$
+```
 
 with initial condition
 
-$$
+```math
 u(x,0)=\operatorname{payoff}(e^x).
-$$
+```
 
 This is KMP20 equations (4)--(6), PDF pages 5--6, and An24 equations
 (2)--(4), PDF pages 4--5. The Caputo derivative is defined in KMP20
 equation (4), PDF page 5, and An24 equation (3), PDF page 5:
 
-$$
+```math
 {}^C_0D_t^\alpha g(t)
 =
 \frac{1}{\Gamma(1-\alpha)}
 \int_0^t
 g'(s)(t-s)^{-\alpha}\,ds,
 \qquad 0<\alpha<1.
-$$
+```
 
 At `alpha = 1`, it becomes the ordinary first derivative and the model must
 recover classical BSM. Smaller `alpha` gives stronger subdiffusive
@@ -116,7 +116,7 @@ time-memory behavior. That statement describes the model; it is not an
 empirical interpretation of fitted market behavior.
 
 An24 introduces a scale parameter `rho` with units
-\(\text{year}^{\alpha-1}\), then sets `rho = 1` in equation (4), PDF page 5.
+$\text{year}^{\alpha-1}$, then sets `rho = 1` in equation (4), PDF page 5.
 The code uses the same normalization. Changing the unit of time without
 rescaling `rho` would therefore change the model.
 
@@ -131,48 +131,48 @@ an unstated stochastic model to An24.
 
 The inverse-stable representation is
 
-$$
+```math
 V_\alpha(T)
 =
 \mathbb{E}\!\left[
 V_{\mathrm{BS}}\!\left(S_\alpha(T)\right)
 \right],
-$$
+```
 
-where \(S_\alpha(T)\) is random operational time. This identity later provides
+where $S_\alpha(T)$ is random operational time. This identity later provides
 the independent benchmark.
 
 # Boundary conditions and fractional discounting
 
 The inverse-stable clock changes discounting. Define
 
-$$
+```math
 q_\alpha(t)
 =
 \mathbb{E}\!\left[e^{-rS_\alpha(t)}\right]
 =
 E_\alpha(-rt^\alpha),
-$$
+```
 
-where \(E_\alpha\) is the Mittag--Leffler function. KMP20 Section 2.2, PDF
+where $E_\alpha$ is the Mittag--Leffler function. KMP20 Section 2.2, PDF
 pages 3--5, gives the subordination identity and the clock-density transform
 from which this relationship follows. In Laplace space,
 
-$$
+```math
 \mathcal{L}_t\{q_\alpha\}(k)
 =
 \frac{k^{\alpha-1}}{k^\alpha+r}.
-$$
+```
 
 In elapsed time, the discount satisfies
 
-$$
+```math
 {}^C_0D_t^\alpha q_\alpha(t)=-r q_\alpha(t).
-$$
+```
 
 The default `boundary_mode="canonical_subdiffusive"` uses
 
-$$
+```math
 \begin{aligned}
 C(x_{\min},t)&=0,
 &
@@ -181,25 +181,25 @@ P(x_{\min},t)&=Kq_\alpha(t)-e^{x_{\min}},
 &
 P(x_{\max},t)&=0.
 \end{aligned}
-$$
+```
 
 The corresponding fractional put--call parity is
 
-$$
+```math
 C_\alpha-P_\alpha=S-Kq_\alpha(t).
-$$
+```
 
 The alternative `boundary_mode="paper_reproduction"` uses the ordinary
-discount \(e^{-rt}\). It exists only to reproduce the papers' published
+discount $e^{-rt}$. It exists only to reproduce the papers' published
 numerical setups, after correcting the evident `x_R` and time-coordinate typos
 in An24 equations (5)--(6), PDF page 5. At `alpha = 1`, both boundary modes
 reduce to ordinary BSM discounting and parity.
 
 The dependency-free Mittag--Leffler evaluator uses its defining series for
 
-$$
-|r|t^\alpha\le0.75.
-$$
+```math
+| r | t^\alpha\le0.75. |
+```
 
 That range covers the validation cases and intended market inputs. Larger
 arguments are rejected because the direct series is not a reliable general
@@ -213,9 +213,9 @@ that is stronger evidence than testing only one recurrence.
 
 However,
 
-$$
+```math
 \text{solver agreement}\ne\text{proof of correctness}.
-$$
+```
 
 The methods share the same model definition and could share a model-level
 mistake. The independent subordination benchmark is therefore also necessary.
@@ -229,25 +229,25 @@ The implementation follows KMP20 equations (7)--(11), PDF pages 6--7.
 On a uniform log-price grid, centered differences approximate the spatial
 operator
 
-$$
+```math
 L_hu
 =
 \frac{\sigma^2}{2}u_{xx}
 +
 \left(r-\frac{\sigma^2}{2}\right)u_x
 -r u.
-$$
+```
 
 Write `a = sigma^2 / 2`, `b = r - a`, and `dx` for the spatial step. The
 centered operator has coefficients
 
-$$
+```math
 \text{lower}=\frac{a}{\Delta x^2}-\frac{b}{2\Delta x},
 \qquad
 \text{diag}=-\frac{2a}{\Delta x^2}-r,
 \qquad
 \text{upper}=\frac{a}{\Delta x^2}+\frac{b}{2\Delta x}.
-$$
+```
 
 This produces a tridiagonal operator: each interior node depends only on its
 left neighbor, itself, and its right neighbor.
@@ -256,21 +256,21 @@ left neighbor, itself, and its right neighbor.
 
 For `dt = T / Nt`, define
 
-$$
+```math
 d=\Gamma(2-\alpha)\,\Delta t^\alpha
-$$
+```
 
 and the L1 weights
 
-$$
+```math
 b_j
 =
 (j+1)^{1-\alpha}-j^{1-\alpha}.
-$$
+```
 
-At time level \(n\), the L1 approximation can be written as
+At time level $n$, the L1 approximation can be written as
 
-$$
+```math
 {}^C_0D_t^\alpha U^n
 \approx
 \frac{1}{d}
@@ -279,7 +279,7 @@ U^n
 -\sum_{j=0}^{n-2}(b_j-b_{j+1})U^{n-1-j}
 -b_{n-1}U^0
 \right].
-$$
+```
 
 The first term is the unknown current solution. The sum is the fractional
 history, ordered from the newest earlier level back toward the payoff, and the
@@ -289,16 +289,16 @@ last term retains the initial payoff contribution.
 
 KMP20 blends the spatial operator at the previous and current time levels:
 
-$$
+```math
 \left[I-(1-\theta)dL_h\right]U^n
 =
 \sum_{j=0}^{n-2}(b_j-b_{j+1})U^{n-1-j}
 +b_{n-1}U^0
 +\theta dL_hU^{n-1}
 +\text{boundary terms}.
-$$
+```
 
-The matrix on the left is the implicit part. The \(\theta dL_hU^{n-1}\) term
+The matrix on the left is the implicit part. The $\theta dL_hU^{n-1}$ term
 is the explicit contribution, while the remaining terms carry the entire
 fractional history.
 
@@ -306,13 +306,13 @@ KMP20 uses `theta = 0` for fully implicit and `theta = 1` for fully explicit,
 which is the reverse of another common convention. The default is the
 paper's optimal stable weight after Theorem 3.3, PDF page 16,
 
-$$
+```math
 \widehat{\theta}
 =
 \frac{2-2^{1-\alpha}}{3-2^{1-\alpha}}.
-$$
+```
 
-At `alpha = 1`, \(\widehat{\theta}=1/2\), and the method reduces exactly to
+At `alpha = 1`, $\widehat{\theta}=1/2$, and the method reduces exactly to
 Crank--Nicolson.
 
 ## 4. Matrix solve and history cost
@@ -324,16 +324,16 @@ fractional solution depends on the full earlier path.
 
 KMP20 Theorem 3.3, PDF page 15, claims
 
-$$
+```math
 O\!\left(\Delta t^{\,2-\alpha}+\Delta x^2\right)
-$$
+```
 
 under its regularity assumptions. Theorem 3.2(i), PDF page 10, gives the
 unconditional-stability region
 
-$$
+```math
 1-\log_2\!\left(2-\frac{\theta}{1-\theta}\right)\le\alpha.
-$$
+```
 
 The diagnostics implement this exact parenthesized condition. Consequently,
 `theta = 0` is on the unconditional side for every `alpha > 0`, `theta = 0.50`
@@ -349,9 +349,9 @@ The implementation follows An24 equations (7)--(17), PDF pages 6--7.
 A quadratic L2 history formula needs more than one earlier level. The first
 step therefore uses the paper's L1 formula with
 
-$$
+```math
 \phi_1=\Gamma(2-\alpha)\,\Delta t^\alpha.
-$$
+```
 
 This startup is kept separate in the code rather than being hidden inside the
 later recurrence.
@@ -360,13 +360,13 @@ later recurrence.
 
 For later steps, An24 uses
 
-$$
+```math
 \phi_2=\Gamma(3-\alpha)\,\Delta t^\alpha
-$$
+```
 
 and three coefficient sequences:
 
-$$
+```math
 \begin{aligned}
 a_i
 &=
@@ -389,7 +389,7 @@ c_i
 -i^{2-\alpha}
 +(i+1)^{2-\alpha}.
 \end{aligned}
-$$
+```
 
 These are An24 equations (8)--(9), PDF page 6. Their combinations multiply
 earlier solution levels in equations (15)--(17), PDF page 7. Separate formulas
@@ -405,11 +405,11 @@ whose right-hand side contains the complete L2 history and current boundary
 values. In compact form, the weighted left matrix is
 $I-(1-\theta)dL_h$, while the two L2 left matrices are
 
-$$
+```math
 I-\phi_1L_h
 \qquad\text{and}\qquad
 \beta I-\phi_2L_h.
-$$
+```
 
 Removing boundary columns from these matrices moves their contributions to the
 right-hand side with positive signs. Array level `surface[n]` is the papers'
@@ -419,9 +419,9 @@ history loop.
 At `alpha = 1`, the startup becomes backward Euler and the later steps become
 BDF2. An24 claims temporal order
 
-$$
+```math
 O\!\left(\Delta t^{\,3-\alpha}\right)
-$$
+```
 
 for sufficiently smooth solutions. A European option payoff has a kink at the
 strike, so this smooth-solution order should not be treated automatically as
@@ -440,7 +440,7 @@ equations.
 | :-------------------------------- | :---------------------- | :----------------------- |
 | Source                            | KMP20                   | An24                     |
 | Time approximation                | L1                      | L2                       |
-| Claimed temporal order            | \(2-\alpha\)            | \(3-\alpha\), if smooth  |
+| Claimed temporal order            | $2-\alpha$              | $3-\alpha$, if smooth    |
 | `alpha = 1` limit                 | Crank--Nicolson         | BE startup + BDF2        |
 | Independent benchmark convergence | Yes                     | Yes                      |
 | 7/14 DTE validated                | Yes                     | Yes                      |
@@ -455,16 +455,16 @@ regularity, grid balance, domain width, and the requested tolerance.
 
 The independent reference uses
 
-$$
+```math
 V_\alpha(T)
 =
 \mathbb{E}
 \left[
 V_{\mathrm{BS}}\!\left(S_\alpha(T)\right)
 \right].
-$$
+```
 
-Here \(S_\alpha(T)\) is random operational time generated by the inverse-stable
+Here $S_\alpha(T)$ is random operational time generated by the inverse-stable
 clock. Conditional on one operational-time realization, ordinary analytic BSM
 can be evaluated. Averaging those conditional prices gives a TFBS price without
 using either finite-difference history recurrence.
@@ -472,9 +472,9 @@ using either finite-difference history recurrence.
 `validation/subordination.py` evaluates this expectation with the
 distributional identity
 
-$$
+```math
 S_\alpha(t)\overset{d}{=}t^\alpha D_1^{-\alpha},
-$$
+```
 
 Kanter75's positive-stable representation, and deterministic Gauss--Legendre
 quadrature. Increasing the quadrature order provides a direct convergence
@@ -489,13 +489,13 @@ check before the value is used as a reference.
 The low-level solvers accept an explicit `GridSpec`. Starting from a grid with
 joint resolution `N`, `refine_price` computes
 
-$$
+```math
 V_N,\qquad V_{2N},\qquad V_{4N},
-$$
+```
 
 on the same finite log-price domain. It estimates the observed order with
 
-$$
+```math
 \widehat p
 =
 \log_2
@@ -503,15 +503,15 @@ $$
 \frac{|V_N-V_{2N}|}
 {|V_{2N}-V_{4N}|}
 \right)
-$$
+```
 
 and the remaining error at the finest level with
 
-$$
+```math
 \widehat E_{4N}
 =
 \frac{|V_{4N}-V_{2N}|}{2^{\widehat p}-1}.
-$$
+```
 
 In plain language, the helper asks whether successive grid refinements are
 changing the price by less and less, estimates how quickly those changes are
@@ -527,7 +527,7 @@ tolerance.
 
 The distinction can be summarized as
 
-$$
+```math
 \text{total numerical error}
 =
 \text{finite-domain error}
@@ -535,7 +535,7 @@ $$
 \text{space discretization error}
 +
 \text{time discretization error}.
-$$
+```
 
 # Validation
 
@@ -550,21 +550,21 @@ The suite currently contains 25 tests.
 `Nx` is the number of spatial intervals in log-price, and `Nt` is the number
 of elapsed-time intervals. When a table uses only `N`, it means
 
-$$
+```math
 N_x=N_t=N.
-$$
+```
 
 Increasing these counts costs more computation but generally reduces
 discretization error. Grid resolution is distinct from domain width
-\([x_{\min},x_{\max}]\): refining `Nx` on a fixed domain makes the mesh finer,
+$[x_{\min},x_{\max}]$: refining `Nx` on a fixed domain makes the mesh finer,
 while expanding the domain tests whether artificial boundaries affect the
 price.
 
 Unless stated otherwise, convergence tables report absolute error,
 
-$$
+```math
 \left|V_{\mathrm{solver}}-V_{\mathrm{benchmark}}\right|.
-$$
+```
 
 Moving left to right means refining the grid. Falling values indicate
 convergence toward the stated benchmark.
@@ -611,9 +611,9 @@ suite checks all 15 rows; representative entries appear below.
 
 | `alpha` | `dt` | Paper error | Computed error |
 | :-----: | :--: | ----------: | -------------: |
-|   0.10  | 1/10 |  2.5543e-04 |   2.554339e-04 |
-|   0.50  | 1/20 |  1.1428e-04 |   1.142771e-04 |
-|   0.90  | 1/40 |  8.7868e-05 |   8.786794e-05 |
+| 0.10    | 1/10 | 2.5543e-04  | 2.554339e-04   |
+| 0.50    | 1/20 | 1.1428e-04  | 1.142771e-04   |
+| 0.90    | 1/40 | 8.7868e-05  | 8.786794e-05   |
 
 ### Interpretation
 
@@ -641,16 +641,16 @@ spatial error. The last column is the theoretical smooth-solution order.
 
 | `alpha` | Paper | Computed | `2-alpha` |
 | :-----: | ----: | -------: | --------: |
-|   0.99  |  1.02 |    1.057 |      1.01 |
-|   0.70  |  1.32 |    1.359 |      1.30 |
-|   0.50  |  1.51 |    1.520 |      1.50 |
-|   0.30  |  1.70 |    1.700 |      1.70 |
-|   0.10  |  1.85 |    1.850 |      1.90 |
+| 0.99    | 1.02  | 1.057    | 1.01      |
+| 0.70    | 1.32  | 1.359    | 1.30      |
+| 0.50    | 1.51  | 1.520    | 1.50      |
+| 0.30    | 1.70  | 1.700    | 1.70      |
+| 0.10    | 1.85  | 1.850    | 1.90      |
 
 ### Interpretation
 
 The observed orders reproduce the paper's trend and remain close to
-\(2-\alpha\), with the same finite-grid departures from the asymptotic value.
+$2-\alpha$, with the same finite-grid departures from the asymptotic value.
 
 ## Classical BSM limit
 
@@ -673,8 +673,8 @@ price was compared with the analytic zero-dividend BSM value.
 
 | Solver   | `N=80` error | `N=320` error |
 | :------- | -----------: | ------------: |
-| Weighted |     4.65e-02 |      1.61e-03 |
-| L2       |     4.67e-02 |      1.60e-03 |
+| Weighted | 4.65e-02     | 1.61e-03      |
+| L2       | 4.67e-02     | 1.60e-03      |
 
 ### Interpretation
 
@@ -703,8 +703,8 @@ The table shows the endpoint differences.
 
 | `alpha` | `N=60` difference | `N=240` difference |
 | :-----: | ----------------: | -----------------: |
-|   0.50  |          2.73e-05 |           8.03e-06 |
-|   0.90  |          7.92e-05 |           2.73e-05 |
+| 0.50    | 2.73e-05          | 8.03e-06           |
+| 0.90    | 7.92e-05          | 2.73e-05           |
 
 ### Interpretation
 
@@ -726,26 +726,26 @@ to judge.
 ### How was it tested?
 
 Orders 32 through 512 were evaluated. `Change` is
-\(\left|V_{256}-V_{512}\right|\); the displayed price columns stop at order
+$\left|V_{256}-V_{512}\right|$; the displayed price columns stop at order
 256 to keep the table narrow.
 
 ### Results
 
-| Case                   |    Order 32 |    Order 64 |   Order 128 |   Order 256 |   Change |
+| Case                   | Order 32    | Order 64    | Order 128   | Order 256   | Change   |
 | :--------------------- | ----------: | ----------: | ----------: | ----------: | -------: |
 | 0.1000, short ATM call | 0.101133993 | 0.101139277 | 0.101140632 | 0.101140964 | 7.97e-08 |
 | 0.3000, long ITM put   | 0.637119071 | 0.637118225 | 0.637117954 | 0.637117875 | 2.16e-08 |
 | 0.9999, ATM put        | 0.103285676 | 0.103281179 | 0.103278738 | 0.103278153 | 6.97e-08 |
 
-The largest \(\left|V_{128}-V_{256}\right|\) is `5.85e-07`. At order 256,
+The largest $\left|V_{128}-V_{256}\right|$ is `5.85e-07`. At order 256,
 the clock mean agrees with
 
-$$
+```math
 \frac{t^\alpha}{\Gamma(1+\alpha)}
-$$
+```
 
 within `1.00e-05` for `alpha = 0.10`, `0.50`, `0.90`, and `0.9999`. The same
-quadrature reproduces \(E_\alpha(-0.05)\) within `2.10e-07`.
+quadrature reproduces $E_\alpha(-0.05)$ within `2.10e-07`.
 
 ### Interpretation
 
@@ -774,8 +774,8 @@ The problem uses `S0 = 1.00`, `K = 1.10`, `T = 1.00`, `r = 0.05`,
 
 | Option | Benchmark | Weighted  | L2        |
 | :----: | --------: | --------: | --------: |
-|  Call  | 0.1026890 | 0.1026182 | 0.1026366 |
-|  Put   | 0.1443118 | 0.1442812 | 0.1442764 |
+| Call   | 0.1026890 | 0.1026182 | 0.1026366 |
+| Put    | 0.1443118 | 0.1442812 | 0.1442764 |
 
 ### Interpretation
 
@@ -801,33 +801,33 @@ All cases use `S0 = 1.00`, the domain `[-4, 4]`, and the order-512
 subordination benchmark. Strikes align with every spatial grid so payoff-grid
 alignment does not obscure the refinement trend.
 
-| Case | `alpha` | `K`          |  `T` |  `r` | `sigma` | Option   |
+| Case | `alpha` | `K`          | `T`  | `r`  | `sigma` | Option   |
 | :--: | ------: | :----------- | ---: | ---: | ------: | :------- |
-|  A   |  0.1000 | 1.0000       | 0.25 | 0.00 |    0.30 | ATM call |
-|  B   |  0.3000 | \(e^{0.5}\)  | 2.00 | 0.03 |    0.40 | ITM put  |
-|  C   |  0.5000 | \(e^{0.5}\)  | 1.00 | 0.00 |    0.30 | OTM call |
-|  D   |  0.9000 | \(e^{-0.5}\) | 1.00 | 0.03 |    0.35 | OTM put  |
-|  E   |  0.9900 | \(e^{-0.5}\) | 2.00 | 0.04 |    0.45 | ITM call |
-|  F   |  0.9999 | 1.0000       | 1.00 | 0.03 |    0.30 | ATM put  |
+| A    | 0.1000  | 1.0000       | 0.25 | 0.00 | 0.30    | ATM call |
+| B    | 0.3000  | $e^{0.5}$    | 2.00 | 0.03 | 0.40    | ITM put  |
+| C    | 0.5000  | $e^{0.5}$    | 1.00 | 0.00 | 0.30    | OTM call |
+| D    | 0.9000  | $e^{-0.5}$   | 1.00 | 0.03 | 0.35    | OTM put  |
+| E    | 0.9900  | $e^{-0.5}$   | 2.00 | 0.04 | 0.45    | ITM call |
+| F    | 0.9999  | 1.0000       | 1.00 | 0.03 | 0.30    | ATM put  |
 
 ### Results
 
 All entries are absolute errors relative to the independent benchmark.
 
-| Case | Solver   |    `N=80` |   `N=160` |   `N=320` |   `N=640` |
+| Case | Solver   | `N=80`    | `N=160`   | `N=320`   | `N=640`   |
 | :--: | :------- | --------: | --------: | --------: | --------: |
-|  A   | Weighted | 3.017e-03 | 7.849e-04 | 2.012e-04 | 5.209e-05 |
-|  A   | L2       | 3.015e-03 | 7.837e-04 | 2.006e-04 | 5.180e-05 |
-|  B   | Weighted | 2.551e-04 | 6.769e-05 | 1.853e-05 | 5.413e-06 |
-|  B   | L2       | 2.497e-04 | 6.515e-05 | 1.729e-05 | 4.809e-06 |
-|  C   | Weighted | 2.320e-04 | 8.332e-05 | 3.305e-05 | 1.434e-05 |
-|  C   | L2       | 1.800e-04 | 5.732e-05 | 2.005e-05 | 7.844e-06 |
-|  D   | Weighted | 1.850e-04 | 6.258e-05 | 2.373e-05 | 1.015e-05 |
-|  D   | L2       | 1.467e-04 | 4.153e-05 | 1.230e-05 | 3.999e-06 |
-|  E   | Weighted | 3.818e-04 | 1.038e-04 | 3.043e-05 | 1.000e-05 |
-|  E   | L2       | 3.668e-04 | 9.434e-05 | 2.488e-05 | 6.864e-06 |
-|  F   | Weighted | 1.632e-03 | 4.011e-04 | 9.989e-05 | 2.496e-05 |
-|  F   | L2       | 1.634e-03 | 4.015e-04 | 9.999e-05 | 2.498e-05 |
+| A    | Weighted | 3.017e-03 | 7.849e-04 | 2.012e-04 | 5.209e-05 |
+| A    | L2       | 3.015e-03 | 7.837e-04 | 2.006e-04 | 5.180e-05 |
+| B    | Weighted | 2.551e-04 | 6.769e-05 | 1.853e-05 | 5.413e-06 |
+| B    | L2       | 2.497e-04 | 6.515e-05 | 1.729e-05 | 4.809e-06 |
+| C    | Weighted | 2.320e-04 | 8.332e-05 | 3.305e-05 | 1.434e-05 |
+| C    | L2       | 1.800e-04 | 5.732e-05 | 2.005e-05 | 7.844e-06 |
+| D    | Weighted | 1.850e-04 | 6.258e-05 | 2.373e-05 | 1.015e-05 |
+| D    | L2       | 1.467e-04 | 4.153e-05 | 1.230e-05 | 3.999e-06 |
+| E    | Weighted | 3.818e-04 | 1.038e-04 | 3.043e-05 | 1.000e-05 |
+| E    | L2       | 3.668e-04 | 9.434e-05 | 2.488e-05 | 6.864e-06 |
+| F    | Weighted | 1.632e-03 | 4.011e-04 | 9.989e-05 | 2.496e-05 |
+| F    | L2       | 1.634e-03 | 4.015e-04 | 9.999e-05 | 2.498e-05 |
 
 ### Interpretation
 
@@ -856,12 +856,12 @@ also checked for finite values. The table uses an ATM call with `r = 0.03`,
 
 ### Results
 
-| `alpha` |    Benchmark |   BSM gap | Weighted `N=640` | L2 `N=640` |
+| `alpha` | Benchmark    | BSM gap   | Weighted `N=640` | L2 `N=640` |
 | ------: | -----------: | --------: | ---------------: | ---------: |
-|  0.9900 | 0.1328956641 | 6.258e-05 |        2.790e-05 |  2.604e-05 |
-|  0.9990 | 0.1328395037 | 6.420e-06 |        2.507e-05 |  2.490e-05 |
-|  0.9999 | 0.1328337366 | 6.526e-07 |        2.478e-05 |  2.479e-05 |
-|  1.0000 | 0.1328330840 | 0.000e+00 |        2.474e-05 |  2.477e-05 |
+| 0.9900  | 0.1328956641 | 6.258e-05 | 2.790e-05        | 2.604e-05  |
+| 0.9990  | 0.1328395037 | 6.420e-06 | 2.507e-05        | 2.490e-05  |
+| 0.9999  | 0.1328337366 | 6.526e-07 | 2.478e-05        | 2.479e-05  |
+| 1.0000  | 0.1328330840 | 0.000e+00 | 2.474e-05        | 2.477e-05  |
 
 ### Interpretation
 
@@ -886,31 +886,31 @@ spatial resolution more demanding.
 ### How was it tested?
 
 All cases use `S0 = 1.00`, `r = 0.03`, the fixed domain `[-2, 2]`, and the
-order-512 benchmark. Strikes are `1.00`, \(e^{+0.0625}\), or \(e^{-0.0625}\), deliberately
+order-512 benchmark. Strikes are `1.00`, $e^{+0.0625}$, or $e^{-0.0625}$, deliberately
 aligned with every tested grid; off-grid strike behavior is therefore not
 isolated by this particular test.
 
-| Case | DTE | Description       | `alpha` | `sigma` |    Benchmark |
+| Case | DTE | Description       | `alpha` | `sigma` | Benchmark    |
 | :--: | --: | :---------------- | ------: | ------: | -----------: |
-|  A   |   7 | ATM call          |  0.1000 |    0.20 | 0.0696660711 |
-|  B   |  14 | Slightly ITM put  |  0.5000 |    0.60 | 0.1382332752 |
-|  C   |   7 | Slightly OTM call |  0.9000 |    1.00 | 0.0425209975 |
-|  D   |  14 | Slightly OTM put  |  0.9999 |    0.60 | 0.0210735049 |
+| A    | 7   | ATM call          | 0.1000  | 0.20    | 0.0696660711 |
+| B    | 14  | Slightly ITM put  | 0.5000  | 0.60    | 0.1382332752 |
+| C    | 7   | Slightly OTM call | 0.9000  | 1.00    | 0.0425209975 |
+| D    | 14  | Slightly OTM put  | 0.9999  | 0.60    | 0.0210735049 |
 
 ### Results
 
 All entries are absolute errors relative to the independent benchmark.
 
-| Case | Solver   |    `N=64` |   `N=128` |   `N=256` |   `N=512` |
+| Case | Solver   | `N=64`    | `N=128`   | `N=256`   | `N=512`   |
 | :--: | :------- | --------: | --------: | --------: | --------: |
-|  A   | Weighted | 1.927e-03 | 5.069e-04 | 1.314e-04 | 3.465e-05 |
-|  A   | L2       | 1.924e-03 | 5.053e-04 | 1.306e-04 | 3.424e-05 |
-|  B   | Weighted | 9.018e-04 | 2.549e-04 | 7.780e-05 | 2.643e-05 |
-|  B   | L2       | 8.955e-04 | 2.519e-04 | 7.641e-05 | 2.576e-05 |
-|  C   | Weighted | 1.142e-03 | 3.045e-04 | 8.676e-05 | 2.726e-05 |
-|  C   | L2       | 1.107e-03 | 2.846e-04 | 7.580e-05 | 2.132e-05 |
-|  D   | Weighted | 1.284e-03 | 3.174e-04 | 7.905e-05 | 1.975e-05 |
-|  D   | L2       | 1.285e-03 | 3.176e-04 | 7.909e-05 | 1.975e-05 |
+| A    | Weighted | 1.927e-03 | 5.069e-04 | 1.314e-04 | 3.465e-05 |
+| A    | L2       | 1.924e-03 | 5.053e-04 | 1.306e-04 | 3.424e-05 |
+| B    | Weighted | 9.018e-04 | 2.549e-04 | 7.780e-05 | 2.643e-05 |
+| B    | L2       | 8.955e-04 | 2.519e-04 | 7.641e-05 | 2.576e-05 |
+| C    | Weighted | 1.142e-03 | 3.045e-04 | 8.676e-05 | 2.726e-05 |
+| C    | L2       | 1.107e-03 | 2.846e-04 | 7.580e-05 | 2.132e-05 |
+| D    | Weighted | 1.284e-03 | 3.174e-04 | 7.905e-05 | 1.975e-05 |
+| D    | L2       | 1.285e-03 | 3.176e-04 | 7.909e-05 | 1.975e-05 |
 
 ### Interpretation
 
@@ -938,7 +938,7 @@ the order-512 benchmark.
 
 ### Results
 
-| Mode  | Solver   |    `N=80` |   `N=160` |   `N=320` |
+| Mode  | Solver   | `N=80`    | `N=160`   | `N=320`   |
 | :---: | :------- | --------: | --------: | --------: |
 | Time  | Weighted | 1.531e-04 | 9.539e-05 | 6.682e-05 |
 | Time  | L2       | 1.458e-04 | 9.196e-05 | 6.517e-05 |
@@ -973,12 +973,12 @@ reports the absolute price change from half-width 3 to 4.
 
 ### Results
 
-| Case                    | `alpha` |  `T` | `sigma` | Weighted change | L2 change |
+| Case                    | `alpha` | `T`  | `sigma` | Weighted change | L2 change |
 | :---------------------- | ------: | ---: | ------: | --------------: | --------: |
-| ATM call, short         |    0.50 | 0.10 |    0.25 |         6.9e-18 |   6.9e-18 |
-| ITM call, long/high vol |    0.90 | 2.00 |    0.60 |         2.0e-08 |   1.5e-08 |
-| OTM put, long           |    0.50 | 1.50 |    0.30 |         3.0e-11 |   2.0e-11 |
-| ITM put, short/high vol |    0.90 | 0.25 |    0.60 |         0.0e+00 |   2.8e-17 |
+| ATM call, short         | 0.50    | 0.10 | 0.25    | 6.9e-18         | 6.9e-18   |
+| ITM call, long/high vol | 0.90    | 2.00 | 0.60    | 2.0e-08         | 1.5e-08   |
+| OTM put, long           | 0.50    | 1.50 | 0.30    | 3.0e-11         | 2.0e-11   |
+| ITM put, short/high vol | 0.90    | 0.25 | 0.60    | 0.0e+00         | 2.8e-17   |
 
 ### Interpretation
 
@@ -1029,8 +1029,8 @@ The numerical validation does not resolve every issue in the source papers.
 An24 Theorem 2, PDF pages 11--13, claims unconditional stability. Between
 equations (31) and (32), its proof drops a drift cross term that does not cancel
 for consecutive time levels. A direct check at
-\((x_L,x_R)=(0,\pi)\), `alpha = 0.50`, `dt = 0.01`, and
-\(\mu=r=0.01\), using \(u^0=\sin(30x)\), makes the normalized left side of
+$(x_L,x_R)=(0,\pi)$, `alpha = 0.50`, `dt = 0.01`, and
+$\mu=r=0.01$, using $u^0=\sin(30x)$, makes the normalized left side of
 equation (32) equal `5.130259...`, above the claimed bound of `4`. With
 nonzero drift and two eigenmodes, the omitted cross term is `-6.7195e-05` at
 step four. This invalidates the printed proof, not the numerical method; the
