@@ -61,6 +61,34 @@ class ModelTests(unittest.TestCase):
                 abs(solver(problem, coarse).price - exact),
             )
 
+    def test_fractional_solvers_agree_and_have_sane_surfaces(self) -> None:
+        grid = GridSpec(-4.0, 3.0, 180, 120)
+        for alpha in (0.5, 0.8, 0.95):
+            for option_type in ("call", "put"):
+                problem = EuropeanOptionProblem(
+                    1.0, 1.1, 1.0, 0.04, 0.3, alpha, option_type
+                )
+                weighted = solve_weighted(problem, grid)
+                l2 = solve_l2(problem, grid)
+                self.assertLess(abs(weighted.price - l2.price), 8.0e-4)
+                self.assertGreaterEqual(np.min(weighted.grid_price), -1.0e-10)
+                self.assertGreaterEqual(np.min(l2.grid_price), -1.0e-10)
+                if option_type == "call":
+                    self.assertGreaterEqual(np.min(np.diff(weighted.grid_price[-1])), -1e-9)
+                    self.assertGreaterEqual(np.min(np.diff(l2.grid_price[-1])), -1e-9)
+
+    def test_cross_solver_difference_shrinks_under_refinement(self) -> None:
+        for alpha in (0.5, 0.9):
+            problem = EuropeanOptionProblem(1.0, 1.0, 1.0, 0.04, 0.3, alpha, "call")
+            differences = []
+            for count in (60, 120, 240):
+                grid = GridSpec(-5.0, 5.0, count, count)
+                differences.append(
+                    abs(solve_weighted(problem, grid).price - solve_l2(problem, grid).price)
+                )
+            self.assertGreater(differences[0], differences[1])
+            self.assertGreater(differences[1], differences[2])
+
 
 if __name__ == "__main__":
     unittest.main()

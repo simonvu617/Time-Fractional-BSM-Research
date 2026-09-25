@@ -119,3 +119,21 @@ def boundary_values(
     if problem.option_type == "call":
         return 0.0, max(math.exp(x_max) - discounted_strike, 0.0)
     return max(discounted_strike - math.exp(x_min), 0.0), 0.0
+
+
+def black_scholes_price(problem: EuropeanOptionProblem) -> float:
+    """Return the analytic zero-dividend BSM benchmark."""
+
+    root_time = math.sqrt(problem.T)
+    d1 = (
+        math.log(problem.S0 / problem.K)
+        + (problem.r + 0.5 * problem.sigma**2) * problem.T
+    ) / (problem.sigma * root_time)
+    d2 = d1 - problem.sigma * root_time
+    def normal_cdf(value: float) -> float:
+        return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+    discounted_strike = problem.K * math.exp(-problem.r * problem.T)
+    if problem.option_type == "call":
+        return problem.S0 * normal_cdf(d1) - discounted_strike * normal_cdf(d2)
+    return discounted_strike * normal_cdf(-d2) - problem.S0 * normal_cdf(-d1)

@@ -32,30 +32,11 @@ collector.
 from tfbsm_pricing import EuropeanOptionProblem, GridSpec, solve_l2, solve_weighted
 
 problem = EuropeanOptionProblem(
-    S0=100.0,
-    K=100.0,
-    T=1.0,
-    r=0.05,
-    sigma=0.20,
-    alpha=0.80,
-    option_type="call",
+    S0=100, K=100, T=1, r=0.05, sigma=0.20, alpha=0.80, option_type="call"
 )
-grid = GridSpec(
-    x_min=2.0,
-    x_max=7.0,
-    space_steps=300,
-    time_steps=200,
-)
-
-weighted = solve_weighted(problem, grid)
-l2 = solve_l2(problem, grid)
-
-print(weighted.price, l2.price)
+grid = GridSpec(x_min=2, x_max=7, space_steps=300, time_steps=200)
+print(solve_weighted(problem, grid).price, solve_l2(problem, grid).price)
 ```
-
-`grid_price` in each result contains the complete solution surface with shape
-`(time_steps + 1, space_steps + 1)`. The diagnostics report the scheme,
-spacing, paper order claims, and known proof limitations.
 
 The paper-to-code formula crosswalk, complete scholarly references, validation
 results, and known limitations are in
