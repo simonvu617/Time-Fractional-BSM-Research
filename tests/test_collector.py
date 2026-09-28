@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 import pandas as pd
+import requests
 
 from tfbsm_collector import (
     cli,
@@ -740,6 +741,32 @@ class SavedCollectionTest(unittest.TestCase):
                 )
                 self.assertIsNone(store.cached(request))
                 self.assertEqual(store.client.stop_event.is_set(), stopped)
+
+    def test_read_timeout_is_request_local_but_connection_failure_stops(self):
+        request = planning.near_close_request(
+            self.cfg, "option", "SPY", DAY, EXPIRATIONS[0]
+        )
+        cases = (
+            (requests.ReadTimeout("slow query"), False),
+            (requests.ConnectionError("terminal unavailable"), True),
+        )
+        for error, stopped in cases:
+            with self.subTest(error=type(error).__name__):
+                client = transport.ThetaClient(self.cfg)
+                session = mock.MagicMock()
+                session.get.side_effect = error
+                with (
+                    mock.patch.object(client, "session", return_value=session),
+                    mock.patch.object(client.stop_event, "wait", return_value=False),
+                ):
+                    result = client.download(request, io.BytesIO())
+                self.assertEqual(result["attempts"], 6)
+                self.assertEqual(session.get.call_count, 6)
+                self.assertEqual(
+                    session.get.call_args.kwargs["timeout"],
+                    (10, transport.OPTION_AT_TIME_READ_TIMEOUT_SECONDS),
+                )
+                self.assertEqual(client.stop_event.is_set(), stopped)
 
     def test_only_selection_failures_block_later_months_and_gaps_retry_on_resume(
         self,

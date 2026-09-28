@@ -22,6 +22,10 @@ import requests.adapters
 from tfbsm_collector import config, planning
 
 
+DEFAULT_READ_TIMEOUT_SECONDS = 120
+OPTION_AT_TIME_READ_TIMEOUT_SECONDS = 300
+
+
 class CollectionStopped(RuntimeError):
     """A shared stop signal preventing further collection work."""
 
@@ -103,6 +107,13 @@ class ThetaClient:
             self.local.session.mount("https://", adapter)
         return self.local.session
 
+    def discard_session(self) -> None:
+        """Close this worker's failed connection before its next retry."""
+        session = getattr(self.local, "session", None)
+        if session is not None:
+            session.close()
+            del self.local.session
+
     @contextlib.contextmanager
     def request_slot(self):
         """Provide a shared HTTP slot, honoring pacing and cancellation.
@@ -150,6 +161,15 @@ class ThetaClient:
                 retries.
         """
         meta = {}
+        # Wildcard option snapshots can make Theta scan a large, liquid chain.
+        # The QQQ September 2023 request repeatedly exceeded the ordinary
+        # two-minute limit while a one-day slice completed normally. Give this
+        # endpoint enough time to finish without weakening every HTTP timeout.
+        read_timeout = (
+            OPTION_AT_TIME_READ_TIMEOUT_SECONDS
+            if request.endpoint == "/option/at_time/quote"
+            else DEFAULT_READ_TIMEOUT_SECONDS
+        )
         for attempt in range(6):
             started = time.perf_counter()
             retry_after = 0.0
@@ -166,7 +186,7 @@ class ThetaClient:
                     with self.session().get(
                         self.cfg.base_url.rstrip("/") + request.endpoint,
                         params=request.params,
-                        timeout=(10, 120),
+                        timeout=(10, read_timeout),
                         stream=True,
                     ) as response:
                         meta.update(
@@ -261,10 +281,19 @@ class ThetaClient:
                     payload_bytes=payload.tell(),
                 )
                 payload.seek(0)
+                # A timed-out or broken keep-alive connection must not be
+                # reused for the next attempt.
+                self.discard_session()
                 if attempt == 5:
-                    self.stop(
-                        f"Theta connection failed after six attempts for {request.endpoint}; rerun when it is available."
-                    )
+                    # Read timeouts can be caused by one expensive historical
+                    # query while the terminal remains healthy. Preserve that
+                    # request as a retryable gap and let other work continue.
+                    # Connect failures still stop the run because they indicate
+                    # that the local terminal itself is unavailable.
+                    if not isinstance(exc, requests.ReadTimeout):
+                        self.stop(
+                            f"Theta connection failed after six attempts for {request.endpoint}; rerun when it is available."
+                        )
                     return meta
 
             self.stop_event.wait(
