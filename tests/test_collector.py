@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import hashlib
 import io
+import json
 import pathlib
 import tempfile
 import threading
@@ -31,6 +32,7 @@ from tfbsm_collector import (
     storage,
     transport,
     validation,
+    watchdog,
     workflow,
 )
 
@@ -742,6 +744,35 @@ class SavedCollectionTest(unittest.TestCase):
                 )
                 self.assertIsNone(store.cached(request))
                 self.assertEqual(store.client.stop_event.is_set(), stopped)
+
+    def test_watchdog_restarts_failure_and_stops_after_completion(self):
+        failed = mock.MagicMock(pid=101)
+        failed.wait.return_value = 1
+        completed = mock.MagicMock(pid=102)
+        completed.wait.return_value = 2
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(
+                watchdog.subprocess, "Popen", side_effect=(failed, completed)
+            ) as launch,
+            mock.patch.object(watchdog.time, "sleep") as sleep,
+        ):
+            state_dir = pathlib.Path(directory)
+            exit_code = watchdog.supervise(
+                ["--plan"],
+                state_dir,
+                initial_delay=1,
+                maximum_delay=4,
+                stable_seconds=60,
+            )
+            state = json.loads(
+                (state_dir / "watchdog.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(launch.call_count, 2)
+        sleep.assert_called_once_with(1)
+        self.assertEqual(state["status"], "complete_with_gaps")
+        self.assertEqual(state["restarts"], 1)
 
     def test_read_timeout_is_request_local_but_connection_failure_stops(self):
         request = planning.near_close_request(
