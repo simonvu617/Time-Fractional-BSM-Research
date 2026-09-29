@@ -1,0 +1,2 @@
+# Keep Python formatting identical on Windows and other platforms.
+*.py text eol=lf

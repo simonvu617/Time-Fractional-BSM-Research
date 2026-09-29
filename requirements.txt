@@ -1,0 +1,5 @@
+exchange-calendars
+numpy
+pandas>=2
+pyarrow
+requests
