@@ -30,6 +30,34 @@ class CollectionStopped(RuntimeError):
     """A shared stop signal preventing further collection work."""
 
 
+def is_read_timeout(error: BaseException) -> bool:
+    """Recognize direct and streamed-response read timeouts.
+
+    Requests raises ``ReadTimeout`` while waiting for response headers, but it
+    wraps urllib3's ``ReadTimeoutError`` in ``ConnectionError`` when a streamed
+    response stalls after headers arrive. Both describe one slow request, not
+    an unreachable Theta Terminal.
+    """
+
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, requests.ReadTimeout) or (
+            type(current).__name__ == "ReadTimeoutError"
+        ):
+            return True
+        pending.extend(
+            nested
+            for nested in (*current.args, current.__cause__, current.__context__)
+            if isinstance(nested, BaseException)
+        )
+    return False
+
+
 class ThetaClient:
     """Shared request limits and per-thread connections to Theta Terminal.
 
@@ -290,7 +318,7 @@ class ThetaClient:
                     # request as a retryable gap and let other work continue.
                     # Connect failures still stop the run because they indicate
                     # that the local terminal itself is unavailable.
-                    if not isinstance(exc, requests.ReadTimeout):
+                    if not is_read_timeout(exc):
                         self.stop(
                             f"Theta connection failed after six attempts for {request.endpoint}; rerun when it is available."
                         )

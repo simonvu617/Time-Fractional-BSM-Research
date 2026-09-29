@@ -20,6 +20,7 @@ from unittest import mock
 
 import pandas as pd
 import requests
+import urllib3
 
 from tfbsm_collector import (
     cli,
@@ -748,6 +749,14 @@ class SavedCollectionTest(unittest.TestCase):
         )
         cases = (
             (requests.ReadTimeout("slow query"), False),
+            (
+                requests.ConnectionError(
+                    urllib3.exceptions.ReadTimeoutError(
+                        None, "/option/history/quote", "slow stream"
+                    )
+                ),
+                False,
+            ),
             (requests.ConnectionError("terminal unavailable"), True),
         )
         for error, stopped in cases:
