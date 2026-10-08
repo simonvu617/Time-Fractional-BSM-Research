@@ -5,6 +5,6 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tfbsm-pricing"
 version = "0.1.0"
-description = "Independent European time-fractional Black-Scholes solvers"
+description = "European and American time-fractional Black-Scholes solvers"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.0"]

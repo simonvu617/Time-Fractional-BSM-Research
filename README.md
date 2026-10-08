@@ -6,7 +6,7 @@ The answer is unknown. The project must support a positive, negative, or inconcl
 
 ## AI authorship disclosure
 
-The solver code and related documentation introduced by PR #2 were generated
+The solver code and related documentation in this repository were generated
 by OpenAI Codex, an artificial-intelligence coding system, from Simon Vu's
 research instructions. They remain draft research software and require human
 review before they are merged or used for empirical conclusions.
@@ -21,8 +21,7 @@ The candidate model uses an inverse-stable market-time clock with:
 
 `alpha = 1` must recover classical BSM under identical inputs. This is not a Hurst-exponent, fractional-Brownian-motion, or rough-volatility project.
 
-The `tfbsm_pricing` package contains two independently implemented European
-TFBSM finite-difference solvers:
+The `tfbsm_pricing` package contains three TFBSM finite-difference solvers:
 
 - the weighted L1 method in G. Krzyżanowski, M. Magdziarz, and Ł.
   Płociniczak, [“A weighted finite difference method for subdiffusive
@@ -31,11 +30,17 @@ TFBSM finite-difference solvers:
 - the L2 method in X. An, Q. Wang, F. Liu, V. V. Anh, and I. W. Turner,
   [“Parameter estimation for time-fractional Black-Scholes equation with S&P
   500 index option”](https://doi.org/10.1007/s11075-023-01563-4),
-  *Numerical Algorithms* 95, 1-30 (2024).
+  *Numerical Algorithms* 95, 1-30 (2024);
+- an American put solver based on Z. Zhou and X. Gao,
+  [“Numerical Methods for Pricing American Options with Time-Fractional PDE
+  Models”](https://doi.org/10.1155/2016/5614950), *Mathematical Problems in
+  Engineering* (2016), Article 5614950, Section 4.
 
-They share the same model and grid interface but keep their fractional-history
-weights and recurrences separate. Neither solver is coupled to the ThetaData
-collector.
+The first two solve the same zero-dividend European problem on log-price
+grids, with independent time recurrences. The third solves an American put
+with continuous dividend yield on a stock-price grid, using the paper's
+`beta=0` specialization and L1 boundary search. The solvers are independent
+of the ThetaData collector.
 
 ## Pricing example
 
@@ -49,9 +54,25 @@ grid = GridSpec(x_min=2, x_max=7, space_steps=300, time_steps=200)
 print(solve_weighted(problem, grid).price, solve_l2(problem, grid).price)
 ```
 
+For an American put with continuous dividends:
+
+```python
+from tfbsm_pricing import AmericanPutProblem, StockGridSpec, solve_zhou_gao
+
+problem = AmericanPutProblem(
+    S0=100, K=100, T=1, r=0.05, sigma=0.20, alpha=0.80, q=0.02
+)
+grid = StockGridSpec(S_max=400, space_steps=400, time_steps=200)
+result = solve_zhou_gao(problem, grid)
+print(result.price, result.exercise_boundary[-1])
+```
+
 The paper-to-code formula crosswalk, complete scholarly references, validation
 results, and known limitations are in
-[`docs/numerical_solvers.md`](docs/numerical_solvers.md).
+[`docs/numerical_solvers.md`](docs/numerical_solvers.md) for the European
+solvers and [`docs/american_solver.md`](docs/american_solver.md) for the
+American solver, including its discount-term correction to the printed
+stencil and mesh-level boundary approximation.
 
 ## Run the checks
 
@@ -64,8 +85,8 @@ Only NumPy is required.
 ## Project status
 
 The numerical solvers are being reviewed in a pull request before inclusion on
-`main`. Calibration, empirical fitting, American options, trading logic, and
-data analysis remain outside this implementation.
+`main`. Calibration, empirical fitting, American calls, scheduled cash
+dividends, trading logic, and data analysis remain outside this implementation.
 
 ## License, citation, and data
 
