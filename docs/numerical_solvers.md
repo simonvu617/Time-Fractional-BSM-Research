@@ -1,5 +1,9 @@
 # European TFBS numerical solvers
 
+The third solver, a Zhou--Gao American put method with continuous dividend
+yield, has its own [model, usage, and validation notes](american_solver.md).
+This document covers the two European methods only.
+
 This document explains the two European time-fractional Black--Scholes (TFBS)
 solvers, the mathematical problem they solve, and the numerical evidence used
 to check them. Source keys are `KMP20`, `An24`, and `Kanter75`; full references
@@ -39,7 +43,7 @@ solver.
 
 File: `validation/subordination.py`
 
-This is not a third production solver. It exists so the two finite-difference
+This is a validation benchmark. It exists so the two finite-difference
 solvers can be checked against a calculation that does not use either
 fractional finite-difference recurrence.
 

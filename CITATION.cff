@@ -8,3 +8,16 @@ authors:
 repository-code: "https://github.com/simonvu617/Time-Fractional-BSM-Research"
 license: MIT
 version: 0.1.0
+references:
+  - type: article
+    title: "Numerical Methods for Pricing American Options with Time-Fractional PDE Models"
+    authors:
+      - family-names: Zhou
+        given-names: Zhiqiang
+      - family-names: Gao
+        given-names: Xuemei
+    year: 2016
+    journal: "Mathematical Problems in Engineering"
+    volume: "2016"
+    doi: "10.1155/2016/5614950"
+    url: "https://doi.org/10.1155/2016/5614950"
